@@ -537,9 +537,8 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             class AuditMW(AgentMiddleware):
                 name = "audit"
 
-                async def before_model(self, messages, ctx):
+                async def on_before_model(self, messages, ctx):
                     events.append("before_model")
-                    return messages
 
                 async def after_turn(self, final_answer, ctx):
                     events.append("after_turn")

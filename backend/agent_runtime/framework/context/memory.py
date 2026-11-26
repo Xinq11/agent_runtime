@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import os
-from typing import Any, List, Tuple
+from typing import Any, List, Sequence, Tuple
 
 from agent_runtime.framework.core.contracts import ExecutionContext, Message, estimate_tokens
 
@@ -21,6 +21,7 @@ class ContextBudget:
     max_window_tokens: int = int(os.getenv("AGENT_MAX_WINDOW_TOKENS", "32768"))
     reserve_output_tokens: int = int(os.getenv("AGENT_RESERVE_OUTPUT_TOKENS", "2048"))
     max_summary_tokens: int = 800
+    max_extra_context_tokens: int = 1200
     compact_trigger_messages: int = 8
     keep_recent_messages: int = 4
 
@@ -101,6 +102,7 @@ def assemble_before_model(
     summary_text: str,
     recent_messages: List[Message],
     budget: ContextBudget,
+    extra_contexts: Sequence[str] = (),
 ) -> Tuple[List[Message], dict]:
     """Build cache-friendly segments with strictly contiguous atomic tool-group trimming."""
     static_block = system_prompt.strip()
@@ -117,6 +119,22 @@ def assemble_before_model(
         )
         assembled.append(sum_msg)
         used_tokens += estimate_tokens(sum_msg.content)
+
+    # Merge middleware-provided reference blocks under an explicit cap so injections never blow budget
+    clean_extras = [b.strip() for b in extra_contexts if isinstance(b, str) and b.strip()]
+    extra_truncated = False
+    if clean_extras:
+        merged_extra = "\n\n".join(clean_extras)
+        extra_cap = min(
+            max(64, budget.max_extra_context_tokens),
+            max(64, (budget.max_input_tokens - used_tokens) // 3),
+        )
+        if estimate_tokens(merged_extra) > extra_cap:
+            merged_extra = _truncate_to_token_budget(merged_extra, extra_cap)
+            extra_truncated = True
+        extra_msg = Message(role="system", content=merged_extra)
+        assembled.append(extra_msg)
+        used_tokens += estimate_tokens(extra_msg.content)
 
     remaining = max(256, budget.max_input_tokens - used_tokens)
     groups = _group_atomic_messages(recent_messages)
@@ -148,6 +166,8 @@ def assemble_before_model(
         "dropped_messages": dropped_count,
         "fallback_folded": dropped_count > 0,
         "kept_messages": len(kept),
+        "extra_context_blocks": len(clean_extras),
+        "extra_context_truncated": extra_truncated,
     }
     return assembled, stats
 

@@ -575,6 +575,65 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_scoped_middleware_cannot_corrupt_context_budget_or_tool_pairs(self):
+        from agent_runtime import AgentMiddleware
+        from agent_runtime.framework.context.memory import ContextBudget
+
+        async def _run():
+            store = get_test_store()
+            captured_messages = []
+
+            class PiiAndHugeInjectMW(AgentMiddleware):
+                name = "pii_and_huge_inject"
+
+                async def transform_user_input(self, text, ctx):
+                    return text.replace("13800138000", "[PHONE_REDACTED]")
+
+                async def extra_context(self, latest_user_text, ctx):
+                    return "超大背景材料：" + ("制度条款" * 4000)
+
+                async def on_before_model(self, messages, ctx):
+                    # Immutable tuple snapshot prevents accidental mutation
+                    self.snapshot_type = type(messages)
+                    captured_messages.append(messages)
+
+            class CaptureModel:
+                async def generate(self, *, messages, tool_specs, ctx):
+                    from agent_runtime.framework.core.contracts import Message
+
+                    return Message("assistant", f"收到({len(messages)}条)")
+
+            mw = PiiAndHugeInjectMW()
+            budget = ContextBudget(
+                max_window_tokens=1600,
+                reserve_output_tokens=200,
+                max_extra_context_tokens=300,
+            )
+            app = AgentRuntimeApp(
+                model=CaptureModel(),
+                store=store,
+                middlewares=[mw],
+                budget=budget,
+                system_prompt="BASE_SYSTEM_PROMPT",
+            )
+            res = await app.run_turn("联系我 13800138000", thread_id="th_mw_guard")
+            self.assertIn("收到", res["final_answer"])
+            self.assertIs(mw.snapshot_type, tuple)
+            self.assertEqual(len(captured_messages), 1)
+            msgs = captured_messages[0]
+            # 1. System prompt preserved intact
+            self.assertEqual(msgs[0].role, "system")
+            self.assertEqual(msgs[0].content, "BASE_SYSTEM_PROMPT")
+            # 2. Oversized extra_context was truncated inside kernel budget
+            self.assertEqual(msgs[1].role, "system")
+            self.assertIn("truncated for context budget", msgs[1].content)
+            # 3. User text transformed without breaking message roles
+            self.assertEqual(msgs[-1].role, "user")
+            self.assertIn("[PHONE_REDACTED]", msgs[-1].content)
+            self.assertNotIn("13800138000", msgs[-1].content)
+
+        asyncio.run(_run())
+
 
 if __name__ == "__main__":
     unittest.main()

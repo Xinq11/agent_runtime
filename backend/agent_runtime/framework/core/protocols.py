@@ -83,14 +83,28 @@ class RAGStrategy(Protocol):
 
 
 class AgentMiddleware:
-    """Base class for plug-and-play lifecycle hooks around model & tool execution."""
+    """Base class for safe, scoped lifecycle hooks around model & tool execution.
+
+    Context-window ownership stays strictly inside the runtime kernel (`assemble_before_model`):
+    middlewares cannot overwrite `system_prompt`, drop history summaries, or break atomic
+    `assistant(tool_calls)` / `tool` message pairs.
+    """
 
     name: str = "middleware"
 
-    async def before_model(
-        self, messages: List[Message], ctx: ExecutionContext
-    ) -> List[Message]:
-        return messages
+    async def extra_context(self, latest_user_text: str, ctx: ExecutionContext) -> Optional[str]:
+        """Optionally return a reference text block merged under kernel ContextBudget."""
+        return None
+
+    async def transform_user_input(self, text: str, ctx: ExecutionContext) -> str:
+        """Optionally transform/redact the latest user text before model inference."""
+        return text
+
+    async def on_before_model(
+        self, messages: Tuple[Message, ...], ctx: ExecutionContext
+    ) -> None:
+        """Read-only observation hook invoked with an immutable snapshot before model call."""
+        return None
 
     async def after_model(
         self, response: Message, ctx: ExecutionContext

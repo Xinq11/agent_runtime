@@ -1,4 +1,9 @@
-"""Composable async middleware pipeline for `agent_runtime`."""
+"""Composable async middleware pipeline for `agent_runtime`.
+
+Enforces context-window safety: middlewares can contribute budgeted extra context,
+transform user text, observe immutable assembled snapshots, and wrap tools without
+being able to corrupt system prompts or atomic tool-call message pairs.
+"""
 
 from __future__ import annotations
 
@@ -22,20 +27,37 @@ class MiddlewareChain:
     def items(self) -> List[AgentMiddleware]:
         return list(self._items)
 
-    async def run_before_model(
-        self, messages: List[Message], ctx: ExecutionContext
-    ) -> List[Message]:
-        current = messages
+    async def run_transform_user_input(self, text: str, ctx: ExecutionContext) -> str:
+        current = text
         for mw in self._items:
-            current = await mw.before_model(current, ctx)
+            updated = await mw.transform_user_input(current, ctx)
+            if isinstance(updated, str):
+                current = updated
         return current
+
+    async def run_extra_context(self, latest_user_text: str, ctx: ExecutionContext) -> List[str]:
+        blocks: List[str] = []
+        for mw in self._items:
+            chunk = await mw.extra_context(latest_user_text, ctx)
+            if isinstance(chunk, str) and chunk.strip():
+                blocks.append(chunk.strip())
+        return blocks
+
+    async def run_on_before_model(
+        self, messages: Sequence[Message], ctx: ExecutionContext
+    ) -> None:
+        snapshot = tuple(messages)
+        for mw in self._items:
+            await mw.on_before_model(snapshot, ctx)
 
     async def run_after_model(
         self, response: Message, ctx: ExecutionContext
     ) -> Message:
         current = response
         for mw in reversed(self._items):
-            current = await mw.after_model(current, ctx)
+            updated = await mw.after_model(current, ctx)
+            if isinstance(updated, Message):
+                current = updated
         return current
 
     async def run_wrap_tool(

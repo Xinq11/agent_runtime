@@ -81,7 +81,7 @@
 | --- | --- | --- |
 | `BaseAgent` | 面向单个完整垂直助手，集中声明系统提示词、工具、子 Agent、中间件与插件 | [agent/base.py](agent_runtime/framework/agent/base.py) |
 | `AgentPlugin` | 面向可复用的能力包或客户交付包（如 RAG、Skills、费用包），可组合挂入 `AgentRuntimeApp` | [core/protocols.py](agent_runtime/framework/core/protocols.py) |
-| `AgentMiddleware` | 模型前后与工具调用外层切面（`before_model` / `after_model` / `wrap_tool` / `after_turn`） | [core/middleware.py](agent_runtime/framework/core/middleware.py) |
+| `AgentMiddleware` | 受控生命周期切面（`extra_context` 纳入内核预算、`transform_user_input`、`on_before_model` 只读快照、`after_model`、`wrap_tool`、`after_turn`），不可破坏上下文裁剪与工具配对 | [core/middleware.py](agent_runtime/framework/core/middleware.py) |
 | `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider 与脚本 Mock） | [infra/llm/provider.py](agent_runtime/infra/llm/provider.py) |
 | `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](agent_runtime/extensions/rag/extension.py) |
 

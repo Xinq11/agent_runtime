@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -100,18 +100,31 @@ def build_agent_graph(
         ) as bm_sp:
             summary, cursor = await asyncio.to_thread(store.get_summary, ctx.thread_id)
             history = await asyncio.to_thread(store.list_messages, ctx.thread_id, cursor)
+            recent = list(history) + list(pending)
+            latest_user_text = ""
+            if recent and recent[-1].role == "user":
+                transformed = await mw.run_transform_user_input(recent[-1].content or "", ctx)
+                if transformed != recent[-1].content:
+                    recent[-1] = replace(recent[-1], content=transformed)
+                latest_user_text = (recent[-1].content or "").strip()
+            extra_contexts = (
+                await mw.run_extra_context(latest_user_text, ctx) if latest_user_text else []
+            )
             inputs, bm_stats = assemble_before_model(
                 system_prompt=system_prompt,
                 summary_text=summary,
-                recent_messages=history + pending,
+                recent_messages=recent,
                 budget=ctx_budget,
+                extra_contexts=extra_contexts,
             )
-            inputs = await mw.run_before_model(inputs, ctx)
+            await mw.run_on_before_model(inputs, ctx)
             bm_sp.attributes.update(
                 {
                     "input_tokens_est": bm_stats.get("input_tokens_est", 0),
                     "kept_messages": bm_stats.get("kept_messages", 0),
                     "dropped_messages": bm_stats.get("dropped_messages", 0),
+                    "extra_context_blocks": bm_stats.get("extra_context_blocks", 0),
+                    "extra_context_truncated": bm_stats.get("extra_context_truncated", False),
                     "summary_cursor": cursor,
                 }
             )

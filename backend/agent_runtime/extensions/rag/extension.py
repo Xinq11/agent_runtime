@@ -13,7 +13,7 @@ from agent_runtime.framework.tools.registry import ToolSpec
 
 
 class _AutoInjectRAGMiddleware(AgentMiddleware):
-    """Optional `before_model` auto-injection mode for strong KB-first assistants."""
+    """Optional `extra_context` auto-injection mode for strong KB-first assistants."""
 
     name = "rag_auto_inject"
 
@@ -21,24 +21,18 @@ class _AutoInjectRAGMiddleware(AgentMiddleware):
         self._get_strategy = get_strategy
         self._top_k = top_k
 
-    async def before_model(self, messages: List[Message], ctx: ExecutionContext) -> List[Message]:
+    async def extra_context(self, latest_user_text: str, ctx: ExecutionContext) -> Optional[str]:
         strategy = self._get_strategy()
-        if strategy is None or not messages or messages[-1].role != "user":
-            return messages
-        query = (messages[-1].content or "").strip()
-        if not query:
-            return messages
+        query = (latest_user_text or "").strip()
+        if strategy is None or not query:
+            return None
         result = await strategy.retrieve(
             scope=ctx.auth_scope, query=query, top_k=self._top_k, ctx=ctx
         )
         if result.status != "ok" or not result.hits:
-            return messages
+            return None
         grounded = result.formatted_context or format_grounded_context(result.hits)
-        injected = Message(
-            role="system",
-            content=f"[知识库参考资料 - 回答请标注来源编号]\n{grounded}",
-        )
-        return [*messages[:-1], injected, messages[-1]]
+        return f"[知识库参考资料 - 回答请标注来源编号]\n{grounded}"
 
 
 class RagExtension(AgentPlugin):
