@@ -1,0 +1,198 @@
+{
+  "uid": "agent-runtime-overview",
+  "title": "Agent Runtime Overview",
+  "schemaVersion": 40,
+  "version": 1,
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "trace_id",
+        "label": "Trace",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "agent-pg"
+        },
+        "query": "SELECT trace_id FROM agent_spans GROUP BY trace_id ORDER BY max(start_ms) DESC LIMIT 100",
+        "refresh": 2,
+        "sort": 0,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "首个模型增量延迟 · P95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "agent-prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, mode) (rate(agent_ttft_seconds_bucket[5m])))",
+          "legendFormat": "{{mode}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "agent-prom"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "输入、输出与前缀缓存 Token",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "agent-prom"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum by (kind) (increase(agent_tokens_total[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "agent-prom"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "工具执行结果",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "agent-prom"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum by (tool,status) (increase(agent_tool_calls_total[5m]))",
+          "legendFormat": "{{tool}} · {{status}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "agent-prom"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "运行日志",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "agent-loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "expr": "{service_name=\"agent-runtime\"} | json",
+          "queryType": "range",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "agent-loki"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "调用瀑布图 · PostgreSQL agent_spans",
+      "type": "traces",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "agent-pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT trace_id AS \"traceID\",span_id AS \"spanID\",parent_span_id AS \"parentSpanID\",service_name AS \"serviceName\",operation_name AS \"operationName\",start_ms AS \"startTime\",duration_ms AS duration FROM agent_spans WHERE trace_id=${trace_id:sqlstring} ORDER BY start_ms,span_id",
+          "rawQuery": true,
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "agent-pg"
+          }
+        }
+      ]
+    }
+  ]
+}

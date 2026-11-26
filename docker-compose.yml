@@ -1,0 +1,98 @@
+name: agent-runtime
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_DB: agent_runtime
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent_demo}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "agent", "-d", "agent_runtime"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  minio:
+    image: minio/minio:local
+    pull_policy: never
+    command: server /data --console-address ":9001"
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    environment: &minio-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes: [minio-data:/data]
+  minio-init:
+    image: minio/mc:local
+    pull_policy: never
+    depends_on: [minio]
+    environment: *minio-env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 2; done
+        mc mb --ignore-existing local/agent-artifacts
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+  loki:
+    image: grafana/loki:3.3.2
+    command: -config.file=/etc/loki/loki-config.yml
+    ports: ["127.0.0.1:3100:3100"]
+    volumes:
+      - ./infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/agent-runtime-overview.json
+      GRAFANA_PG_PASSWORD: ${GRAFANA_PG_PASSWORD:-traces_demo}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/agent-runtime-overview.json:/var/lib/grafana/dashboards/agent-runtime-overview.json:ro
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    environment:
+      <<: *minio-env
+      PG_DSN: "host=postgres dbname=agent_runtime user=agent"
+      PGPASSWORD: ${POSTGRES_PASSWORD:-agent_demo}
+      GRAFANA_PG_PASSWORD: ${GRAFANA_PG_PASSWORD:-traces_demo}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: agent-artifacts
+      LOKI_URL: http://loki:3100
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      AGENT_EXTENSIONS: ${AGENT_EXTENSIONS:-agent_runtime.extensions.rag.extension:RagExtension,agent_runtime.extensions.skills.extension:SkillsExtension,agent_runtime.extensions.customers.enterprise_expense:EnterpriseExpensePlugin}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health',timeout=4)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  frontend:
+    build: ./frontend
+    ports: ["127.0.0.1:8080:80"]
+    depends_on:
+      backend: {condition: service_healthy}
+volumes:
+  pg-data: {}
+  minio-data: {}
+  prom-data: {}
+  grafana-data: {}
+  loki-data: {}

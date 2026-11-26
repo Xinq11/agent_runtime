@@ -1,0 +1,25 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: agent-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Loki
+    uid: agent-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+  - name: PostgreSQL
+    uid: agent-pg
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: grafana_reader
+    jsonData:
+      database: agent_runtime
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: $GRAFANA_PG_PASSWORD

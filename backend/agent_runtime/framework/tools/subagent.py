@@ -1,0 +1,146 @@
+"""Agent as Tool: read-only Sub-Agent runner reusing the unified ToolGateway.
+
+Follows the refactored `agent-multi-agent-collaboration.html` design:
+  - Sub-agents run inside an isolated private `messages[]` window.
+  - `max_depth = 1` prevents recursive sub-agent spawning.
+  - Permissions are monotonically narrowed (`allow_write=False`, role allowlist).
+  - Return value flows directly through `ToolGateway`'s truncation & `ref_id` spill.
+  - Progress events stream out-of-band via `ctx.emit("subagent_status", ...)`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+from agent_runtime.framework.core.contracts import ExecutionContext, Message, RiskLevel
+
+
+@dataclass(frozen=True)
+class SubAgentProfile:
+    tool_name: str
+    role: str
+    description: str
+    system_prompt: str
+    allowed_tools: Tuple[str, ...]
+    model_name: str = "mock-fast"
+    max_steps: int = 4
+    timeout_sec: float = 12.0
+
+
+async def run_readonly_subagent(
+    *,
+    profile: SubAgentProfile,
+    goal: str,
+    parent_ctx: ExecutionContext,
+    model_client: Any,
+    tool_gateway: Any,
+    obs: Any,
+) -> str:
+    """Execute a read-only sub-agent in an isolated context and return concise text."""
+    if parent_ctx.depth >= parent_ctx.max_depth:
+        return "[ERROR] 已达最大子 Agent 嵌套深度 (max_depth=1)，禁止继续派发子 Agent。"
+
+    with obs.span(
+        trace_id=parent_ctx.trace_id,
+        operation_name=f"subagent:{profile.role}",
+        parent_span_id=parent_ctx.parent_span_id,
+        attributes={"role": profile.role, "model": profile.model_name},
+    ) as sub_span:
+        sub_ctx = parent_ctx.derive_subagent(
+            agent_name=profile.role,
+            allowed_tools=profile.allowed_tools,
+            parent_span_id=sub_span.span_id,
+            model_name=profile.model_name,
+        )
+        await parent_ctx.emit(
+            "subagent_status",
+            {"role": profile.role, "phase": "started", "goal": goal},
+        )
+
+        # Isolated private conversation window — discarded on return
+        private_msgs: List[Message] = [
+            Message(
+                role="system",
+                content=(
+                    f"{profile.system_prompt}\n"
+                    "约束：你处于只读调研模式，只输出最终结论、关键数字和出处，勿输出冗长试错过程。"
+                ),
+            ),
+            Message(role="user", content=goal),
+        ]
+        loop_counts: Dict[str, int] = {}
+        final_answer = ""
+
+        for _step in range(profile.max_steps):
+            visible_specs = tool_gateway.registry.visible_specs(
+                sub_ctx.auth_scope, include_subagents=False
+            )
+            resp = await model_client.generate(
+                messages=private_msgs,
+                tool_specs=visible_specs,
+                ctx=sub_ctx,
+            )
+            private_msgs.append(resp)
+
+            if not resp.tool_calls:
+                final_answer = resp.content
+                break
+
+            results = await tool_gateway.execute_batch(
+                resp.tool_calls,
+                sub_ctx,
+                loop_counts=loop_counts,
+            )
+            for res in results:
+                private_msgs.append(
+                    Message(
+                        role="tool",
+                        content=res.content,
+                        tool_call_id=res.tool_call_id,
+                        name=res.tool_name,
+                    )
+                )
+        else:
+            final_answer = "[SUBAGENT_MAX_STEPS] 子任务已达步数上限，请基于已有部分结论汇报。"
+
+        await parent_ctx.emit(
+            "subagent_status",
+            {"role": profile.role, "phase": "done", "chars": len(final_answer)},
+        )
+        return final_answer
+
+
+def register_subagent_tool(
+    *,
+    registry: Any,
+    profile: SubAgentProfile,
+    model_client: Any,
+    tool_gateway: Any,
+    obs: Any,
+    tool_spec_cls: Any,
+) -> None:
+    """Register a read-only Sub-Agent as a normal Tool on the shared ToolRegistry."""
+
+    async def _handler(args: Dict[str, Any], ctx: ExecutionContext) -> str:
+        return await run_readonly_subagent(
+            profile=profile,
+            goal=str(args["goal"]),
+            parent_ctx=ctx,
+            model_client=model_client,
+            tool_gateway=tool_gateway,
+            obs=obs,
+        )
+
+    registry.register(
+        tool_spec_cls(
+            name=profile.tool_name,
+            description=profile.description,
+            required_args=("goal",),
+            allowed_args=("goal",),
+            risk_level=RiskLevel.READ,
+            handler=_handler,
+            timeout_sec=profile.timeout_sec,
+            is_subagent=True,
+        )
+    )

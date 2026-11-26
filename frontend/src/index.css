@@ -1,0 +1,130 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #faf9f5;
+  --rail: #f3f1ea;
+  --surface: #ffffff;
+  --surface-hover: #f5f3ec;
+  --surface-subtle: #efece3;
+  --border: #e6e2d8;
+  --border-strong: #d4cfc2;
+  --ink: #1f1e1c;
+  --ink-secondary: #5e5b54;
+  --ink-muted: #8a857b;
+  --accent: #d97757;
+  --accent-hover: #c56546;
+  --accent-soft: #fdf2ee;
+  --accent-border: #f2cabd;
+  --ok: #1f7a5a;
+  --ok-soft: #edf7f2;
+  --warn: #b36b14;
+  --warn-soft: #fdf6ea;
+  --danger: #b83b3b;
+  --danger-soft: #fdf0f0;
+  --code-bg: #181715;
+  --code-ink: #ebe7de;
+}
+
+[data-theme="dark"] {
+  --bg: #141413;
+  --rail: #1a1917;
+  --surface: #1f1e1b;
+  --surface-hover: #272521;
+  --surface-subtle: #24221e;
+  --border: #2e2c27;
+  --border-strong: #3f3c35;
+  --ink: #f1eee7;
+  --ink-secondary: #b6b1a6;
+  --ink-muted: #7f7a70;
+  --accent: #e08364;
+  --accent-hover: #eb9376;
+  --accent-soft: rgba(224, 131, 100, 0.14);
+  --accent-border: rgba(224, 131, 100, 0.36);
+  --ok: #4cb98e;
+  --ok-soft: rgba(76, 185, 142, 0.12);
+  --warn: #e2a44c;
+  --warn-soft: rgba(226, 164, 76, 0.12);
+  --danger: #e26d6d;
+  --danger-soft: rgba(226, 109, 109, 0.12);
+  --code-bg: #0f0e0d;
+  --code-ink: #ebe7de;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Inter", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Quiet micro-interactions (Taste Skill rule 5: step on hover, press on click, no tilt) */
+.interactive-btn {
+  transition: transform 140ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+.interactive-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+.interactive-btn:active:not(:disabled) {
+  transform: translateY(0px) scale(0.985);
+}
+
+.quiet-card {
+  transition: border-color 160ms ease, background-color 160ms ease, transform 160ms ease;
+}
+.quiet-card:hover {
+  border-color: var(--border-strong);
+}
+
+/* Subtle custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+}
+
+@keyframes backdropFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes drawerSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.drawer-backdrop {
+  animation: backdropFadeIn 180ms ease-out forwards;
+}
+
+.drawer-sheet {
+  animation: drawerSlideIn 240ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
