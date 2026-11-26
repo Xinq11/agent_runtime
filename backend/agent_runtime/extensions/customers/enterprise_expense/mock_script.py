@@ -14,7 +14,7 @@ def route_enterprise_expense_mock(
     tool_msgs: List[Message],
     tool_names: Set[str],
 ) -> Message:
-    """Scripted assistant turns driving expense BI, CRAG, approval, truncation, and loop demos."""
+    """Scripted assistant turns driving expense BI, RAG, approval, truncation, and loop demos."""
     if ctx.agent_name == "bi_analyst":
         if not tool_msgs and "bi_query" in tool_names:
             return Message(

@@ -1,4 +1,4 @@
-"""CRAG 7-stage retrieval service orchestrating recall, fusion, diversification, rerank, and evidence."""
+"""RAG 7-stage retrieval service orchestrating recall, fusion, diversification, rerank, and evidence."""
 
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ from agent_runtime.framework.core.contracts import (
     RetrievalResult,
 )
 
-log = logging.getLogger("agent-runtime.crag")
+log = logging.getLogger("agent-runtime.rag")
 
 
-class CragRetrievalService:
-    """Full 7-stage CRAG retrieval facade implementing `RAGStrategy`."""
+class RagRetrievalService:
+    """Full 7-stage RAG retrieval facade implementing `RAGStrategy`."""
 
     def __init__(
         self,
@@ -74,7 +74,7 @@ class CragRetrievalService:
         try:
             query_vec = self.embedding_client.embed(query)
         except Exception as exc:
-            log.warning("embedding failed, skipping CRAG retrieval: %s", type(exc).__name__)
+            log.warning("embedding failed, skipping RAG retrieval: %s", type(exc).__name__)
             return [], set()
 
         query_terms = sorted(set(terms(query)))

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from agent_runtime.extensions.customers.enterprise_expense.tools import create_expense_tools
-from agent_runtime.extensions.rag.retrieval import CragRetrievalService
+from agent_runtime.extensions.rag.retrieval import RagRetrievalService
 from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
 from agent_runtime.framework.tools.registry import ToolSpec
@@ -51,7 +51,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
             plugin_name=self.name,
             welcome_title="今天查点什么，或者一起做哪件事？",
             welcome_description=(
-                "统一核心 SDK + 生产级 PG/OSS/PLG 底座：支持 ECharts 交互图表、云原生文件读写、CRAG 混合检索、PG+OSS 技能库、只读子 Agent 与高危审批恢复。"
+                "统一核心 SDK + 生产级 PG/OSS/PLG 底座：支持 ECharts 交互图表、云原生文件读写、RAG 混合检索、PG+OSS 技能库、只读子 Agent 与高危审批恢复。"
             ),
             quick_prompts=(
                 QuickPromptSpec(
@@ -60,7 +60,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
                     prompt="查一下华东区 Q3 差旅超标分月数据和费用构成，用表格展示并画一张柱状图",
                 ),
                 QuickPromptSpec(
-                    title="并行子 Agent + CRAG + 高危审批",
+                    title="并行子 Agent + RAG + 高危审批",
                     hint="并行派发只读 BI 子代理与制度检索，发起高危写审批暂停恢复",
                     prompt="查华东区 Q3 差旅超标明细，结合最新报销制度帮我发起专项审批",
                 ),
@@ -116,7 +116,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
                 section="奖金池",
             )
         else:
-            rag = CragRetrievalService(store, min_rerank_score=0.35)
+            rag = RagRetrievalService(store, min_rerank_score=0.35)
             rag.index_chunk(
                 RAGChunk(
                     chunk_id="ck_travel_2026",

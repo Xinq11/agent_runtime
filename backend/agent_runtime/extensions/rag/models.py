@@ -1,6 +1,6 @@
-"""Strict per-stage CRAG retrieval result models and pluggable Embedding/Rerank client protocols.
+"""Strict per-stage RAG retrieval result models and pluggable Embedding/Rerank client protocols.
 
-Mirrors the ChatBI / CRAG retrieval style contract:
+Retrieval stage model contract:
   - Each stage owns an explicit result type (never overload one generic `score` field).
   - `retrieve()` returns child-level `ChunkSearchResult` (all 4 stage scores for eval/diagnostics).
   - `retrieve_evidence()` returns parent-level `ParentEvidenceResult` (NO raw scores leaked to LLM).

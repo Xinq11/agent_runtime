@@ -14,11 +14,11 @@ from agent_runtime import (
     ApprovalDecision,
     AuthScope,
     BaseAgent,
-    CragRetrievalService,
     ExecutionContext,
     Message,
     RAGChunk,
     RagExtension,
+    RagRetrievalService,
     RerankItem,
     RetrievalResult,
     RiskLevel,
@@ -145,10 +145,10 @@ class TestAgentRuntimeSDK(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_03_crag_seven_stage_pipeline_acl_diversifier_and_fallback(self):
+    def test_03_rag_seven_stage_pipeline_acl_diversifier_and_fallback(self):
         async def _run():
             store = InMemoryStore()
-            crag = CragRetrievalService(store, min_rerank_score=0.35)
+            rag = RagRetrievalService(store, min_rerank_score=0.35)
             # Multi-chunk document to verify adjacent child expansion & per-doc diversification (max 2)
             for idx, body in enumerate(
                 [
@@ -158,7 +158,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 ],
                 1,
             ):
-                crag.index_chunk(
+                rag.index_chunk(
                     RAGChunk(
                         chunk_id=f"p_pub_{idx}",
                         parent_id="p_pub",
@@ -171,7 +171,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                         acl_roles=("employee",),
                     )
                 )
-            crag.index_chunk(
+            rag.index_chunk(
                 RAGChunk(
                     chunk_id="p_sec_1",
                     parent_id="p_sec",
@@ -189,26 +189,26 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             exec_scope = AuthScope(tenant_id="t_acme", user_id="u2", roles=("exec",))
 
             # ACL hard boundary: employee cannot retrieve exec-only chunk
-            r_emp = await crag.retrieve(scope=emp_scope, query="高管年度奖金系数是多少")
+            r_emp = await rag.retrieve(scope=emp_scope, query="高管年度奖金系数是多少")
             self.assertEqual(r_emp.hits, [])
             self.assertIn(r_emp.status, ("no_hit", "low_confidence"))
 
             # Child-level diagnostic retrieve_chunks() exposes 4 distinct stage scores & max 2 per doc
-            diag = crag.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=4)
+            diag = rag.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=4)
             self.assertGreaterEqual(len(diag), 1)
-            self.assertLessEqual(len(diag), 2)  # CandidateDiversifier max_per_document=2
+            self.assertLessEqual(len(diag), 2)  # per-doc diversification max_per_document=2
             self.assertGreater(diag[0].rrf_score, 0.0)
             self.assertGreater(diag[0].rerank_score, 0.0)
 
             # Parent-level retrieve_evidence() returns full parent content without raw score leakage
-            evidences, _ = crag.retrieve_evidence(emp_scope, "一线城市住宿报销标准", top_n=4)
+            evidences, _ = rag.retrieve_evidence(emp_scope, "一线城市住宿报销标准", top_n=4)
             self.assertEqual(len(evidences), 1)
             self.assertEqual(evidences[0].parent_id, "p_pub")
             self.assertIn("全量父文档", evidences[0].content)
             self.assertTrue(len(evidences[0].matched_child_ids) >= 1)
 
             # Exec retrieves exec-only doc with [1] citation
-            r_exec = await crag.retrieve(scope=exec_scope, query="高管年度奖金系数")
+            r_exec = await rag.retrieve(scope=exec_scope, query="高管年度奖金系数")
             self.assertEqual(r_exec.status, "ok")
             self.assertIn("[1]", r_exec.formatted_context)
 
@@ -217,13 +217,13 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 def rerank(self, query, documents):
                     raise RuntimeError("rerank sidecar timeout")
 
-            crag_fb = CragRetrievalService(store, rerank_client=BrokenReranker(), min_rerank_score=0.0)
-            fb_chunks = crag_fb.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=2)
+            rag_fb = RagRetrievalService(store, rerank_client=BrokenReranker(), min_rerank_score=0.0)
+            fb_chunks = rag_fb.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=2)
             self.assertGreaterEqual(len(fb_chunks), 1)
             self.assertEqual(fb_chunks[0].rerank_score, 0.0)
 
             # Unrelated query returns no_hit / low_confidence refusal
-            r_miss = await crag.retrieve(scope=emp_scope, query="火星飞船燃料价格")
+            r_miss = await rag.retrieve(scope=emp_scope, query="火星飞船燃料价格")
             self.assertEqual(r_miss.hits, [])
             self.assertIn(r_miss.status, ("no_hit", "low_confidence"))
 

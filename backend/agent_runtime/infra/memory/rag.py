@@ -10,7 +10,7 @@ from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
 
 
 class MemoryRagMixin:
-    """In-memory CRAG chunk storage and recall ports."""
+    """In-memory RAG chunk storage and recall ports."""
 
     def upsert_rag_chunk(self, chunk: RAGChunk) -> None:
         with self._lock:

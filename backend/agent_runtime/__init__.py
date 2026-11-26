@@ -8,7 +8,7 @@ Stable public import surface:
         AgentMiddleware,
         RAGStrategy,
         RagExtension,
-        CragRetrievalService,
+        RagRetrievalService,
         SkillsExtension,
         tool,
         ToolSpec,
@@ -62,7 +62,6 @@ __all__ = [
     "AuthScope",
     "BaseAgent",
     "ChunkSearchResult",
-    "CragRetrievalService",
     "EmbeddingClient",
     "ExecutionContext",
     "LLMProvider",
@@ -73,6 +72,7 @@ __all__ = [
     "RAGChunk",
     "RAGStrategy",
     "RagExtension",
+    "RagRetrievalService",
     "RerankClient",
     "RerankItem",
     "RetrievalResult",
@@ -117,10 +117,10 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.framework.tools.subagent import SubAgentProfile as _profile
 
         return _profile
-    if name == "CragRetrievalService":
-        from agent_runtime.extensions.rag.retrieval import CragRetrievalService as _crag
+    if name == "RagRetrievalService":
+        from agent_runtime.extensions.rag.retrieval import RagRetrievalService as _rag
 
-        return _crag
+        return _rag
     if name in ("rrf_fuse", "diversify_candidates", "rerank_candidates", "final_rank_fuse"):
         from agent_runtime.extensions.rag import ranking as _rank
 

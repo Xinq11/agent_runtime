@@ -1,4 +1,4 @@
-"""PostgreSQL + pgvector + OSS repository mixin for CRAG indexing and dual-channel recall."""
+"""PostgreSQL + pgvector + OSS repository mixin for RAG indexing and dual-channel recall."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
 
 
 class PgRagMixin:
-    """Chunk/document persistence and sparse/dense/adjacent recall for CRAG."""
+    """Chunk/document persistence and sparse/dense/adjacent recall for RAG."""
 
     def upsert_rag_chunk(self, chunk: RAGChunk) -> None:
         with self.transaction() as cur:

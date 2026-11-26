@@ -70,7 +70,7 @@ class LLMProvider(Protocol):
 
 @runtime_checkable
 class RAGStrategy(Protocol):
-    """Protocol for pluggable custom RAG strategies (CRAG, Milvus, ES, Dify, etc.)."""
+    """Protocol for pluggable custom RAG strategies (built-in 7-stage RAG, Milvus, ES, Dify, etc.)."""
 
     async def retrieve(
         self,

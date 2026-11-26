@@ -1,4 +1,4 @@
-"""Stateless CRAG ranking functions: RRF fusion, per-doc diversification, rerank, final fusion."""
+"""Stateless RAG ranking functions: RRF fusion, per-doc diversification, rerank, final fusion."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from agent_runtime.extensions.rag.models import (
 )
 from agent_runtime.framework.core.contracts import RAGChunk
 
-log = logging.getLogger("agent-runtime.crag")
+log = logging.getLogger("agent-runtime.rag")
 
 RRF_K = 60
 RERANK_MAX_DOCUMENT_CHARS = 256

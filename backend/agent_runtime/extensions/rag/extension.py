@@ -1,11 +1,11 @@
-"""Pluggable `RagExtension`: defaults to ChatBI/CRAG 7-stage pipeline, or accepts any custom `RAGStrategy`."""
+"""Pluggable `RagExtension`: defaults to the built-in 7-stage RAG pipeline, or accepts any custom `RAGStrategy`."""
 
 from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence
 
 from agent_runtime.extensions.rag.models import EmbeddingClient, RerankClient
-from agent_runtime.extensions.rag.retrieval import CragRetrievalService
+from agent_runtime.extensions.rag.retrieval import RagRetrievalService
 from agent_runtime.extensions.rag.text_utils import format_grounded_context
 from agent_runtime.framework.core.contracts import ExecutionContext, Message, RiskLevel
 from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin, RAGStrategy
@@ -67,7 +67,7 @@ class RagExtension(AgentPlugin):
 
     def register_tools(self, *, registry: Any, store: Any, model: Any, gateway: Any, obs: Any) -> None:
         if self._active_strategy is None:
-            self._active_strategy = CragRetrievalService(
+            self._active_strategy = RagRetrievalService(
                 store,
                 embedding_client=self._embedding_client,
                 rerank_client=self._rerank_client,
@@ -91,7 +91,7 @@ class RagExtension(AgentPlugin):
             registry.register(
                 ToolSpec(
                     name="search_knowledge",
-                    description="检索企业知识库文档（默认 CRAG 7 阶段混合召回与父证据聚合，支持自定义策略）。",
+                    description="检索企业知识库文档（默认 7 阶段混合召回与父证据聚合，支持自定义策略）。",
                     required_args=("query",),
                     allowed_args=("query",),
                     risk_level=RiskLevel.READ,
