@@ -2,7 +2,6 @@
 
 Stable public import surface:
     from agent_runtime import (
-        BaseAgent,
         AgentRuntimeApp,
         AgentPlugin,
         AgentMiddleware,
@@ -82,7 +81,6 @@ __all__ = [
     "AuthScope",
     "AuthenticationError",
     "AuthorizationError",
-    "BaseAgent",
     "ChunkSearchResult",
     "EmbeddingClient",
     "ExecutionContext",
@@ -132,10 +130,6 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.framework.agent import app as _app
 
         return getattr(_app, name)
-    if name == "BaseAgent":
-        from agent_runtime.framework.agent.base import BaseAgent as _base
-
-        return _base
     if name == "tool":
         from agent_runtime.framework.tools.decorator import tool as _tool
 

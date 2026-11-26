@@ -45,10 +45,7 @@ def load_extension(spec: str) -> AgentPlugin:
     mod_name, attr_name = spec.split(":", 1)
     mod = importlib.import_module(mod_name)
     obj = getattr(mod, attr_name)
-    inst = obj() if callable(obj) else obj
-    if hasattr(inst, "to_plugin") and not isinstance(inst, AgentPlugin):
-        return inst.to_plugin()
-    return inst
+    return obj() if callable(obj) else obj
 
 
 class AgentRuntimeApp:

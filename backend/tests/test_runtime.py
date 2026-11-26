@@ -13,7 +13,6 @@ from agent_runtime import (
     AgentRuntimeApp,
     ApprovalDecision,
     AuthScope,
-    BaseAgent,
     ExecutionContext,
     Message,
     RAGChunk,
@@ -530,7 +529,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_12_base_agent_inheritance_middleware_and_sse_v1_envelope(self):
+    def test_12_agent_plugin_middleware_and_sse_v1_envelope(self):
         async def _run():
             events: List[str] = []
 
@@ -543,20 +542,20 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 async def after_turn(self, final_answer, ctx):
                     events.append("after_turn")
 
-            class CustomFinanceAgent(BaseAgent):
+            class CustomFinancePlugin(AgentPlugin):
                 name = "custom_finance"
                 system_prompt = "你是定制财务助手。"
 
-                def build_middlewares(self):
+                def middlewares(self):
                     return (AuditMW(),)
 
-            app = CustomFinanceAgent().build_app(store=get_test_store())
-            res = await app.run_turn("你好", thread_id="th_inherit")
+            app = AgentRuntimeApp(store=get_test_store(), extensions=[CustomFinancePlugin()])
+            res = await app.run_turn("你好", thread_id="th_plugin")
             self.assertTrue(res["final_answer"])
             self.assertIn("before_model", events)
             self.assertIn("after_turn", events)
 
-            # Dynamic loader supports both AgentPlugin and BaseAgent specs
+            # Dynamic loader loads AgentPlugin specs cleanly
             ext = load_extension("agent_runtime.extensions.customers.enterprise_expense:EnterpriseExpensePlugin")
             self.assertEqual(ext.name, "enterprise_expense")
 

@@ -1,7 +1,7 @@
 """Public extension protocols for the `agent_runtime` SDK.
 
-Downstream teams implement these stable protocols (or subclass `BaseAgent` /
-`AgentPlugin` / `AgentMiddleware`) without modifying framework internals.
+Downstream teams implement these stable protocols (or subclass `AgentPlugin` /
+`AgentMiddleware`) without modifying framework internals.
 """
 
 from __future__ import annotations
