@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from agent_runtime.framework.core.contracts import AuthScope
+from agent_runtime.framework.core.security import AccessFilter
+from agent_runtime.infra.pg.acl_sql import compile_acl_sql, default_access_filter
 
 
 class PgOpsQueriesMixin:
     """Aggregated read snapshots for Trace drawer and Ops console."""
 
     def get_thread_state_snapshot(
-        self, scope: AuthScope, thread_id: str, trace_id: str = ""
+        self,
+        scope: AuthScope,
+        thread_id: str,
+        trace_id: str = "",
+        *,
+        kb_filter: Optional[AccessFilter] = None,
     ) -> Dict[str, Any]:
         owner = self.rows("SELECT tenant_id,actor_id FROM agent_threads WHERE thread_id=%s", (thread_id,))
         if owner and (owner[0]["tenant_id"], owner[0]["actor_id"]) != (scope.tenant_id, scope.user_id):
@@ -49,12 +56,14 @@ class PgOpsQueriesMixin:
                AND expires_at>now() ORDER BY expires_at DESC LIMIT 50""",
             args,
         )
+        flt = kb_filter or default_access_filter(scope)
+        kb_acl_sql, kb_acl_params = compile_acl_sql(flt, scope=scope, alias="c")
         chunks = self.rows(
-            """SELECT c.chunk_id,c.tenant_id,p.doc_title,p.section_path,c.acl_roles,p.doc_url,p.oss_key
+            f"""SELECT c.chunk_id,c.tenant_id,p.doc_title,p.section_path,c.acl_roles,p.doc_url,p.oss_key
                FROM rag_chunks c JOIN rag_parents p USING (tenant_id,parent_id)
-               WHERE c.tenant_id=%s AND c.status='active'
+               WHERE {kb_acl_sql}
                ORDER BY p.doc_title,c.chunk_id LIMIT 100""",
-            (scope.tenant_id,),
+            kb_acl_params,
         )
         workspace_files = (
             [asdict(f) for f in self.list_workspace_files(scope.tenant_id, thread_id)] if thread_id else []
@@ -71,7 +80,12 @@ class PgOpsQueriesMixin:
             "knowledge_chunks": chunks,
         }
 
-    def get_ops_overview_snapshot(self, scope: AuthScope) -> Dict[str, Any]:
+    def get_ops_overview_snapshot(
+        self,
+        scope: AuthScope,
+        *,
+        skills_filter: Optional[AccessFilter] = None,
+    ) -> Dict[str, Any]:
         threads_rows = self.rows(
             """
             SELECT t.thread_id, t.title, t.created_at,
@@ -109,7 +123,12 @@ class PgOpsQueriesMixin:
         kb_rows = self.rows(
             """SELECT p.parent_id AS chunk_id, p.parent_id, p.tenant_id, p.doc_title, p.section_path,
                       p.doc_url, p.oss_key,
-                      ARRAY[]::text[] AS acl_roles,
+                      COALESCE(
+                          (SELECT array_agg(DISTINCT r ORDER BY r)
+                           FROM rag_chunks c2, unnest(c2.acl_roles) AS r
+                           WHERE c2.tenant_id=p.tenant_id AND c2.parent_id=p.parent_id),
+                          ARRAY[]::text[]
+                      ) AS acl_roles,
                       left(COALESCE(NULLIF(p.parent_text, ''), MIN(c.content), ''), 240) AS snippet,
                       count(c.chunk_id)::int AS chunk_count,
                       CASE WHEN bool_or(c.status = 'active') THEN 'active' ELSE 'disabled' END AS status
@@ -131,7 +150,8 @@ class PgOpsQueriesMixin:
                ORDER BY rt.created_at DESC LIMIT 30""",
             (scope.tenant_id,),
         )
-        skills = [asdict(s) for s in self.list_skills(scope, include_disabled=True)]
+        sk_flt = skills_filter or default_access_filter(scope, unrestricted=True, include_disabled=True)
+        skills = [asdict(s) for s in self.list_skills(scope, access_filter=sk_flt)]
         return {
             "counts": {
                 "threads": len(threads_rows),

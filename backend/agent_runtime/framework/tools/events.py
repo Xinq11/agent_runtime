@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
+from langgraph.errors import GraphInterrupt
+
 from agent_runtime.framework.core.contracts import ExecutionContext, ToolCall, ToolResult
-from agent_runtime.framework.core.langgraph_compat import GRAPH_INTERRUPT_TYPES
 from agent_runtime.framework.tools.gateway import ToolGateway
 
 
@@ -35,7 +36,7 @@ class EventGateway(ToolGateway):
                 preview=result.content[:240],
             )
             return result
-        except GRAPH_INTERRUPT_TYPES:
+        except GraphInterrupt:
             status = "approval_required"
             raise
         except asyncio.CancelledError:

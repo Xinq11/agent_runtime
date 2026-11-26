@@ -5,8 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from agent_runtime.extensions.customers.enterprise_expense.tools import create_expense_tools
-from agent_runtime.extensions.rag.retrieval import RagRetrievalService
-from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
+from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
 from agent_runtime.framework.tools.registry import ToolSpec
 from agent_runtime.framework.tools.subagent import SubAgentProfile, register_subagent_tool
@@ -97,55 +96,23 @@ class EnterpriseExpensePlugin(AgentPlugin):
 
     def bootstrap_store(self, store: Any) -> None:
         scope = AuthScope("t_acme", "seed", ("employee", "exec"))
-        # 1. Seed sample knowledge documents (idempotent)
-        if hasattr(store, "index_document"):
-            store.index_document(
-                scope,
-                "2026 差旅与费用报销制度",
-                "一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
-                ["employee", "finance"],
-                parent="travel_2026",
-                section="住宿标准与超标审批红线",
-            )
-            store.index_document(
-                scope,
-                "高管薪酬方案（绝密）",
-                "高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
-                ["exec"],
-                parent="exec_comp",
-                section="奖金池",
-            )
-        else:
-            rag = RagRetrievalService(store, min_rerank_score=0.35)
-            rag.index_chunk(
-                RAGChunk(
-                    chunk_id="ck_travel_2026",
-                    parent_id="p_travel_2026",
-                    tenant_id="t_acme",
-                    doc_title="2026 差旅与费用报销制度",
-                    section_path="第 3 章 > 住宿标准与超标审批红线",
-                    doc_url="https://wiki.acme.internal/policy/travel-2026#s3",
-                    content="一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
-                    parent_text="一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
-                    acl_roles=("employee", "finance"),
-                )
-            )
-            rag.index_chunk(
-                RAGChunk(
-                    chunk_id="ck_exec_comp",
-                    parent_id="p_exec_comp",
-                    tenant_id="t_acme",
-                    doc_title="高管薪酬方案（绝密）",
-                    section_path="奖金池",
-                    doc_url="https://wiki.acme.internal/policy/exec-comp",
-                    content="高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
-                    parent_text="高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
-                    acl_roles=("exec",),
-                )
-            )
-
-        # 2. Seed sample declarative Skill into PG + OSS (only if not already published)
-        if hasattr(store, "publish_skill") and not store.list_skills(scope, query="expense-audit-report"):
+        store.index_document(
+            scope,
+            "2026 差旅与费用报销制度",
+            "一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
+            ["employee", "finance"],
+            parent="travel_2026",
+            section="住宿标准与超标审批红线",
+        )
+        store.index_document(
+            scope,
+            "高管薪酬方案（绝密）",
+            "高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
+            ["exec"],
+            parent="exec_comp",
+            section="奖金池",
+        )
+        if not store.list_skills(scope, query="expense-audit-report", include_disabled=True, bypass_acl=True):
             store.publish_skill(
                 scope=scope,
                 slug="expense-audit-report",

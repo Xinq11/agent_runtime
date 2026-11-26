@@ -19,14 +19,29 @@ class RiskLevel(str, Enum):
 
 @dataclass(frozen=True)
 class AuthScope:
-    """Caller identity & tool scope carried across execution boundaries."""
+    """Caller identity & tool scope carried across execution boundaries.
+
+    `allowed_tools=None` means unrestricted; `allowed_tools=()` means zero tools allowed.
+    """
 
     tenant_id: str
     user_id: str
     roles: Tuple[str, ...] = ()
     dept_ids: Tuple[str, ...] = ()
-    allowed_tools: Tuple[str, ...] = ()
+    allowed_tools: Optional[Tuple[str, ...]] = None
     allow_write: bool = True
+    authenticated: bool = False
+    attrs: Tuple[Tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "roles", tuple(self.roles or ()))
+        object.__setattr__(self, "dept_ids", tuple(self.dept_ids or ()))
+        if self.allowed_tools is not None:
+            object.__setattr__(self, "allowed_tools", tuple(self.allowed_tools))
+        if isinstance(self.attrs, dict):
+            object.__setattr__(self, "attrs", tuple(sorted((str(k), v) for k, v in self.attrs.items())))
+        else:
+            object.__setattr__(self, "attrs", tuple((str(k), v) for k, v in (self.attrs or ())))
 
     def narrowed(
         self,
@@ -35,7 +50,7 @@ class AuthScope:
         allow_write: bool = False,
     ) -> "AuthScope":
         """Monotonic permission narrowing: sub-agents can only shrink scope, never expand."""
-        if self.allowed_tools:
+        if self.allowed_tools is not None:
             intersected = tuple(sorted(set(self.allowed_tools) & set(allowed_tools)))
         else:
             intersected = tuple(sorted(set(allowed_tools)))
@@ -46,6 +61,8 @@ class AuthScope:
             dept_ids=self.dept_ids,
             allowed_tools=intersected,
             allow_write=self.allow_write and allow_write,
+            authenticated=self.authenticated,
+            attrs=self.attrs,
         )
 
 

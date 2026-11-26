@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from agent_runtime.extensions.rag.text_utils import chunk_text, embed_text, terms
 from agent_runtime.framework.core.config import BUCKET, uid
 from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
+from agent_runtime.framework.core.security import AccessFilter
+from agent_runtime.infra.pg.acl_sql import compile_acl_sql, default_access_filter
 
 
 class PgRagMixin:
@@ -48,26 +50,40 @@ class PgRagMixin:
             )
 
     def search_sparse_rag(
-        self, scope: AuthScope, query_terms: List[str], limit: int
+        self,
+        scope: AuthScope,
+        query_terms: List[str],
+        limit: int,
+        *,
+        access_filter: Optional[AccessFilter] = None,
     ) -> List[Tuple[RAGChunk, float]]:
         words = sorted(set(query_terms))
         if limit <= 0 or not words:
             return []
+        flt = access_filter or default_access_filter(scope)
+        acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="c")
+        cx_acl_sql, cx_acl_params = compile_acl_sql(flt, scope=scope, alias="cx", param_prefix="aclx")
         with self.transaction() as cur:
             cur.execute(
-                """
+                f"""
                 WITH q AS (SELECT to_tsquery('simple', %(words)s) AS ts)
                 SELECT c.chunk_id,c.parent_id,c.tenant_id,p.doc_title,p.section_path,p.doc_url,
-                       c.content,p.parent_text,c.acl_roles,c.status,c.embedding::text,
+                       c.content,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM rag_chunks cx
+                           WHERE cx.tenant_id=c.tenant_id AND cx.parent_id=c.parent_id
+                             AND cx.status='active' AND NOT ({cx_acl_sql})
+                       ) THEN '' ELSE p.parent_text END AS parent_text,
+                       c.acl_roles,c.status,c.embedding::text,
                        ts_rank(c.fts_tsv, q.ts)::float8 AS sparse_score
                 FROM rag_chunks c
                 JOIN rag_parents p USING (tenant_id, parent_id), q
-                WHERE c.tenant_id=%(tenant)s AND c.status='active'
+                WHERE {acl_sql}
                   AND c.fts_tsv @@ q.ts
                 ORDER BY sparse_score DESC, c.chunk_id
                 LIMIT %(k)s
                 """,
-                {"tenant": scope.tenant_id, "words": " | ".join(words), "k": limit},
+                {**acl_params, **cx_acl_params, "words": " | ".join(words), "k": limit},
             )
             return [
                 (RAGChunk(*row[:8], tuple(row[8]), row[9], tuple(json.loads(row[10])), row[11]), float(row[11]))
@@ -75,45 +91,79 @@ class PgRagMixin:
             ]
 
     def search_dense_rag(
-        self, scope: AuthScope, query_vec, limit: int
+        self,
+        scope: AuthScope,
+        query_vec,
+        limit: int,
+        *,
+        access_filter: Optional[AccessFilter] = None,
     ) -> List[Tuple[RAGChunk, float]]:
         if limit <= 0:
             return []
+        flt = access_filter or default_access_filter(scope)
+        acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="c")
+        cx_acl_sql, cx_acl_params = compile_acl_sql(flt, scope=scope, alias="cx", param_prefix="aclx")
         with self.transaction() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT c.chunk_id,c.parent_id,c.tenant_id,p.doc_title,p.section_path,p.doc_url,
-                       c.content,p.parent_text,c.acl_roles,c.status,c.embedding::text,
+                       c.content,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM rag_chunks cx
+                           WHERE cx.tenant_id=c.tenant_id AND cx.parent_id=c.parent_id
+                             AND cx.status='active' AND NOT ({cx_acl_sql})
+                       ) THEN '' ELSE p.parent_text END AS parent_text,
+                       c.acl_roles,c.status,c.embedding::text,
                        (1.0 - (c.embedding <=> %(vec)s::vector))::float8 AS dense_score
                 FROM rag_chunks c
                 JOIN rag_parents p USING (tenant_id, parent_id)
-                WHERE c.tenant_id=%(tenant)s AND c.status='active'
+                WHERE {acl_sql}
                   AND c.embedding <=> %(vec)s::vector < 1
                 ORDER BY c.embedding <=> %(vec)s::vector, c.chunk_id
                 LIMIT %(k)s
                 """,
-                {"tenant": scope.tenant_id, "vec": json.dumps(list(query_vec)), "k": limit},
+                {
+                    **acl_params,
+                    **cx_acl_params,
+                    "vec": json.dumps(list(query_vec)),
+                    "k": limit,
+                },
             )
             return [
                 (RAGChunk(*row[:8], tuple(row[8]), row[9], tuple(json.loads(row[10])), row[11]), float(row[11]))
                 for row in cur.fetchall()
             ]
 
-    def find_adjacent_rag_chunks(self, scope: AuthScope, parent_ids: List[str]) -> List[RAGChunk]:
+    def find_adjacent_rag_chunks(
+        self,
+        scope: AuthScope,
+        parent_ids: List[str],
+        *,
+        access_filter: Optional[AccessFilter] = None,
+    ) -> List[RAGChunk]:
         if not parent_ids:
             return []
+        flt = access_filter or default_access_filter(scope)
+        acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="c")
+        cx_acl_sql, cx_acl_params = compile_acl_sql(flt, scope=scope, alias="cx", param_prefix="aclx")
         with self.transaction() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT c.chunk_id,c.parent_id,c.tenant_id,p.doc_title,p.section_path,p.doc_url,
-                       c.content,p.parent_text,c.acl_roles,c.status,c.embedding::text
+                       c.content,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM rag_chunks cx
+                           WHERE cx.tenant_id=c.tenant_id AND cx.parent_id=c.parent_id
+                             AND cx.status='active' AND NOT ({cx_acl_sql})
+                       ) THEN '' ELSE p.parent_text END AS parent_text,
+                       c.acl_roles,c.status,c.embedding::text
                 FROM rag_chunks c
                 JOIN rag_parents p USING (tenant_id, parent_id)
-                WHERE c.tenant_id=%s AND c.status='active'
-                  AND c.parent_id = ANY(%s)
+                WHERE {acl_sql}
+                  AND c.parent_id = ANY(%(parent_ids)s)
                 ORDER BY c.chunk_id
                 """,
-                (scope.tenant_id, list(parent_ids)),
+                {**acl_params, **cx_acl_params, "parent_ids": list(parent_ids)},
             )
             return [
                 RAGChunk(*row[:8], tuple(row[8]), row[9], tuple(json.loads(row[10])), 0.0)

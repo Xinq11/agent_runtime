@@ -9,18 +9,21 @@
 ## 1. 基础约定与身份认证
 
 - **标准前缀**：`/api/v1`（同时保留 `/api` 兼容别名；Prometheus 抓取端点位于 `/metrics`）。
-- **认证与租户隔离 Header**（生产环境由 API 网关校验 JWT 后透传，切勿在请求体中伪造）：
+- **认证与租户隔离 Header**（仅适用于本地演示或已完成验签并清洗外源头的受信任 API 网关；切勿在未受保护的公网直接信任客户端自填头）：
   | Header | 说明 | 示例 |
   |---|---|---|
-  | `X-Tenant-Id` | 租户 ID | `t_acme` |
-  | `X-User-Id` | 操作人用户 ID | `u_alice` |
-  | `X-User-Roles` | 逗号分隔角色列表（用于 RAG / Skill ACL 前置过滤） | `employee,exec` |
+  | `X-Tenant-Id` | 租户 ID（缺省回退后端默认演示租户） | `t_acme` |
+  | `X-User-Id` | 操作人用户 ID（存在此 Header 时按网关头解析身份，否则回退默认身份） | `u_alice` |
+  | `X-User-Roles` | 逗号分隔角色列表（配合可拔插 `AccessController` 进行管理鉴权与 RAG / Skill SQL 前置过滤；资源未配置 `acl_roles` 时默认同租户公开，空主体角色仅可见公开项；详见 [架构文档](ARCHITECTURE.md#6-安全边界与可拔插-acl-架构现状与演进)） | `employee,exec` |
+  | `X-Gateway-Signature` | 可选；开启 `AGENT_IDENTITY_RESOLVER=signed_header`（配置 `AGENT_GATEWAY_HMAC_SECRET`）时必传，缺失或验签失败返 `401` | `...` |
 - **标准错误码**：
-  - `403`：权限变更或无权访问；
-  - `404`：会话 / Run / 审批单 / 工件 / Skill 不存在或跨租户越权；
+  - `401`：身份凭证缺失、过期或签名校验失败；
+  - `403`：权限不足（如非管理员访问管理面、禁止自批或审批角色不符）；
+  - `404`：会话 / Run / 审批单 / 工件 / Skill / 知识文档不存在或跨租户越权；
   - `409`：同一会话已有运行中/待审批 Run、或审批单状态冲突/已取消；
   - `413`：文档或 Skill 超过 2 MiB 体积上限；
-  - `422`：请求体校验失败（如空消息、非法 slug、Skill 上传可执行脚本）。
+  - `422`：请求体校验失败（如空消息、非法 slug、Skill 上传不支持的文件类型或可执行脚本）；
+  - `503`：外部/自定义权限控制器异常（fail-closed 拒绝服务）。
 
 ---
 
@@ -66,7 +69,7 @@
 
 ### 2.3 模型配置查询与热更新
 - `GET /api/v1/config/model`
-- `POST /api/v1/config/model`
+- `POST /api/v1/config/model`（当前仅对本后端进程生效，且端点受白名单约束；生产部署应限制为平台运维权限）
   - 请求体：`{ "api_key"?: string, "base_url"?: string, "model"?: string, "mode"?: "auto" | "deepseek" | "mock" }`
 
 ---
@@ -80,13 +83,13 @@
 {
   "thread_id": "th_optional_client_id",
   "message": "查华东区 Q3 差旅超标数据并画一张柱状图",
-  "request_id": "req_optional_idempotency_key"
+  "request_id": "req_optional_correlation_id"
 }
 ```
 - 响应：`Content-Type: text/event-stream`
 
 #### 标准 SSE v1 事件信封规范
-每一帧 SSE 均包含单调递增 `id` 与统一 JSON 信封：
+每一帧 SSE 均包含单调递增的帧序号 `id`（`seq`）与统一 JSON 信封：
 ```text
 id: 1
 event: meta
@@ -105,13 +108,13 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 | `error` | 执行异常 | `error`, `trace_id`, `run_id` | **终态** |
 
 ### 3.2 主动中止正在执行或待审批的 Run（Abort）
-- `POST /api/v1/chat/abort` → `202 Accepted`（幂等，重复调用安全）
+- `POST /api/v1/chat/abort` → `202 Accepted`
 - 请求体（`run_id` 与 `thread_id` 二选一）：
 ```json
 { "run_id": "run_xxx" }
 ```
 - 响应：`{ "ok": true, "run": { "run_id": "...", "status": "cancelled", ... } }`
-- 说明：中止后底层 `agent_runs` 状态不可逆进入 `cancelled`，旧审批票据无法再恢复该 Run。
+- 说明：中止活跃运行后，底层 `agent_runs` 不可逆进入 `cancelled`，旧审批票据无法再恢复该 Run。按 `run_id` 重复调用已完成/已失败/已取消的 Run 时返回其原终态；按 `thread_id` 查询不到活跃 Run 时返回 `404`。
 
 ### 3.3 查询单次 Run 状态
 - `GET /api/v1/runs/{run_id}` → 返回 `RunRecord`（`status`: `running | paused | completed | cancelled | failed`）。
@@ -128,20 +131,26 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 }
 ```
 - 响应：`{ "ok": true, "run_id": "...", "thread_id": "...", "trace_id": "...", "final_answer": "...", "status": "completed" | "interrupted", "interrupts": [] }`
+- 说明：
+  - 若恢复执行后再次命中新的高危工具，接口将返回 `status: "interrupted"` 及下一批待确认的 `interrupts` 数组，客户端需继续按新的 `review_id` 依次调用本接口或调用 Abort 结束运行。
+  - `approver_id` 在 HTTP 接口中始终由服务端已解析的调用方主体（`scope.user_id`）生成，请求体中传入的 `approver_id` 仅保留字段兼容而不作为审计依据；开启 `RbacAccessController` 时按 `approval:decide` 校验审批人角色及是否允许自批。
 
-### 3.5 会话列表、历史消息与 Trace 状态快照
+### 3.5 会话管理、历史消息与 Trace 状态快照
 - `GET /api/v1/threads` → 列出当前用户所有非空会话（按创建时间倒序，不含空草稿）。
 - `POST /api/v1/threads` → 显式创建会话。
 - `GET /api/v1/threads/{thread_id}/messages` → 返回该会话完整 `session_messages`。
+- `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（消息、摘要、Trace/Span、运行/审批记录、工作区文件与大输出元数据、以及 LangGraph 检查点；当前不同步清理 MinIO 实体对象）。
 - `GET /api/v1/state?thread_id={tid}&trace_id={tr}` → 返回单会话 Trace 瀑布图 `spans`、压缩摘要游标 `summary`、当前 `active_run`、`workspace_files`、待审批单、OSS 工件与 Loki 日志。
 
 ---
 
 ## 4. Skills 技能库管理接口（PG + OSS 版本化）
 
-- `GET /api/v1/skills?query={q}` → 列出当前租户与角色可见的全部活跃 Skill 元信息。
-- `GET /api/v1/skills/{slug}?resource={path}` → 从 OSS 读取 `SKILL.md` 正文或指定声明式文本附件。
-- `POST /api/v1/skills/upload` → 热发布新版本 Skill（先写不可变 OSS 版本对象，再在 PG 原子切指针；**禁止上传 `.py`/`.sh`/`.exe` 等可执行脚本**）：
+- `GET /api/v1/skills?query={q}` → 列出当前租户与角色可见的全部生效 Skill 元信息。
+- `GET /api/v1/skills/{slug}?resource={path}&include_disabled={bool}` → 从 OSS 读取 `SKILL.md` 正文或指定声明式文本附件。`include_disabled=true` 需通过 `skill:manage` 鉴权（`rbac` 模式下非管理员返回 `403`）。
+- `POST /api/v1/skills/upload` → 热发布新版本 Skill（需 `skill:manage` 权限；先写不可变 OSS 版本对象，再在 PG 原子切指针；**禁止上传 `.py`/`.sh`/`.exe` 等可执行脚本**），同时支持两种提交格式：
+  1. `multipart/form-data`（文件上传）：字段 `file`（仅允许 `.md` / `.markdown` / `.txt` / `.json` / `.yaml` / `.yml` 且 UTF-8 编码）、`slug`（可选，默认取文件名）、`description`、`acl_roles`（可选，缺省落空数组租户内公开）。
+  2. `application/json`（结构化发布）：
 ```json
 {
   "slug": "weekly-report-sop",
@@ -154,14 +163,16 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
   }
 }
 ```
-- `DELETE /api/v1/skills/{slug}` → 下线/禁用指定 Skill。
+- `PATCH /api/v1/skills/{slug}/status` → 切换 Skill 生效/下架状态，请求体：`{ "status": "active" | "disabled" }`。
+- `DELETE /api/v1/skills/{slug}` → 下线/禁用指定 Skill（与 `PATCH .../status` 并存，语义等价于置为 `disabled`）。
 
 ---
 
-## 5. 知识库与全局运维观测接口
+## 5. 知识库与运维观测接口
 
-- `POST /api/v1/knowledge/upload` → 支持 `application/json`（`{title, content, section, acl_roles}`）或 `multipart/form-data` 文件上传，原文落 MinIO OSS，切块向量化后入 PG `pgvector`。
-- `GET /api/v1/ops/overview` → 全局监控总览（健康状态、各实体计数、会话与摘要、OSS 工件、知识切片、Skills、最近 Trace、Prometheus `/metrics` 快照、Loki 最近 80 条结构化日志）。
+- `POST /api/v1/knowledge/upload` → 支持 `application/json`（`{title, content, section, acl_roles}`）或 `multipart/form-data`（`file`, `title?`, `section?`, `acl_roles?`）上传，原文落 MinIO OSS，切块向量化后入 PG `pgvector`。
+- `PATCH /api/v1/knowledge/{parent_id}/status` → 切换知识库文档生效/下架状态，请求体：`{ "status": "active" | "disabled" }`。
+- `GET /api/v1/ops/overview` → 管理后台总览（健康状态、各实体计数、会话与摘要、OSS 工件、知识文档、Skills、最近 Trace、Prometheus `/metrics` 快照、Loki 最近 80 条结构化日志；企业模式应限制为管理员权限）。
 - `GET /api/v1/ops/outputs/{ref_id}?offset=0&limit=1200` → 分页读取 MinIO OSS 落盘的大工具输出。
 - `GET /metrics` → 标准 Prometheus Exposition Format 指标端点。
 
@@ -169,11 +180,14 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 
 ## 6. 最小前端接入示例（TypeScript / Fetch）
 
+> 以下示例中的 `X-*` 身份头仅用于本地演示或直连内部可信网关场景；企业门户接入时应通过登录态 Token / Cookie 由前置网关鉴权后向后端注入可信主体。
+
 ```ts
 const res = await fetch("/api/v1/chat/sse", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
+    // 演示环境示例头；生产门户应改由网关验签注入
     "X-Tenant-Id": "t_acme",
     "X-User-Id": "u_alice",
     "X-User-Roles": "employee,exec",
@@ -190,14 +204,15 @@ while (true) {
   const { done, value } = await reader.read();
   if (done) break;
   buf += decoder.decode(value, { stream: true });
-  for (const frame of buf.split("\n\n").slice(0, -1)) {
+  const frames = buf.split("\n\n");
+  buf = frames.pop() ?? "";
+  for (const frame of frames) {
     const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
     if (!dataLine) continue;
     const env = JSON.parse(dataLine.slice(5).trim()); // { schema_version, run_id, seq, type, timestamp, payload }
     if (env.type === "meta") currentRunId = env.run_id;
     if (env.type === "token") console.log(env.payload.text);
   }
-  buf = buf.slice(buf.lastIndexOf("\n\n") + 2);
 }
 
 // 随时中止：

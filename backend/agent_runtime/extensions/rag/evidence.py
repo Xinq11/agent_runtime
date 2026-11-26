@@ -21,6 +21,7 @@ def aggregate_parent_evidences(
     top_score = max(c.rerank_score for c in final_children)
     best_rank: Dict[str, int] = {}
     matched_children: Dict[str, List[str]] = {}
+    authorized_chunks: Dict[str, List[str]] = {}
     meta_by_parent: Dict[str, ChunkSearchResult] = {}
 
     for rank_idx, child in enumerate(final_children):
@@ -31,6 +32,8 @@ def aggregate_parent_evidences(
             continue
         best_rank.setdefault(pid, rank_idx)
         meta_by_parent.setdefault(pid, child)
+        if child.content:
+            authorized_chunks.setdefault(pid, []).append(child.content.strip())
         if child.chunk_id in real_rrf_hits:
             lst = matched_children.setdefault(pid, [])
             if child.chunk_id not in lst:
@@ -40,7 +43,10 @@ def aggregate_parent_evidences(
     evidences: List[ParentEvidenceResult] = []
     for pid in ordered_pids:
         meta = meta_by_parent[pid]
-        content = (meta.parent_text or meta.content or "").strip()
+        if meta.parent_text and meta.parent_text.strip():
+            content = meta.parent_text.strip()
+        else:
+            content = "\n".join(c for c in authorized_chunks.get(pid, []) if c).strip()
         if not content:
             continue
         evidences.append(

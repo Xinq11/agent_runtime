@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request
 
-from agent_runtime.api.deps import caller_scope
+from agent_runtime.api.deps import caller_scope_async
 from agent_runtime.api.schemas import ApprovalResumeRequest
 from agent_runtime.framework.core.contracts import ApprovalDecision
 from agent_runtime.framework.core.runs import RunNotFoundError, RunStateError
+from agent_runtime.framework.core.security import AccessControlError, AuthorizationError
 
 router = APIRouter(tags=["Conversation & Runs"])
 
@@ -16,20 +19,25 @@ router = APIRouter(tags=["Conversation & Runs"])
 async def resume_approval(review_id: str, req: Request, body: ApprovalResumeRequest):
     store = req.app.state.store
     runtime = req.app.state.runtime
-    scope = caller_scope(req)
+    scope = await caller_scope_async(req)
 
-    tid = store.find_approval_thread(review_id, scope)
-    if not tid or (body.thread_id and body.thread_id != tid):
+    ticket = await asyncio.to_thread(store.get_approval_ticket, review_id, scope.tenant_id)
+    if ticket is None or (body.thread_id and body.thread_id != ticket.thread_id):
         raise HTTPException(404, "审批单不存在")
 
+    # Authoritative approver identity always comes from verified server-side scope, never client body
     decision = ApprovalDecision(
         review_id,
         body.approved,
-        str(body.approver_id or scope.user_id),
+        scope.user_id,
         str(body.reason or ""),
     )
     try:
-        final = await runtime.resume_approval(thread_id=tid, decision=decision, scope=scope)
+        final = await runtime.resume_approval(thread_id=ticket.thread_id, decision=decision, scope=scope)
+    except AuthorizationError as exc:
+        raise HTTPException(exc.status_code, exc.reason) from exc
+    except AccessControlError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except RunNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (RunStateError, ValueError) as exc:
@@ -42,7 +50,7 @@ async def resume_approval(review_id: str, req: Request, body: ApprovalResumeRequ
     return {
         "ok": True,
         "run_id": final.get("run_id"),
-        "thread_id": tid,
+        "thread_id": ticket.thread_id,
         "trace_id": final.get("trace_id"),
         "final_answer": final.get("final_answer", ""),
         "status": "interrupted" if tickets else "completed",

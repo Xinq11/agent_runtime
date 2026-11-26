@@ -36,9 +36,8 @@ class ToolSpec:
             raise ValueError("timeout_sec must be positive and finite")
 
     def permitted(self, scope: AuthScope) -> bool:
-        return (not scope.allowed_tools or self.name in scope.allowed_tools) and (
-            self.risk_level == RiskLevel.READ or scope.allow_write
-        )
+        tool_ok = scope.allowed_tools is None or self.name in scope.allowed_tools
+        return tool_ok and (self.risk_level == RiskLevel.READ or scope.allow_write)
 
 
 class ToolRegistry:

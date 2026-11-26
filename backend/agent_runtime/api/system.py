@@ -10,9 +10,16 @@ from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from agent_runtime import __version__ as SDK_VERSION
+from agent_runtime.api.deps import (
+    caller_scope,
+    caller_scope_async,
+    require_access_async,
+    resolve_filter,
+)
 from agent_runtime.api.schemas import ModelConfigUpdateRequest
-from agent_runtime.framework.core.config import DEFAULT_BASE, resolve_identity
+from agent_runtime.framework.core.config import DEFAULT_BASE
 from agent_runtime.framework.core.contracts import PROTOCOL_VERSION
+from agent_runtime.framework.core.security import AccessDecision, ResourceRef
 
 router = APIRouter(tags=["System & Metadata"])
 
@@ -36,9 +43,10 @@ def health(req: Request):
 @router.get("/meta", summary="获取框架协议版本、已启用扩展、工具清单与 UI 元信息")
 def app_meta(req: Request):
     runtime = req.app.state.runtime
-    scope = resolve_identity(req, default_scope=runtime.default_identity())
+    scope = caller_scope(req)
     skills = []
     if hasattr(req.app.state.store, "list_skills"):
+        sk_flt = resolve_filter(req, scope, "skill:read", "skill")
         skills = [
             {
                 "slug": s.slug,
@@ -47,8 +55,31 @@ def app_meta(req: Request):
                 "tags": list(s.tags),
                 "resources": list(s.resources),
             }
-            for s in req.app.state.store.list_skills(scope)
+            for s in req.app.state.store.list_skills(scope, access_filter=sk_flt)
         ]
+    visible_tools = []
+    ac = runtime.access_controller
+    for s in runtime.registry.visible_specs(scope):
+        try:
+            decision = ac.check(
+                scope,
+                "tool:list",
+                ResourceRef("tool", id=s.name, tenant_id=scope.tenant_id, attrs={"risk_level": s.risk_level.value}),
+            )
+        except Exception as exc:
+            raise HTTPException(503, f"access_controller_error:{type(exc).__name__}") from exc
+        if not isinstance(decision, AccessDecision):
+            raise HTTPException(503, "invalid_access_decision")
+        if not decision.allowed:
+            continue
+        visible_tools.append(
+            {
+                "name": s.name,
+                "description": s.description,
+                "risk_level": s.risk_level.value,
+                "is_subagent": s.is_subagent,
+            }
+        )
     return {
         "sdk_version": SDK_VERSION,
         "protocol_version": PROTOCOL_VERSION,
@@ -64,15 +95,7 @@ def app_meta(req: Request):
             "error",
         ],
         **runtime.metadata().to_dict(),
-        "tools": [
-            {
-                "name": s.name,
-                "description": s.description,
-                "risk_level": s.risk_level.value,
-                "is_subagent": s.is_subagent,
-            }
-            for s in runtime.registry.list_specs()
-        ],
+        "tools": visible_tools,
         "skills": skills,
     }
 
@@ -84,6 +107,8 @@ async def get_model(req: Request):
 
 @router.post("/config/model", summary="热更新当前进程模型配置")
 async def update_model(req: Request, payload: ModelConfigUpdateRequest):
+    scope = await caller_scope_async(req)
+    await require_access_async(req, scope, "system:update_model", ResourceRef("system", tenant_id=scope.tenant_id))
     body = payload.model_dump(exclude_none=True)
     current = req.app.state.model.config
     cfg = replace(current, **{k: str(v).strip() for k, v in body.items()})

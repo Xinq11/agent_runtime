@@ -22,8 +22,8 @@ class PgArtifactsMixin:
             cur.execute(
                 """INSERT INTO tool_outputs(ref_id,tenant_id,resource_owner,tool_name,full_text,
                       preview,total_chars,expires_at,oss_key,thread_id)
-                   SELECT %s,%s,%s,%s,'',%s,%s,to_timestamp(%s),%s,thread_id
-                   FROM runtime_traces WHERE trace_id=%s RETURNING ref_id""",
+                   VALUES (%s,%s,%s,%s,'',%s,%s,to_timestamp(%s),%s,
+                           (SELECT thread_id FROM runtime_traces WHERE trace_id=%s))""",
                 (
                     ref,
                     ctx.auth_scope.tenant_id,
@@ -36,8 +36,6 @@ class PgArtifactsMixin:
                     ctx.trace_id,
                 ),
             )
-            if not cur.fetchone():
-                raise RuntimeError("missing trace owner")
         return ToolOutputBlob(
             ref,
             ctx.auth_scope.tenant_id,

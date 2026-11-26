@@ -10,7 +10,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from agent_runtime.api.deps import caller_scope
+from agent_runtime.api.deps import caller_scope, caller_scope_async
 from agent_runtime.api.schemas import AbortRequest, ChatRequest
 from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink, uid
 from agent_runtime.framework.core.contracts import SSEEvent
@@ -32,7 +32,7 @@ def get_run(run_id: str, req: Request):
 
 @router.post("/chat/abort", status_code=202, summary="主动中止正在执行或待审批的 Run")
 async def abort_chat(req: Request, body: AbortRequest):
-    scope = caller_scope(req)
+    scope = await caller_scope_async(req)
     try:
         rec = req.app.state.runtime.run_service.request_abort(
             scope=scope, run_id=body.run_id, thread_id=body.thread_id
@@ -56,7 +56,7 @@ async def chat_sse(req: Request, body: ChatRequest):
     if not isinstance(text, str) or not text.strip():
         raise HTTPException(422, "message 不能为空")
 
-    scope = caller_scope(req)
+    scope = await caller_scope_async(req)
     runtime = req.app.state.runtime
     store, graph, obs = req.app.state.store, req.app.state.graph, req.app.state.obs
     run_service = runtime.run_service

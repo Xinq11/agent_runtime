@@ -14,6 +14,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from agent_runtime import __version__ as SDK_VERSION
 from agent_runtime.api import approvals, chat_stream, ops, skills, state, system, threads
 from agent_runtime.framework.agent.app import AgentRuntimeApp, load_extension
+from agent_runtime.framework.core.security import load_access_controller, load_identity_resolver
 from agent_runtime.infra.llm.provider import OpenAICompatibleProvider
 from agent_runtime.infra.pg.postgres import PgOssStore
 from agent_runtime.infra.plg.telemetry import Telemetry
@@ -45,16 +46,20 @@ async def lifespan(app: FastAPI):
             await saver.setup()
             obs = Telemetry(store, client)
             model = OpenAICompatibleProvider(client, obs)
+            access_controller = load_access_controller()
             runtime = AgentRuntimeApp(
                 model=model,
                 store=store,
                 obs=obs,
                 checkpointer=saver,
                 extensions=extensions,
+                access_controller=access_controller,
             )
             await asyncio.to_thread(runtime.bootstrap_extensions)
+            identity_resolver = load_identity_resolver(default_scope=runtime.default_identity())
 
             app.state.runtime = runtime
+            app.state.identity_resolver = identity_resolver
             app.state.store = store
             app.state.obs = obs
             app.state.model = model

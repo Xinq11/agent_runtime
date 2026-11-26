@@ -10,10 +10,17 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from agent_runtime.api.deps import caller_scope
+from agent_runtime.api.deps import (
+    caller_scope,
+    caller_scope_async,
+    require_access,
+    require_access_async,
+    resolve_filter,
+)
 from agent_runtime.api.schemas import SkillUploadRequest, StatusUpdateRequest
 from agent_runtime.extensions.skills.extension import validate_resource_name, validate_skill_slug
 from agent_runtime.framework.core.config import MAX_DOCUMENT
+from agent_runtime.framework.core.security import ResourceRef
 
 _ALLOWED_SKILL_EXTS = {".md", ".markdown", ".txt", ".json", ".yaml", ".yml"}
 
@@ -22,17 +29,26 @@ router = APIRouter(tags=["Skills Management"])
 
 @router.get("/skills", summary="列出当前可用的全部 Skill")
 def list_skills(req: Request, query: str = ""):
-    items = req.app.state.store.list_skills(caller_scope(req), query=query)
+    scope = caller_scope(req)
+    flt = resolve_filter(req, scope, "skill:read", "skill")
+    items = req.app.state.store.list_skills(scope, query=query, access_filter=flt)
     return {"skills": [asdict(s) for s in items]}
 
 
 @router.get("/skills/{slug}", summary="读取指定 Skill 的 SKILL.md 正文或附属声明式资源")
 def get_skill(slug: str, req: Request, resource: str = "", include_disabled: bool = False):
+    scope = caller_scope(req)
+    clean = slug.strip().lower()
+    if include_disabled:
+        require_access(req, scope, "skill:manage", ResourceRef("skill", id=clean, tenant_id=scope.tenant_id))
+        flt = resolve_filter(req, scope, "skill:manage", "skill")
+    else:
+        flt = resolve_filter(req, scope, "skill:read", "skill")
     content, meta, err = req.app.state.store.get_skill_content(
-        caller_scope(req),
-        slug.strip().lower(),
+        scope,
+        clean,
         resource=resource.strip() or None,
-        include_disabled=include_disabled,
+        access_filter=flt,
     )
     if err or content is None or meta is None:
         raise HTTPException(404, err or "skill_not_found")
@@ -51,7 +67,8 @@ def _validate_uploaded_filename(filename: str) -> None:
 
 @router.post("/skills/upload", summary="上传/发布新版本声明式 Skill 到 OSS + PG（支持文件或 JSON）")
 async def upload_skill(req: Request):
-    scope = caller_scope(req)
+    scope = await caller_scope_async(req)
+    await require_access_async(req, scope, "skill:manage", ResourceRef("skill", tenant_id=scope.tenant_id))
     raw_resources: dict[str, str] = {}
     tags: list[str] = []
     acl_roles: list[str] | None = None
@@ -75,6 +92,7 @@ async def upload_skill(req: Request):
                 fallback_slug = ""
             raw_slug = str(form.get("slug") or fallback_slug)
             description = str(form.get("description") or "")
+            acl_roles = [str(r) for r in form.getlist("acl_roles")]
     else:
         try:
             body = SkillUploadRequest.model_validate(await req.json())
@@ -107,7 +125,7 @@ async def upload_skill(req: Request):
             raise HTTPException(413, f"附属资源 {safe_name} 超过 2 MiB 上限")
         clean_resources[safe_name] = str(rbody)
 
-    roles = acl_roles or list(scope.roles) or ["user"]
+    roles = [str(r).strip() for r in (acl_roles or []) if str(r).strip()]
 
     summary = await asyncio.to_thread(
         req.app.state.store.publish_skill,
@@ -132,8 +150,10 @@ async def upload_skill(req: Request):
 
 @router.patch("/skills/{slug}/status", summary="切换 Skill 生效/下架状态")
 def update_skill_status(slug: str, req: Request, body: StatusUpdateRequest):
+    scope = caller_scope(req)
     clean = slug.strip().lower()
-    ok = req.app.state.store.set_skill_status(caller_scope(req), clean, body.status)
+    require_access(req, scope, "skill:manage", ResourceRef("skill", id=clean, tenant_id=scope.tenant_id))
+    ok = req.app.state.store.set_skill_status(scope, clean, body.status)
     if not ok:
         raise HTTPException(404, "skill_not_found")
     return {"ok": True, "slug": clean, "status": body.status}
@@ -141,7 +161,10 @@ def update_skill_status(slug: str, req: Request, body: StatusUpdateRequest):
 
 @router.delete("/skills/{slug}", summary="下线/禁用指定 Skill")
 def disable_skill(slug: str, req: Request):
-    ok = req.app.state.store.disable_skill(caller_scope(req), slug.strip().lower())
+    scope = caller_scope(req)
+    clean = slug.strip().lower()
+    require_access(req, scope, "skill:manage", ResourceRef("skill", id=clean, tenant_id=scope.tenant_id))
+    ok = req.app.state.store.disable_skill(scope, clean)
     if not ok:
         raise HTTPException(404, "skill_not_found")
-    return {"ok": True, "slug": slug.strip().lower(), "status": "disabled"}
+    return {"ok": True, "slug": clean, "status": "disabled"}

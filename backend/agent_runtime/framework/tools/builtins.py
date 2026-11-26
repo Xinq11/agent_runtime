@@ -9,9 +9,15 @@ from __future__ import annotations
 import json
 import posixpath
 import re
-from typing import Any
+from typing import Any, Optional
 
 from agent_runtime.framework.core.contracts import ExecutionContext, RiskLevel, ToolResult
+from agent_runtime.framework.core.security import (
+    AccessControlError,
+    AuthorizationError,
+    ResourceRef,
+    enforce_check,
+)
 from agent_runtime.framework.tools.gateway import ToolRegistry, ToolSpec
 
 MAX_WORKSPACE_FILE_BYTES = 1024 * 1024  # 1 MiB
@@ -33,7 +39,12 @@ def normalize_logical_path(raw: str) -> str:
     return norm
 
 
-def register_immutable_builtin_tools(registry: ToolRegistry, store: Any) -> None:
+def register_immutable_builtin_tools(
+    registry: ToolRegistry,
+    store: Any,
+    *,
+    access_controller: Optional[Any] = None,
+) -> None:
     """Register the 3 locked built-in tools (`read`, `write`, `read_tool_output`)."""
 
     async def handle_read(args: dict, ctx: ExecutionContext) -> Any:
@@ -105,6 +116,25 @@ def register_immutable_builtin_tools(registry: ToolRegistry, store: Any) -> None
     async def handle_read_output(args: dict, ctx: ExecutionContext) -> Any:
         if not isinstance(args["ref_id"], str):
             return ToolResult("", "read_tool_output", "[invalid_args] ref_id", ok=False, error_code="invalid_args")
+        if access_controller is not None:
+            try:
+                await enforce_check(
+                    access_controller,
+                    ctx.auth_scope,
+                    "artifact:read",
+                    ResourceRef(
+                        kind="artifact",
+                        id=args["ref_id"],
+                        tenant_id=ctx.auth_scope.tenant_id,
+                        owner_id=ctx.auth_scope.user_id,
+                    ),
+                )
+            except AuthorizationError as exc:
+                return ToolResult(
+                    "", "read_tool_output", f"[permission_denied] {exc.reason}", ok=False, error_code="permission_denied"
+                )
+            except AccessControlError as exc:
+                return ToolResult("", "read_tool_output", f"[acl_error] {exc}", ok=False, error_code="acl_error")
         page, error = store.read_tool_output_page(
             ctx, args["ref_id"], args.get("offset", 0), args.get("limit", 1200)
         )

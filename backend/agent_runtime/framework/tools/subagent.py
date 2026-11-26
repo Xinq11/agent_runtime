@@ -73,9 +73,36 @@ async def run_readonly_subagent(
         final_answer = ""
 
         for _step in range(profile.max_steps):
-            visible_specs = tool_gateway.registry.visible_specs(
+            raw_specs = tool_gateway.registry.visible_specs(
                 sub_ctx.auth_scope, include_subagents=False
             )
+            ac = getattr(tool_gateway, "access_controller", None)
+            if ac is not None and raw_specs:
+                from agent_runtime.framework.core.security import (
+                    AuthorizationError,
+                    ResourceRef,
+                    enforce_check,
+                )
+
+                visible_specs = []
+                for sp in raw_specs:
+                    try:
+                        await enforce_check(
+                            ac,
+                            sub_ctx.auth_scope,
+                            "tool:list",
+                            ResourceRef(
+                                kind="tool",
+                                id=sp.name,
+                                tenant_id=sub_ctx.auth_scope.tenant_id,
+                                attrs={"risk_level": sp.risk_level.value, "is_subagent": False},
+                            ),
+                        )
+                        visible_specs.append(sp)
+                    except AuthorizationError:
+                        continue
+            else:
+                visible_specs = raw_specs
             resp = await model_client.generate(
                 messages=private_msgs,
                 tool_specs=visible_specs,

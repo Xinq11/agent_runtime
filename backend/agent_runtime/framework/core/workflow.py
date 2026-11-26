@@ -7,6 +7,9 @@ from dataclasses import asdict
 import time
 from typing import Any, Callable, Dict, Optional
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+
 from agent_runtime.framework.context.memory import (
     ContextBudget,
     assemble_before_model,
@@ -14,13 +17,13 @@ from agent_runtime.framework.context.memory import (
 )
 from agent_runtime.framework.core.config import publish_sse, unpack_message
 from agent_runtime.framework.core.contracts import AuthScope, ExecutionContext, Message, SpanRecord
-from agent_runtime.framework.core.langgraph_compat import (
-    END,
-    START,
-    build_state_graph,
-    default_checkpointer,
-)
 from agent_runtime.framework.core.middleware import MiddlewareChain
+from agent_runtime.framework.core.security import (
+    AuthorizationError,
+    ResourceRef,
+    enforce_check,
+    get_policy_rev,
+)
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是通用智能助手。必要时先调用工具核实事实再作答，知识库结论标注来源 [1]。"
@@ -34,14 +37,22 @@ def run_context(
     *,
     on_event: Optional[Any] = None,
     cancel_checker: Optional[Callable[[str], bool]] = None,
+    access_controller: Optional[Any] = None,
 ) -> ExecutionContext:
     rid = str(state.get("run_id") or "")
+    scope = AuthScope(**state["scope"])
+    policy_rev = (
+        get_policy_rev(access_controller, scope)
+        if access_controller is not None
+        else int(state.get("policy_rev", 1))
+    )
     return ExecutionContext(
         trace_id=state["trace_id"],
         thread_id=state["thread_id"],
         request_id=state["request_id"],
         run_id=rid,
-        auth_scope=AuthScope(**state["scope"]),
+        auth_scope=scope,
+        policy_rev=policy_rev,
         on_event=on_event or publish_sse,
         parent_span_id=state["trace_id"] + "_root",
         is_cancelled=(lambda: cancel_checker(rid)) if (cancel_checker and rid) else None,
@@ -61,7 +72,7 @@ def build_agent_graph(
     max_steps: int = 8,
     on_event: Optional[Any] = None,
     cancel_checker: Optional[Callable[[str], bool]] = None,
-    prefer_real_langgraph: bool = True,
+    access_controller: Optional[Any] = None,
 ):
     """Build and compile the single unified LangGraph StateGraph used everywhere."""
     mw = middlewares or MiddlewareChain()
@@ -72,7 +83,12 @@ def build_agent_graph(
             raise asyncio.CancelledError("Run cancelled by user")
 
     async def generation(state: Dict[str, Any]) -> Dict[str, Any]:
-        ctx = run_context(state, on_event=on_event, cancel_checker=cancel_checker)
+        ctx = run_context(
+            state,
+            on_event=on_event,
+            cancel_checker=cancel_checker,
+            access_controller=access_controller,
+        )
         _guard_cancel(ctx)
         persisted_count = int(state.get("persisted_count", 0))
         pending = [unpack_message(m) for m in state["messages"][persisted_count:]]
@@ -112,7 +128,27 @@ def build_agent_graph(
             parent_span_id=ctx.parent_span_id,
             attributes={"mode": mode_name, "model": model_name, "step": step_num},
         ) as m_sp:
-            specs = gateway.registry.visible_specs(ctx.auth_scope) if state["step"] < max_steps - 1 else []
+            raw_specs = gateway.registry.visible_specs(ctx.auth_scope) if state["step"] < max_steps - 1 else []
+            if access_controller is not None and raw_specs:
+                specs = []
+                for sp in raw_specs:
+                    try:
+                        await enforce_check(
+                            access_controller,
+                            ctx.auth_scope,
+                            "tool:list",
+                            ResourceRef(
+                                kind="tool",
+                                id=sp.name,
+                                tenant_id=ctx.auth_scope.tenant_id,
+                                attrs={"risk_level": sp.risk_level.value, "is_subagent": sp.is_subagent},
+                            ),
+                        )
+                        specs.append(sp)
+                    except AuthorizationError:
+                        continue
+            else:
+                specs = raw_specs
             msg = await model.generate(messages=inputs, tool_specs=specs, ctx=ctx)
             _guard_cancel(ctx)
             msg = await mw.run_after_model(msg, ctx)
@@ -136,7 +172,12 @@ def build_agent_graph(
         return {**state, "step": step_num, "messages": [*state["messages"], asdict(msg)]}
 
     async def tools_node(state: Dict[str, Any]) -> Dict[str, Any]:
-        ctx = run_context(state, on_event=on_event, cancel_checker=cancel_checker)
+        ctx = run_context(
+            state,
+            on_event=on_event,
+            cancel_checker=cancel_checker,
+            access_controller=access_controller,
+        )
         _guard_cancel(ctx)
         counts = dict(state["counts"])
         last_asst = unpack_message(state["messages"][-1])
@@ -204,7 +245,12 @@ def build_agent_graph(
         }
 
     async def finish(state: Dict[str, Any]) -> Dict[str, Any]:
-        ctx = run_context(state, on_event=on_event, cancel_checker=cancel_checker)
+        ctx = run_context(
+            state,
+            on_event=on_event,
+            cancel_checker=cancel_checker,
+            access_controller=access_controller,
+        )
         _guard_cancel(ctx)
         with obs.span(
             trace_id=ctx.trace_id,
@@ -234,7 +280,7 @@ def build_agent_graph(
         obs.log_event("turn_done", ctx.trace_id, ctx.thread_id, compacted=comp.get("compacted", False))
         return {**state, "final_answer": final_answer, "persisted_count": len(state["messages"])}
 
-    graph = build_state_graph(dict, prefer_real_langgraph=prefer_real_langgraph)
+    graph = StateGraph(dict)
     graph.add_node("model", generation)
     graph.add_node("tools", tools_node)
     graph.add_node("finish", finish)
@@ -246,9 +292,7 @@ def build_agent_graph(
     )
     graph.add_edge("tools", "model")
     graph.add_edge("finish", END)
-    return graph.compile(
-        checkpointer=checkpointer or default_checkpointer(prefer_real_langgraph=prefer_real_langgraph)
-    )
+    return graph.compile(checkpointer=checkpointer or InMemorySaver())
 
 
 async def invoke_phase(graph: Any, store: Any, payload: Any, cfg: dict, trace: str, start_ms: int) -> dict:

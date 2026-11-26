@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import AuthScope, SkillSummary
+from agent_runtime.framework.core.security import AccessFilter
+from agent_runtime.infra.pg.acl_sql import compile_acl_sql, default_access_filter
 
 
 class PgSkillsMixin:
@@ -99,17 +101,26 @@ class PgSkillsMixin:
         )
 
     def list_skills(
-        self, scope: AuthScope, *, query: str = "", include_disabled: bool = False
+        self,
+        scope: AuthScope,
+        *,
+        query: str = "",
+        include_disabled: bool = False,
+        bypass_acl: bool = False,
+        access_filter: Optional[AccessFilter] = None,
     ) -> List[SkillSummary]:
-        status_clause = "" if include_disabled else "AND s.status='active'"
+        flt = access_filter or default_access_filter(
+            scope, unrestricted=bypass_acl, include_disabled=include_disabled
+        )
+        acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="s")
         rows = self.rows(
             f"""SELECT s.tenant_id, s.slug, v.version_id, v.version_num, v.description,
                        v.tags, s.acl_roles, v.resources, s.revision, s.status
                 FROM agent_skills s
                 JOIN agent_skill_versions v ON v.version_id = s.active_version_id
-                WHERE s.tenant_id=%s {status_clause}
+                WHERE {acl_sql}
                 ORDER BY (s.status = 'active') DESC, s.slug""",
-            (scope.tenant_id,),
+            acl_params,
         )
         q = query.strip().lower()
         out: List[SkillSummary] = []
@@ -127,15 +138,20 @@ class PgSkillsMixin:
         *,
         resource: Optional[str] = None,
         include_disabled: bool = False,
+        bypass_acl: bool = False,
+        access_filter: Optional[AccessFilter] = None,
     ) -> Tuple[Optional[str], Optional[SkillSummary], Optional[str]]:
-        status_clause = "" if include_disabled else "AND s.status='active'"
+        flt = access_filter or default_access_filter(
+            scope, unrestricted=bypass_acl, include_disabled=include_disabled
+        )
+        acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="s")
         rows = self.rows(
             f"""SELECT s.tenant_id, s.slug, v.version_id, v.version_num, v.description,
                        v.tags, s.acl_roles, v.resources, s.revision, s.status, v.oss_key, v.manifest
                 FROM agent_skills s
                 JOIN agent_skill_versions v ON v.version_id = s.active_version_id
-                WHERE s.tenant_id=%s AND s.slug=%s {status_clause}""",
-            (scope.tenant_id, slug),
+                WHERE {acl_sql} AND s.slug=%(slug)s""",
+            {**acl_params, "slug": slug},
         )
         if not rows:
             return None, None, "skill_not_found"

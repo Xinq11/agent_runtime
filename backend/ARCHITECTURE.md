@@ -1,189 +1,138 @@
-# `agent_runtime` 后端架构设计文档（v1.0）
+# Agent Runtime · 后端架构
 
-> **包根路径**：`backend/agent_runtime/`（统一对外导入：`from agent_runtime import ...`）  
-> **定位**：面向研发团队共享的企业级 **通用 Agent Runtime SDK + 生产级基础设施底座（PG / OSS / PLG / LLM）+ 可插拔能力扩展层 + 标准 HTTP / SSE v1 协议层**。
+客户代码决定 Agent 能办什么事。共享 SDK 负责一轮对话怎样运行、调用工具后怎样继续，以及中途暂停后从哪里恢复。Python 应用可以直接装配 SDK，参考 HTTP 服务则把同一条执行路径开放给 Studio 和客户门户。
 
----
-
-## 1. 四层总体架构
-
-系统按**依赖单向收敛、职责细粒度拆包**原则划分为四层，核心引擎层（`framework/`）不写任何原始 SQL，也不耦合具体客户业务或前端框架：
-
-```mermaid
-flowchart TB
-    FE["任意可插拔前端 (官方 React Studio / Vue / 企业门户 / CLI)"]
-
-    subgraph L4["Layer 4: api/ 传输契约层 (FastAPI · HTTP + SSE v1 · OpenAPI)"]
-        direction LR
-        API_MAIN["main.py<br/>(lifespan 托管连接池与 Checkpointer)"]
-        API_STREAM["chat_stream.py<br/>(/chat/sse 非阻塞推流, /chat/abort, /runs/{id})"]
-        API_TH["threads.py / approvals.py / state.py<br/>(会话 CRUD 与级联删 / 审批恢复 / Trace 快照)"]
-        API_OPS["ops.py / skills.py / system.py<br/>(知识库文件上传与上下架 / Skills / 健康检查)"]
-    end
-
-    subgraph L1["Layer 1: framework/ 通用内核 SDK (零 SQL · 启动后冻结注册表)"]
-        direction LR
-        AGENT["agent/<br/>BaseAgent 基类 · AgentRuntimeApp 装配器 · load_extension"]
-        CORE["core/<br/>workflow.py (LangGraph StateGraph)<br/>runs.py (RunService 持久状态机)<br/>contracts/ (分域契约) · langgraph_compat.py"]
-        CTX["context/memory.py<br/>原子工具组连续裁剪 · 游标模型摘要压缩"]
-        TOOLS["tools/<br/>registry.py · gateway.py (类型校验+审批+幂等)<br/>events.py · builtins.py (read/write/read_tool_output) · subagent.py"]
-    end
-
-    subgraph L2["Layer 2: extensions/ 可插拔扩展与客户交付层"]
-        direction LR
-        EXT_RAG["rag/<br/>RagExtension + RAG 7 阶段管线<br/>(ranking / evidence / retrieval / 可插拔 clients)"]
-        EXT_SKILLS["skills/<br/>SkillsExtension (list_skills / get_skill)<br/>声明式文本校验 (禁可执行脚本)"]
-        EXT_CUST["customers/enterprise_expense/<br/>示例客户包 (业务 @tool · 只读子代理 · 种子数据)"]
-    end
-
-    subgraph L3["Layer 3: infra/ 生产级基础设施底座"]
-        direction LR
-        INFRA_PG["pg/ (PgOssStore 门面 + 8 个分域仓储)<br/>ConnectionPool · pgvector · runs/approvals/artifacts/skills"]
-        INFRA_OSS["oss/ (MinioObjectStore)<br/>大输出 · 工作区文件 · 知识原文 · Skill 版本"]
-        INFRA_PLG["plg/ (Telemetry / Hub)<br/>Prometheus 低基数指标 · Loki 批量日志 · PG Spans"]
-        INFRA_LLM["llm/ (OpenAICompatibleProvider)<br/>DeepSeek / OpenAI / vLLM 流式 + MockScriptedLLM"]
-        INFRA_MEM["memory/ (InMemoryStore)<br/>零依赖离线测试内存双份实现"]
-    end
-
-    subgraph EXT["Docker Compose 基础设施"]
-        PG[("PostgreSQL 16 + pgvector")]
-        OSS[("MinIO OSS")]
-        PLG[("Prometheus + Loki + Grafana")]
-        LLM(("DeepSeek / OpenAI 兼容模型"))
-    end
-
-    FE -- "HTTP REST (/api/v1/*)" --> L4
-    L4 -- "SSE v1 Envelope (id / schema_version / run_id / seq / type / payload)" --> FE
-
-    L4 --> AGENT
-    L4 --> CORE
-    AGENT --> CORE
-    AGENT --> TOOLS
-    AGENT --> L2
-    CORE --> CTX
-    CORE --> TOOLS
-    CORE --> INFRA_LLM
-    TOOLS --> INFRA_PG
-    TOOLS --> INFRA_PLG
-    EXT_RAG --> INFRA_PG
-    EXT_SKILLS --> INFRA_PG
-    INFRA_PG --> PG
-    INFRA_PG --> INFRA_OSS
-    INFRA_OSS --> OSS
-    INFRA_PLG --> PG
-    INFRA_PLG --> PLG
-    INFRA_LLM --> LLM
-```
+[项目首页](../README.md) · [HTTP / SSE v1 契约](API.md) · [后端源码](agent_runtime/)
 
 ---
 
-## 2. 单轮对话执行与持久化时序
+## 1. 总图、分层边界与装配生命周期
 
-```mermaid
-sequenceDiagram
-    participant C as Client (SSE)
-    participant API as api/chat_stream.py
-    participant RUN as RunService + PG
-    participant G as LangGraph (workflow.py)
-    participant LLM as LLMProvider
-    participant GW as ToolGateway
-    participant PG as PgOssStore / OSS
+![SDK 和 HTTP 入口共用 AgentRuntimeApp，客户扩展接入执行循环与工具网关](assets/architecture-overview.png)
 
-    C->>API: POST /api/v1/chat/sse
-    API->>RUN: start_run() 短事务写 agent_runs (防并发 409)
-    API->>G: 启动后台 worker Task (独立于 HTTP 连接)
-    API-->>C: event: meta (run_id, thread_id, trace_id)
+### 四层职责与依赖约定
 
-    loop 最多 max_steps 轮推理
-        G->>PG: to_thread: get_summary + list_messages(cursor)
-        G->>G: assemble_before_model (原子工具组连续裁剪)
-        G->>LLM: stream generate (增量 token -> publish_sse)
-        LLM-->>C: event: token (若客户端断开或阻塞超时则标 closed 停止推流)
-        alt 返回 tool_calls
-            G->>GW: execute_batch (类型校验 -> 审批 interrupt -> op_key 幂等 -> 执行/截断落 OSS)
-            GW-->>C: event: tool_status / subagent_status
-            G->>PG: to_thread: save_turn_messages(step_key="tools:{step}") 原子落库并推进 persisted_count
-        else 无 tool_calls (进入 finish)
-            G->>PG: to_thread: save_turn_messages(step_key="finish") + compact_after_agent
-        end
-    end
+| 层 | 负责什么 | 从哪里读代码 |
+| --- | --- | --- |
+| 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流 | [api/main.py](agent_runtime/api/main.py) · [chat_stream.py](agent_runtime/api/chat_stream.py) |
+| 内核 (`framework/`) | 装配模型与扩展，构建执行图，管理上下文预算、Run 状态机与工具网关 | [agent/app.py](agent_runtime/framework/agent/app.py) · [core/workflow.py](agent_runtime/framework/core/workflow.py) |
+| 扩展 (`extensions/`) | 提供 RAG、Skills 标准扩展与客户业务工具；费用包演示查询 BI 与写回执 | [RAG](agent_runtime/extensions/rag/) · [Skills](agent_runtime/extensions/skills/) · [费用包](agent_runtime/extensions/customers/enterprise_expense/) |
+| 基础设施 (`infra/`) | 适配 PostgreSQL + pgvector、MinIO 对象存储、LLM 服务与 PLG 观测 | [PG](agent_runtime/infra/pg/) · [OSS](agent_runtime/infra/oss/) · [LLM](agent_runtime/infra/llm/) · [PLG](agent_runtime/infra/plg/) |
 
-    API->>RUN: mark_finished(completed / paused / cancelled / failed)
-    API-->>C: event: done / approval_required / cancelled / error
-```
+**依赖方向与客户隔离原则：**
+- 目标依赖方向为 `api -> extensions -> framework <- infra`：内核只依赖稳定契约与协议，基础设施适配内核契约，客户业务表、提示词与外部系统连接器封装在独立客户包内（不写入平台 `sql/` 或 `framework/`）。
+- *当前工作树已知待收敛偏差*：① 示例表 `oa_approvals` 仍在 `sql/002_oss_and_kb.sql` 与 `infra/pg/sessions.py` 的删除逻辑中；② `infra/llm/mock.py` 直接导入费用演示脚本；③ `infra/pg/rag_repo.py` 导入 `extensions/rag/text_utils.py`；④ `AgentRuntimeApp.__init__` 懒导入默认 PG/PLG/Mock 实现。新增客户包请严格遵守上述隔离原则，避免继续向公共层写入业务代码。
+
+### 启动装配 vs 每次执行
+
+1. **启动装配（一次）**：`AgentRuntimeApp` 构造 → 注册不可变内置工具（`read` / `write` / `read_tool_output`）→ 加载自定义工具、子 Agent 与 `extensions`（`AGENT_EXTENSIONS` 支持外部独立 Python 包 `pkg.mod:Plugin`）→ **冻结 `ToolRegistry`**（运行期禁止篡改工具表）→ 执行幂等 `bootstrap_extensions()`（种子知识、默认 Skill）。
+2. **每次执行（按请求）**：创建/校验会话 → 登记持久化 `agent_runs` → 写入用户消息并触发统一 LangGraph 执行图 → 流式推送 SSE v1 事件并按步落库 → 正常收敛或暂停等待审批恢复。
+
+> **同进程运行边界**：客户 Python 插件与后端运行在同一进程内，应按业务代码同等级评审、打包与发布，更新后重启服务生效。
 
 ---
 
-## 3. Run 生命周期与流式 Abort 状态机
+## 2. 一轮请求：模型决定下一步，Runtime 负责执行
 
-系统放弃了跨长连接持有 PG Advisory Lock 的做法，改用 `agent_runs` 持久表 + 进程内取消信号协同，保证流式输出期间随时可安全中止，且已取消的 Run 不可被滞后审批复活：
+以费用示例“核查差旅超标并发起审批”为例。Python SDK（`app.run_turn` / `app.resume_approval`）与 HTTP 服务共用以下单一 LangGraph `StateGraph` 执行图：
 
-```mermaid
-stateDiagram-v2
-    [*] --> running: POST /api/v1/chat/sse (短事务写 agent_runs，单会话活跃唯一约束)
-    running --> paused: HIGH_RISK 工具触发 interrupt()
-    running --> completed: finish 节点正常收尾
-    running --> cancelled: POST /api/v1/chat/abort
-    running --> failed: 未捕获异常
-    paused --> running: POST /api/v1/approvals/{review_id}/resume (先验票据再切换)
-    paused --> cancelled: POST /api/v1/chat/abort (终态，拒绝旧审批恢复)
-    completed --> [*]
-    cancelled --> [*]
-    failed --> [*]
-```
+![模型请求工具后接收结果继续推理，高危调用等待审批后恢复](assets/turn-execution.png)
+
+1. **组装上下文（`before_model`）**：读出历史摘要与摘要游标之后的消息，拼接当前轮尚未持久化的临时消息。预算超限时以**原子工具组**（`assistant(tool_calls)` + 对应全部 `tool` 结果）为单位从旧到新连续裁剪；若最新一组自身超窗则截断工具正文而非丢弃配对，避免模型看到孤立的 `tool_call`。[上下文组装](agent_runtime/framework/context/memory.py)
+2. **执行工具（`tools_node` → `ToolGateway`）**：按 `RiskLevel` 分流（只读工具受限并行，写/高危工具串行），依次执行权限收窄校验、JSON Schema 参数校验、循环熔断、高危审批拦截、幂等抢占与超时控制。返回过大时将原文落 MinIO，仅把预览与 `ref_id` 放回上下文，由 `read_tool_output` 分页续读。[工具网关](agent_runtime/framework/tools/gateway.py)
+3. **按步记录进度**：每批工具完成后，图节点以 `(thread_id, trace_id, step_key)` 幂等写入本批消息并推进 `persisted_count`。最终答复在 `finish` 节点落库后，再判断是否触发 `compact_after_agent` 推进摘要游标。[执行图](agent_runtime/framework/core/workflow.py)
+4. **跨轮审批恢复**：`HIGH_RISK` 工具通过 LangGraph `interrupt()` 暂停，前端收到 `approval_required`。提交决定后，服务校验检查点挂起票据与运行状态，记录决定并以 `Command(resume=review_id)` 恢复同一检查点继续执行。[审批入口](agent_runtime/api/approvals.py) · [运行状态](agent_runtime/framework/core/runs.py)
 
 ---
 
-## 4. 模块职责与文件映射
+## 3. 状态归属、存储分工与标识串联
 
-所有核心模块按单一职责控制在 ~200 行量级，避免大文件堆积：
+核心标识关联：`request_id`（客户端请求关联标识，并参与写动作 `op_key` 计算；当前 HTTP 入口不按 `request_id` 去重）→ `run_id`（一次运行生命周期，受同会话活跃唯一约束保护）→ `trace_id`（单轮观测链路）→ `op_key`（基于会话、用户、请求、工具名与 `tool_call.id` 计算的写动作幂等键）→ `thread_id`（会话与 LangGraph 检查点归属）。
 
-| 层级 | 目录 / 文件 | 核心职责 |
-| :--- | :--- | :--- |
-| **Layer 1 · 装配** | `framework/agent/app.py`, `base.py` | `AgentRuntimeApp` 统一装配内核、扩展、冻结 `ToolRegistry`、`execute_run_state` 与 `resume_approval` 唯一编排入口；`BaseAgent` 声明式继承基类 |
-| **Layer 1 · 内核** | `framework/core/workflow.py`, `runs.py`, `config.py`, `middleware.py`, `protocols.py`, `approval_rules.py` | 无 SQL 的 LangGraph `StateGraph` 编排；`RunService` 持久状态机与本地 TTL 节流；非阻塞 `publish_sse`；中间件链与公开扩展协议；审批票据校验纯规则 |
-| **Layer 1 · 契约与图** | `framework/core/contracts/{identity,messages,runtime,artifacts}.py`, `langgraph_compat.py`, `mini_graph.py` | 零依赖 dataclass 契约；自动选择真 `langgraph`（+ `InMemorySaver` / `AsyncPostgresSaver`）或离线 `MiniStateGraph` |
-| **Layer 1 · 上下文** | `framework/context/memory.py` | 前缀缓存友好组装、原子工具组连续裁剪（遇超限即 `break`，最新单组超限安全截断 `tool` 内容）、游标式模型摘要压缩 |
-| **Layer 1 · 工具** | `framework/tools/{registry,gateway,events,builtins,decorator,subagent}.py` | 不可变内置工具保护与启动冻结；JSON Schema 参数类型校验（拦截 `bool` 冒充 `int`）、审批拦截、`op_key` 幂等、截断落 OSS；`@tool` 装饰器；只读子 Agent（`max_depth=1`） |
-| **Layer 2 · RAG** | `extensions/rag/{models,clients,ranking,evidence,retrieval,text_utils,extension}.py` | 内置 RAG 7 阶段检索（Sparse/Dense 召回 → RRF → 邻接 Child 扩展 → 每文档上限 2 多样化 → Rerank 含降级 → 终排融合 → 无分数父证据聚合），支持 `tool` / `auto_inject` / `both` 与自定义 `RAGStrategy` |
-| **Layer 2 · Skills** | `extensions/skills/extension.py` | PG 目录 + 不可变 OSS 版本；暴露 `list_skills` / `get_skill` 只读工具；上传边界拦截可执行脚本（`.py`/`.sh`/`.exe` 等） |
-| **Layer 2 · 示例包** | `extensions/customers/enterprise_expense/` | 独立客户交付示例（BI/OA `@tool`、只读 `call_bi_analyst` 子代理、种子文档与 SOP Skill、离线演示脚本） |
-| **Layer 3 · PG 仓储** | `infra/pg/{base,sessions,runs,approvals,artifacts,skills,rag_repo,ops_queries,postgres}.py` | `PgBase` 托管 `psycopg_pool.ConnectionPool`；按 8 个业务子域拆分的仓储 Mixin，由 `PgOssStore` 薄门面组合 |
-| **Layer 3 · 其他底座** | `infra/oss/minio.py`, `infra/plg/{telemetry,hub}.py`, `infra/llm/{provider,mock}.py`, `infra/memory/` | MinIO S3 客户端；Prometheus 低基数指标 + Loki 异步批量推送；OpenAI 兼容流式 Provider；零依赖线程安全 `InMemoryStore` |
-| **Layer 4 · API** | `api/{main,deps,schemas,system,threads,chat_stream,approvals,state,skills,ops}.py` | `/api/v1/*` 规范路由（含隐藏 `/api/*` 兼容别名），零内联 SQL，提供会话级联删除、文件上传、知识库与 Skill 生效/下架热切换 |
+| 问题 | 去哪里查（存储层） | 关联键 / 前缀 |
+| --- | --- | --- |
+| 这次对话写入了哪些消息与摘要？ | PG：`agent_threads`、`session_messages`、`session_summaries` | `thread_id` |
+| 当前在执行、等审批还是已取消？ | PG 业务状态：`agent_runs`、`tool_approvals`；LangGraph 断点：`checkpoints*` | `run_id` / `review_id` / `thread_id` |
+| 同一个写动作是否执行过？ | PG：`tool_runs`（记录 `running`/`done`/`reconcile`、回执与结果引用） | `(tenant_id, op_key)` |
+| 原始大输出、工作区、知识与 Skill 原文在哪？ | PG 存元数据与向量索引（`tool_outputs`、`workspace_files`、`rag_parents`/`rag_chunks`、`agent_skills`/`agent_skill_versions`）；MinIO 存不可变原文 | `outputs/`、`workspaces/`、`knowledge/`、`skills/` |
+| 哪一步拖慢了响应？ | Prometheus（首 token / 工具状态）、Loki（结构化日志）、PG `agent_spans`（步骤耗时）、Grafana 看板 | `trace_id` |
+
+**检查点与连接生命周期**：
+- FastAPI `lifespan` 启动时打开 `psycopg_pool.ConnectionPool`（`PgOssStore`）、初始化 `AsyncPostgresSaver`、装配 `OpenAICompatibleProvider` 与后台日志推送协程，关闭时优雅刷盘并释放连接池。[启动与关闭](agent_runtime/api/main.py) · [PG 仓储](agent_runtime/infra/pg/postgres.py)
+- 直接嵌入 Python SDK 时，默认检查点为进程内 `InMemorySaver`；需要跨进程或跨重启恢复审批时，应显式传入持久化 checkpointer（如 `AsyncPostgresSaver`）。Mock 模型仅替代推理服务，PostgreSQL 与 MinIO 仍全程参与执行。
 
 ---
 
-## 5. 生产级可靠性与安全红线
+## 4. 断连、取消、重放与故障窗口
 
-1. **SSE 断连防死锁与不丢字策略**
-   - `chat_stream.py` 在 `stream()` 中轮询 `req.is_disconnected()` 并在 `finally` 标记 `closed = True` 同时唤醒队列；`publish_sse` 仅在队列满时有限等待（0.5s），超时自动将 sink 标记 `closed = True` 退出推流而不静默丢弃单条 token。
-   - 后台 `worker` 脱离断开的 HTTP 连接继续执行完毕并落库，确保 `agent_runs` 必然收敛至终态，彻底杜绝会话永久 `409` 锁死。
-2. **上下文原子工具组连续裁剪**
-   - `assemble_before_model` 将每条 `assistant(tool_calls)` 与对应全部 `tool` 结果视为不可分割的原子组，从最新组向前累计预算，遇到首个放不下的旧组立即 `break`，保证发给真实 OpenAI / DeepSeek API 的消息序列严格连续且绝无孤立 `tool_call`。
-   - 若当前最新单个工具组本身超过预算，优先对组内超长 `tool.content` 二分截断并保留完整配对。
-3. **按步原子幂等持久化与同批次中断保副作用**
-   - `tools_node` 在全部工具执行完毕后即刻按 `(thread_id, trace_id, step_key="tools:{step}")` 原子落库本步配对，并推进 `state["persisted_count"]`，下一轮 `before_model` 仅拼接 `history + pending[persisted_count:]` 防止重复喂给模型。
-   - 若同批次多工具（如 `[write_tool, slow_tool]`）在第二个工具处被 `Abort` 取消，`execute_batch` 通过 `completed_sink` 保留已完成工具的结果，`tools_node` 捕获 `CancelledError`（绝不捕获 `GRAPH_INTERRUPT_TYPES`）为未完成 call 补齐 `[cancelled]` `tool` 消息并同步落库，避免“写工具副作用已发生但历史失忆”。
-4. **高危审批与单动作幂等键**
-   - `op_key` 绑定 `(thread_id, user_id, request_id, tool_name, tool_call.id)`，同一轮合法多次写操作互不撞键；网关通过 `ctx.op_key` 透传给业务 handler，确保业务表与 `tool_runs` 幂等键完全一致。
-   - 真实 LangGraph 恢复 `interrupt()` 时会从头重放 `tools_node`，此前同批次已完成的 `WRITE` 工具命中 `tool_runs` 缓存直接回放，绝不二次执行副作用。
-5. **非阻塞异步热路径与连接池**
-   - `PgBase` 使用 `psycopg_pool.ConnectionPool`（在 FastAPI `lifespan` 中统一打开与关闭），async 图节点与关键路由通过 `asyncio.to_thread` 卸载同步 IO；`RunService.is_cancelled` 优先读取进程内取消标记并对 DB 轮询做 0.5s TTL 节流。
-6. **云原生并发写保护与热上下架**
-   - 工作区文件与 Skill 版本均采用唯一不可变 OSS 对象键（`uid` / `version_id`），先写 OSS 再在 PG 事务内原子递增版本号（`version + 1` / `FOR UPDATE`），避免并发写覆盖同一对象。
-   - 知识库文档（`PATCH /api/v1/knowledge/{parent_id}/status`）与 Skill（`PATCH /api/v1/skills/{slug}/status`）支持 `active` / `disabled` 实时切换，下架后立即停止被 RAG 召回或被 Agent 发现调用。
-7. **架构边界与当前阶段说明**
-   - **同进程扩展边界**：内置工具（`read`/`write`/`read_tool_output`）保护与启动后 `ToolRegistry.freeze()` 属于**工程解耦与防误覆盖边界**，同进程加载的 Python `AgentPlugin` 共享进程内存，不构成针对不可信恶意代码的 OS 沙箱。
-   - **默认身份约定**：当前基础服务默认采用统一基础权限，并信任上游内网网关传入的身份头（`X-Tenant-Id` / `X-User-Id`）；若需对外网开放或多租户强隔离，应在接入层 API 网关完成 JWT/OAuth 校验后再透传。
+| 情况 | 当前后端行为 | 客户开发 / 运维需要知道什么 |
+| --- | --- | --- |
+| 浏览器关闭或 SSE 消费过慢 | `publish_sse` 有限等待（0.5s），超时或断连后摘除推送队列，不再阻塞后台协程 | 后台运行可继续收敛并落库，不会锁死会话 409；回到页面查历史与状态，需主动停止时调用 Abort |
+| 用户在一批工具执行中途取消 | `tools_node` 捕获 `CancelledError`（不吞 LangGraph 中断异常），同步刷盘本批已完成结果并为未完成调用补 `[cancelled]`；`agent_runs` 不可逆置为 `cancelled`，拒绝迟到的审批恢复 | 已被下游业务系统受理的副作用仍需按业务规则补偿或人工核对 |
+| 审批恢复触发节点重放 | 网关用 `(tenant_id, op_key)` 抢占；已完成写动作直接复用已存回执，避免重复扣款或重复提单 | 对接真实 OA / 工单时，务必透传 `ctx.op_key` 给下游做幂等防重 |
+| 下游已受理但超时/中途取消（状态不确定） | 网关将 `tool_runs.status` 标记为 `reconcile` | 客户连接器需约定按 `op_key` 向外部系统查单对账的恢复手段 |
+| 进程崩溃或首条消息写入前故障 | PG 保存业务运行态、LangGraph 保存节点级检查点，二者覆盖不同窗口；进程异常退出后活跃 `agent_runs` 目前需人工/超时回收 | 计划在后续版本补充 `start_run` 与首条消息的事务收敛及超时僵尸 Run 自动回收机制 |
 
 ---
 
-## 6. 业务扩展方式
+## 5. 扩展契约：从费用示例换成客户项目
 
-下游团队无需改动 `framework/` 内核，按需选择以下 4 种标准接入方式：
+| 扩展协议 | 定位与适用场景 | 源码入口 |
+| --- | --- | --- |
+| `BaseAgent` | 面向单个完整垂直助手，集中声明系统提示词、工具、子 Agent、中间件与插件 | [agent/base.py](agent_runtime/framework/agent/base.py) |
+| `AgentPlugin` | 面向可复用的能力包或客户交付包（如 RAG、Skills、费用包），可组合挂入 `AgentRuntimeApp` | [core/protocols.py](agent_runtime/framework/core/protocols.py) |
+| `AgentMiddleware` | 模型前后与工具调用外层切面（`before_model` / `after_model` / `wrap_tool` / `after_turn`） | [core/middleware.py](agent_runtime/framework/core/middleware.py) |
+| `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider 与脚本 Mock） | [infra/llm/provider.py](agent_runtime/infra/llm/provider.py) |
+| `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](agent_runtime/extensions/rag/extension.py) |
 
-1. **挂载单个业务工具**：使用 `@tool(risk_level=...)` 装饰函数，自动生成 JSON Schema 与 `ctx: ExecutionContext` 注入。
-2. **交付领域扩展包**：继承 `AgentPlugin`，通过 `AGENT_EXTENSIONS=module.path:ClassName` 动态装配工具、只读子 Agent、中间件、提示词片段与种子数据。
-3. **定制主 Agent 模板**：继承 `BaseAgent`，声明 `system_prompt`、`build_tools()`、`build_subagents()`、`build_middlewares()`，直接调用 `.build_app()` 生成完整运行时。
-4. **替换检索策略**：向 `RagExtension` 注入自定义 `EmbeddingClient` / `RerankClient`（保留内置 RAG 7 阶段管线），或直接传入实现 `RAGStrategy` 协议的外部检索引擎（Milvus / ES / GraphRAG 等）。
+| 新客户需求 | 推荐接入方式 |
+| --- | --- |
+| 接入新业务系统（ERP / 工单 / OA） | 用 `@tool` 封装客户接口并标注 `RiskLevel`，通过独立客户包注册，由网关统一处理校验、超时、审批与幂等 |
+| 更换知识库检索 | 保留内置 7 阶段 RAG 并替换 `EmbeddingClient` / `RerankClient`，或传入自定义 `RagExtension(strategy=...)` |
+| 交付业务 SOP | 通过 `SkillsExtension` 发布版本化声明式文档与文本附件（拒绝可执行脚本），Agent 按需检索读取 |
+| 接入现有门户前端 | 对接 [HTTP / SSE v1 契约](API.md)，与参考 Studio 共用同一后端与运行状态 |
+
+---
+
+## 6. 安全边界与可拔插 ACL 架构（现状与演进）
+
+> 本节严格区分 **Phase 1 已落地能力** 与 **Phase 2–3 规划能力**。核心源码见 [security.py](agent_runtime/framework/core/security.py) 与 [acl_sql.py](agent_runtime/infra/pg/acl_sql.py)。
+
+### 6.1 可拔插双协议（Phase 1 已实现）
+
+业务路由、LangGraph 节点、工具网关、RAG 与 Skills 统一调用两个最小协议，全仓零 `if acl_enabled:` 散落分支：
+
+| 协议 | 职责与最小签名 | 内置实现与环境变量 |
+| --- | --- | --- |
+| `IdentityResolver`（认证 AuthN） | `resolve(context) -> AuthScope` | `StaticIdentityResolver`（`default`）、`HeaderIdentityResolver`（`header` / `signed_header`，复用 `itsdangerous` 对版本化规范 JSON 身份负载做 HMAC 验签）或自定义 `module:Symbol`（`AGENT_IDENTITY_RESOLVER`） |
+| `AccessController`（授权 AuthZ） | `check(scope, action, resource) -> AccessDecision`<br>`filter_for(scope, action, kind) -> AccessFilter`<br>`policy_rev(scope) -> int` | `RbacAccessController(admin_roles=None)`（`default`）、`NoopAccessController`（`noop`）、`RbacAccessController(admin_roles=..., platform_admin_roles=...)`（`rbac`，拆分租户管理 `AGENT_ADMIN_ROLES` 与平台运维 `AGENT_PLATFORM_ADMIN_ROLES`，可配 `AGENT_APPROVER_ROLES` / `AGENT_FORBID_SELF_APPROVAL`）或自定义 `module:Symbol`（`AGENT_ACCESS_CONTROLLER`） |
+
+**五项永不关闭的平台安全不变量**（即使装配 `NoopAccessController` 也始终生效）：
+1. **`tenant_id` 硬隔离**：`compile_acl_sql` 外层查询永远绑定 `tenant_id`，`enforce_filter` 拒绝跨租户过滤条件。
+2. **私有会话归属**：普通用户仅可访问本人会话。
+3. **工件所有者与 TTL**：大输出分页读取校验归属与有效期。
+4. **审批原子性与写幂等**：高危动作消费不可重放、写动作按 `(tenant_id, op_key)` 去重；HTTP 审批恢复的 `approver_id` 强制取自服务端已解析主体，不再采信请求体伪造值。
+5. **子 Agent 权限单调收窄**：`AuthScope.allowed_tools` 区分 `None`（不限）与 `()`（零权限），父子工具求交为空时可见目录与执行网关双双拒绝。
+
+**已落地的核心策略规则**：
+- **Fail-Closed**：任意 `AccessController` 抛异常或返回非法对象时一律 fail-closed（HTTP 返回 `503`，工具返回 `acl_error`，RAG 返回 `status="acl_error"`，绝不静默回退 `Noop`，且明确区别于 `no_hit`）。
+- **空值语义三分法**：资源 `acl_roles = ()` 表示租户公开；`AccessFilter(unrestricted=True)` 表示不限角色（仅 `Noop` 或已鉴权管理员）；`AccessFilter(unrestricted=False, any_roles=())` 表示无角色主体，仅命中公开资源，彻底消除空角色绕过及 RAG/Skills 行为冲突。
+- **白名单结构化 SQL 下推与混合父文防泄漏**：`compile_acl_sql` 仅编译 `AccessFilter` 白名单字段为参数化 SQL（遇到仓储未支持的 `owner_id`/`any_depts` 谓词直接 fail-closed 拒绝，严禁静默放宽或拼接原始 SQL）；同一谓词统一下推至 RAG（稀疏/向量/邻块）、Skills（列表/读取）、`/state` 知识目录与管理总览；当同一父文档包含未授权切片时自动跳过全文回填，仅聚合已授权切片。
+- **动态 `policy_rev` 与跨人审批**：`workflow.run_context` 每次节点进入实时读取 `access_controller.policy_rev(scope)`，暂停期间策略版本递增后，恢复消费自动因 `approval_mismatch` 拒绝执行；SDK 与 HTTP 共用的 `resume_approval` 强制以可信主体 `caller.user_id` 记录审批人，通过 `approval:decide` 支持受控跨人审批与“禁止申请人自批”。
+
+### 6.2 全链路受控资源矩阵与后续演进
+
+| 资源域 | 覆盖动作 | 当前状态（Phase 1 已覆盖） |
+| --- | --- | --- |
+| HTTP / SDK 入口 | 主体解析与验签 | 已支持 `default` / `header` / `signed_header`（版本化 JSON HMAC 验签失败返 `401`）及自定义解析器，并已透传至 [docker-compose.yml](../docker-compose.yml) |
+| Thread / Run | 创建、列表、历史、中止、删除 | 已在 PG 查询与 `RunService` 强制 `tenant_id + actor_id` 归属 |
+| Approval | 审批决定、恢复消费 | SDK 与 HTTP 均按 `caller.user_id` 署名，按 `approval:decide` 与 `policy_rev` 复核 |
+| Tool | `/meta`、主图与子 Agent 可见目录及网关执行 | 目录过滤与执行强拦双一致，子代理空交集返回零权限 |
+| RAG | 检索、邻块、父文与 `/state` 目录 | 统一通过 `AccessFilter` 下推 SQL，混合权限父文仅拼已授权段；失败返回 `status="acl_error"` |
+| Skills | 列表、正文、附件、上传、上下架 | 废除 `include_disabled` 绕过鉴权，管理与下架预览统一走 `skill:manage` |
+| Artifact / Workspace | HTTP 与 `read_tool_output` 分页续读、文件读写 | 统一校验 `artifact:read` 与所有者/TTL |
+| Ops / 模型配置 | `/ops/overview`、`/config/model`、KB/Skill 管理 | 拆分租户管理（`ops:view`/`kb:manage`/`skill:manage`）与平台运维（`platform:view_telemetry`/`system:update_model`），租户管理员无法读取进程级日志或修改共享模型 |
+
+**后续演进路线（Phase 2–3 规划）**：
+- **Phase 2（企业部门与增量同步）**：扩展部门/项目组映射表（`EXISTS` 关联大组授权）与文档级 ACL 增量同步。
+- **Phase 3（外部策略中心集成）**：提供 OPA / Casbin / 企业 IAM 适配器，支持无法下推时的“有界候选召回 → 批量鉴权 → 读取重排”（显式不承诺凑满 `top_k`）、多副本共享策略版本源与结构化决策审计日志。

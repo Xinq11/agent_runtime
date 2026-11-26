@@ -15,6 +15,7 @@ from typing import Any
 
 from agent_runtime.framework.core.contracts import ExecutionContext, RiskLevel, ToolResult
 from agent_runtime.framework.core.protocols import AgentPlugin
+from agent_runtime.framework.core.security import AccessControlError, enforce_filter
 from agent_runtime.framework.tools.gateway import ToolSpec
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
@@ -48,9 +49,17 @@ class SkillsExtension(AgentPlugin):
     )
 
     def register_tools(self, *, registry: Any, store: Any, model: Any, gateway: Any, obs: Any) -> None:
-        async def _list_skills(args: dict, ctx: ExecutionContext) -> str:
+        access_controller = getattr(gateway, "access_controller", None)
+
+        async def _list_skills(args: dict, ctx: ExecutionContext) -> Any:
             query = str(args.get("query") or "").strip()
-            items = store.list_skills(ctx.auth_scope, query=query)
+            flt = None
+            if access_controller is not None:
+                try:
+                    flt = await enforce_filter(access_controller, ctx.auth_scope, "skill:read", "skill")
+                except AccessControlError as exc:
+                    return ToolResult("", "list_skills", f"[acl_error] {exc}", ok=False, error_code="acl_error")
+            items = store.list_skills(ctx.auth_scope, query=query, access_filter=flt)
             if not items:
                 return "当前权限下暂无可用 Skill。"
             return json.dumps(
@@ -72,8 +81,14 @@ class SkillsExtension(AgentPlugin):
             resource = str(args.get("resource") or "").strip()
             if not slug:
                 return ToolResult("", "get_skill", "[invalid_args] slug 不能为空", ok=False, error_code="invalid_args")
+            flt = None
+            if access_controller is not None:
+                try:
+                    flt = await enforce_filter(access_controller, ctx.auth_scope, "skill:read", "skill")
+                except AccessControlError as exc:
+                    return ToolResult("", "get_skill", f"[acl_error] {exc}", ok=False, error_code="acl_error")
             content, meta, err = store.get_skill_content(
-                ctx.auth_scope, slug, resource=resource or None
+                ctx.auth_scope, slug, resource=resource or None, access_filter=flt
             )
             if err or content is None:
                 return ToolResult("", "get_skill", f"[{err or 'skill_not_found'}] {slug}", ok=False, error_code=err or "skill_not_found")

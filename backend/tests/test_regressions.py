@@ -28,7 +28,12 @@ from agent_runtime import (
 )
 from agent_runtime.framework.context.memory import ContextBudget, assemble_before_model
 from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink, uid
-from agent_runtime.infra.memory.store import InMemoryStore
+from agent_runtime.infra.pg.postgres import PgOssStore
+
+try:
+    from tests._pg_harness import get_test_store, reset_test_db
+except ImportError:
+    from _pg_harness import get_test_store, reset_test_db
 
 
 def _assert_valid_tool_call_pairing(tc: unittest.TestCase, messages: Sequence[Message]) -> None:
@@ -57,6 +62,9 @@ def _assert_valid_tool_call_pairing(tc: unittest.TestCase, messages: Sequence[Me
 
 
 class TestProductionRegressions(unittest.TestCase):
+    def setUp(self):
+        reset_test_db()
+
     def test_bug1_publish_sse_never_blocks_indefinitely_when_consumer_stalls_or_closes(self):
         """Bug 1a: `publish_sse` must not deadlock forever when consumer stops draining queue."""
 
@@ -100,15 +108,9 @@ class TestProductionRegressions(unittest.TestCase):
                 return Message("assistant", "完整长回答已生成")
 
         async def _run():
-            store = InMemoryStore()
-            # Provide minimal thread helpers expected by `chat_sse` if not on InMemoryStore
-            if not hasattr(store, "create_thread"):
-                store.create_thread = lambda scope, tid, title: {"thread_id": tid, "title": title}  # type: ignore[attr-defined]
-            if not hasattr(store, "record_turn_start"):
-                store.record_turn_start = lambda tid, trace, text: store.append_message(tid, Message("user", text))  # type: ignore[attr-defined]
-
+            store = get_test_store()
             model = ManyTokensModel()
-            runtime = AgentRuntimeApp(model=model, store=store, prefer_real_langgraph=False)
+            runtime = AgentRuntimeApp(model=model, store=store)
 
             fake_app = SimpleNamespace(
                 state=SimpleNamespace(
@@ -270,9 +272,9 @@ class TestProductionRegressions(unittest.TestCase):
 
             scope = AuthScope("t_acme", "u_alice", ("employee",))
             app = AgentRuntimeApp(
+                store=get_test_store(),
                 model=TwoStepScriptedModel(),
                 tools=[create_voucher, slow_audit],
-                prefer_real_langgraph=False,
             )
 
             ctx = ExecutionContext(
@@ -356,9 +358,9 @@ class TestProductionRegressions(unittest.TestCase):
 
             scope = AuthScope("t_acme", "u_alice", ("employee",))
             app = AgentRuntimeApp(
+                store=get_test_store(),
                 model=SameBatchModel(),
                 tools=[post_ledger, slow_reconcile],
-                prefer_real_langgraph=False,
             )
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
@@ -401,7 +403,7 @@ class TestProductionRegressions(unittest.TestCase):
             return f"{name}:{count}:{ratio}:{active}"
 
         async def _run():
-            app = AgentRuntimeApp(tools=[typed_tool], prefer_real_langgraph=False)
+            app = AgentRuntimeApp(store=get_test_store(), tools=[typed_tool])
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_types",
@@ -447,9 +449,11 @@ class TestProductionRegressions(unittest.TestCase):
     def test_run_service_is_cancelled_throttles_db_reads_for_active_local_run(self):
         """P1: `RunService.is_cancelled` should not hit `store.get_run` on every single guard check within TTL."""
 
-        class CountingStore(InMemoryStore):
+        class CountingStore(PgOssStore):
             def __init__(self) -> None:
-                super().__init__()
+                base = get_test_store()
+                super().__init__(base.dsn, oss=base.oss)
+                self._pool = base._pool
                 self.get_run_calls = 0
 
             def get_run(self, run_id: str):
@@ -458,8 +462,9 @@ class TestProductionRegressions(unittest.TestCase):
 
         async def _run():
             store = CountingStore()
-            app = AgentRuntimeApp(store=store, prefer_real_langgraph=False)
+            app = AgentRuntimeApp(store=store)
             scope = AuthScope("t_acme", "u_alice", ("employee",))
+            store.create_thread(scope, "th_perf", "perf")
             rec = app.run_service.start_run(
                 scope=scope, thread_id="th_perf", trace_id="tr_perf", request_id="req_perf"
             )

@@ -1,15 +1,10 @@
-"""Real LangGraph (`StateGraph` + `InMemorySaver`) integration test suite.
+"""LangGraph (`StateGraph` + `InMemorySaver` + `PgOssStore`) node-replay & idempotency test suite.
 
-Runs inside the Python 3.12 backend container (or any environment with `langgraph>=1.0` installed)
-and skips cleanly on zero-dependency host Python so `unittest discover` stays fast everywhere.
-
-Specifically verifies the subtle node-replay invariants that `MiniStateGraph` only approximates:
-  1. Real `langgraph.types.interrupt()` + `Command(resume=...)` replays `tools_node` from the top
-     without double-executing preceding WRITE tools in the same batch (`op_key` idempotency) and
-     without duplicating step-persisted messages.
-  2. Multi-write in a single turn (`write` x2) + subsequent HIGH_RISK interrupt/resume preserves
-     distinct `op_key`s and exact execution counts under real `InMemorySaver`.
-  3. Expired or cancelled approval resume under real LangGraph leaves run state consistent.
+Verifies the node-replay invariants of LangGraph + `PgOssStore`:
+  1. `langgraph.types.interrupt()` + `Command(resume=...)` replays `tools_node` from the top
+     without double-executing preceding WRITE tools in the same batch (`op_key` idempotency in PG)
+     and without duplicating step-persisted messages in `session_messages`.
+  2. Aborting while paused on an interrupt prevents stale approval resume from executing the tool.
 """
 
 from __future__ import annotations
@@ -17,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List
 import unittest
+
+from langgraph.checkpoint.memory import InMemorySaver
 
 from agent_runtime import (
     AgentRuntimeApp,
@@ -29,20 +26,21 @@ from agent_runtime import (
     tool,
 )
 from agent_runtime.framework.core.config import uid
-from agent_runtime.framework.core.langgraph_compat import HAS_LANGGRAPH
 from agent_runtime.framework.core.runs import RunStateError
 
 try:
-    from langgraph.checkpoint.memory import InMemorySaver as LG_InMemorySaver  # type: ignore
-except Exception:
-    LG_InMemorySaver = None
+    from tests._pg_harness import get_test_store, reset_test_db
+except ImportError:
+    from _pg_harness import get_test_store, reset_test_db
 
 
-@unittest.skipUnless(HAS_LANGGRAPH and LG_InMemorySaver is not None, "Requires real `langgraph` package")
 class TestRealLangGraphEngine(unittest.TestCase):
+    def setUp(self):
+        reset_test_db()
+
     def test_real_langgraph_mixed_write_and_high_risk_replay_idempotency(self):
         """In one batch `[write_tool, high_risk_tool]`, resuming `high_risk_tool` replays `tools_node`
-        under real LangGraph — `write_tool` MUST hit `op_key` cache and NOT execute a second time!
+        under LangGraph — `write_tool` MUST hit PG `op_key` cache and NOT execute a second time!
         """
         write_side_effects: List[str] = []
         high_risk_side_effects: List[str] = []
@@ -77,15 +75,12 @@ class TestRealLangGraphEngine(unittest.TestCase):
                 return Message("assistant", f"转账已完成，共记录草稿 {len(write_side_effects)} 次。")
 
         async def _run():
-            saver = LG_InMemorySaver()
             app = AgentRuntimeApp(
+                store=get_test_store(),
                 model=BatchReplayModel(),
-                checkpointer=saver,
+                checkpointer=InMemorySaver(),
                 tools=[log_draft, wire_transfer],
-                prefer_real_langgraph=True,
             )
-            # Confirm we compiled a real LangGraph graph, NOT CompiledMiniGraph
-            self.assertNotEqual(type(app.graph).__name__, "CompiledMiniGraph")
 
             scope = AuthScope("t_acme", "u_alice", ("employee",))
             ctx = ExecutionContext(
@@ -97,7 +92,6 @@ class TestRealLangGraphEngine(unittest.TestCase):
 
             paused = await app.run_turn("记录草稿并转账 50000 到 ACC-88", ctx=ctx)
             self.assertIn("__interrupt__", paused)
-            # `log_draft` ran once before `wire_transfer` hit `interrupt()`
             self.assertEqual(write_side_effects, ["准备付款50000"])
             self.assertEqual(high_risk_side_effects, [])
             self.assertEqual(app.store.get_run(paused["run_id"]).status, "paused")
@@ -113,13 +107,13 @@ class TestRealLangGraphEngine(unittest.TestCase):
             self.assertNotIn("__interrupt__", resumed)
             self.assertIn("转账已完成", resumed["final_answer"])
 
-            # CRITICAL: `log_draft` must STILL have executed only ONCE despite real LangGraph node replay!
+            # CRITICAL: `log_draft` must STILL have executed only ONCE despite LangGraph node replay!
             self.assertEqual(write_side_effects, ["准备付款50000"])
             self.assertEqual(len(high_risk_side_effects), 1)
             self.assertTrue(high_risk_side_effects[0].endswith(ticket["op_key"]))
             self.assertEqual(app.store.get_run(paused["run_id"]).status, "completed")
 
-            # Saved session history must have no duplicate tool messages after replay
+            # Saved session history in PG must have no duplicate tool messages after replay
             saved = app.store.list_messages("th_lg_replay_1")
             tool_ids = [m.tool_call_id for m in saved if m.role == "tool"]
             self.assertEqual(tool_ids, ["call_w1", "call_hr1"])
@@ -127,7 +121,7 @@ class TestRealLangGraphEngine(unittest.TestCase):
         asyncio.run(_run())
 
     def test_real_langgraph_abort_while_paused_blocks_resume(self):
-        """Real LangGraph checkpoint + `RunService` abort prevents stale resume from executing tool."""
+        """LangGraph checkpoint + PG `RunService` abort prevents stale resume from executing tool."""
         executed: List[int] = []
 
         @tool(risk_level=RiskLevel.HIGH_RISK)
@@ -150,10 +144,10 @@ class TestRealLangGraphEngine(unittest.TestCase):
 
         async def _run():
             app = AgentRuntimeApp(
+                store=get_test_store(),
                 model=SingleHighRiskModel(),
-                checkpointer=LG_InMemorySaver(),
+                checkpointer=InMemorySaver(),
                 tools=[drop_table],
-                prefer_real_langgraph=True,
             )
             scope = AuthScope("t_acme", "u_alice", ("employee",))
             paused = await app.run_turn("删除 users 表", thread_id="th_lg_abort", scope=scope)

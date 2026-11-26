@@ -72,6 +72,7 @@ class RagExtension(AgentPlugin):
                 embedding_client=self._embedding_client,
                 rerank_client=self._rerank_client,
                 min_rerank_score=self.min_rerank_score,
+                access_controller=getattr(gateway, "access_controller", None),
             )
 
         if self.mode in ("tool", "both"):

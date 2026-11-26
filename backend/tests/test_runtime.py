@@ -35,8 +35,12 @@ from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import canonical_hash
 from agent_runtime.framework.core.runs import RunStateError
 from agent_runtime.framework.tools.gateway import compute_op_key
-from agent_runtime.infra.memory.store import InMemoryStore
 from agent_runtime.infra.plg.hub import ObservabilityHub
+
+try:
+    from tests._pg_harness import get_test_store, reset_test_db
+except ImportError:
+    from _pg_harness import get_test_store, reset_test_db
 
 
 def build_full_app(
@@ -47,6 +51,7 @@ def build_full_app(
 ):
     approval_writes: List[Dict[str, Any]] = []
     app = AgentRuntimeApp(
+        store=get_test_store(),
         extensions=[
             RagExtension(),
             SkillsExtension(),
@@ -61,6 +66,9 @@ def build_full_app(
 
 
 class TestAgentRuntimeSDK(unittest.TestCase):
+    def setUp(self):
+        reset_test_db()
+
     def test_01_high_risk_approval_interrupt_resume_and_idempotency(self):
         async def _run():
             app, approval_writes = build_full_app()
@@ -85,7 +93,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 scope=scope,
             )
             self.assertNotIn("__interrupt__", done)
-            self.assertIn("APR-0001", done["final_answer"])
+            self.assertIn("APR_", done["final_answer"])
             self.assertEqual(len(approval_writes), 1)
 
             same_args_hash = canonical_hash(
@@ -129,7 +137,8 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             res = await app.run_turn("帮我拉取全量明细", ctx=ctx)
             self.assertIn("ROW#001", res["final_answer"])
 
-            ref_ids = list(app.store._outputs.keys())
+            ref_rows = app.store.rows("SELECT ref_id FROM tool_outputs WHERE thread_id=%s", ("th_test_2",))
+            ref_ids = [r["ref_id"] for r in ref_rows]
             self.assertEqual(len(ref_ids), 1)
             ref_id = ref_ids[0]
 
@@ -147,7 +156,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
 
     def test_03_rag_seven_stage_pipeline_acl_diversifier_and_fallback(self):
         async def _run():
-            store = InMemoryStore()
+            store = get_test_store()
             rag = RagRetrievalService(store, min_rerank_score=0.35)
             # Multi-chunk document to verify adjacent child expansion & per-doc diversification (max 2)
             for idx, body in enumerate(
@@ -251,7 +260,8 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                     return RetrievalResult(status="ok", hits=[hit])
 
             app = AgentRuntimeApp(
-                extensions=[RagExtension(strategy=CustomESRetriever(), mode="both")]
+                store=get_test_store(),
+                extensions=[RagExtension(strategy=CustomESRetriever(), mode="both")],
             )
             res = await app.run_turn("外部 ES 制度说了什么", thread_id="th_custom_rag")
             self.assertTrue(res["final_answer"])
@@ -326,7 +336,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
         asyncio.run(_run())
 
     def test_07_prometheus_high_cardinality_guard_and_prefix_stability(self):
-        store = InMemoryStore()
+        store = get_test_store()
         obs = ObservabilityHub(store)
         with self.assertRaises(ValueError):
             obs.metrics.inc("agent_bad_metric", trace_id="tr_12345")
@@ -376,7 +386,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             self.assertEqual(props["tags"]["type"], "array")
             self.assertNotIn("ctx", calc_quote.allowed_args)
 
-            app = AgentRuntimeApp(tools=[calc_quote])
+            app = AgentRuntimeApp(store=get_test_store(), tools=[calc_quote])
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_sdk",
@@ -399,9 +409,9 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 return "hijacked"
 
             with self.assertRaises(ValueError):
-                AgentRuntimeApp(tools=[evil_write])
+                AgentRuntimeApp(store=get_test_store(), tools=[evil_write])
 
-            app = AgentRuntimeApp()
+            app = AgentRuntimeApp(store=get_test_store())
             # Registry is frozen after startup
             self.assertTrue(app.registry.frozen)
             with self.assertRaises(RuntimeError):
@@ -541,7 +551,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 def build_middlewares(self):
                     return (AuditMW(),)
 
-            app = CustomFinanceAgent().build_app()
+            app = CustomFinanceAgent().build_app(store=get_test_store())
             res = await app.run_turn("你好", thread_id="th_inherit")
             self.assertTrue(res["final_answer"])
             self.assertIn("before_model", events)
@@ -584,7 +594,11 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             op_key = ticket["op_key"]
 
             # 2. Expired approval ticket MUST fail cleanly WITHOUT stranding run in `running`
-            app.store._approvals[review_id].expires_at = 1.0
+            with app.store.transaction() as cur:
+                cur.execute(
+                    "UPDATE tool_approvals SET expires_at = to_timestamp(1) WHERE review_id=%s",
+                    (review_id,),
+                )
             with self.assertRaises(ValueError):
                 await app.resume_approval(
                     thread_id="th_reg_1",
@@ -594,7 +608,11 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             self.assertEqual(app.store.get_run(run_id).status, "paused")
 
             # Restore expiry and resume -> handler receives exact gateway op_key
-            app.store._approvals[review_id].expires_at = 9999999999.0
+            with app.store.transaction() as cur:
+                cur.execute(
+                    "UPDATE tool_approvals SET expires_at = clock_timestamp() + interval '1 hour' WHERE review_id=%s",
+                    (review_id,),
+                )
             await app.resume_approval(
                 thread_id="th_reg_1",
                 decision=ApprovalDecision(review_id=review_id, approved=True, approver_id="mgr_bob"),

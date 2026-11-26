@@ -34,6 +34,13 @@ from agent_runtime.framework.core.contracts import (
     RAGChunk,
     RetrievalResult,
 )
+from agent_runtime.framework.core.security import (
+    AccessControlError,
+    AccessController,
+    AccessFilter,
+    enforce_filter,
+    enforce_filter_sync,
+)
 
 log = logging.getLogger("agent-runtime.rag")
 
@@ -50,6 +57,7 @@ class RagRetrievalService:
         min_rerank_score: float = 0.35,
         max_per_document: int = MAX_RERANK_CANDIDATES_PER_DOCUMENT,
         rerank_max_chars: int = RERANK_MAX_DOCUMENT_CHARS,
+        access_controller: Optional[AccessController] = None,
     ) -> None:
         self.store = store
         self.embedding_client = embedding_client or LocalHashEmbeddingClient()
@@ -57,16 +65,26 @@ class RagRetrievalService:
         self.min_rerank_score = min_rerank_score
         self.max_per_document = max_per_document
         self.rerank_max_chars = rerank_max_chars
+        self.access_controller = access_controller
 
     def index_chunk(self, chunk: RAGChunk) -> None:
         vec = self.embedding_client.embed(chunk_text(chunk))
         self.store.upsert_rag_chunk(replace(chunk, embedding=vec))
 
     def _run_pipeline(
-        self, scope: AuthScope, query: str, top_n: int
+        self,
+        scope: AuthScope,
+        query: str,
+        top_n: int,
+        *,
+        access_filter: Optional[AccessFilter] = None,
     ) -> Tuple[List[ChunkSearchResult], Set[str]]:
-        if not query or not query.strip() or not scope.roles or top_n <= 0:
+        if not query or not query.strip() or top_n <= 0:
             return [], set()
+
+        flt = access_filter
+        if flt is None and self.access_controller is not None:
+            flt = enforce_filter_sync(self.access_controller, scope, "kb:retrieve", "rag_doc")
 
         rerank_n = max(1, top_n * 2)
         recall_n = max(1, rerank_n * 3)
@@ -82,10 +100,12 @@ class RagRetrievalService:
             return [], set()
 
         sparse_results = [
-            SparseSearchResult(c, s) for c, s in self.store.search_sparse_rag(scope, query_terms, recall_n)
+            SparseSearchResult(c, s)
+            for c, s in self.store.search_sparse_rag(scope, query_terms, recall_n, access_filter=flt)
         ]
         dense_results = [
-            DenseSearchResult(c, s) for c, s in self.store.search_dense_rag(scope, query_vec, recall_n)
+            DenseSearchResult(c, s)
+            for c, s in self.store.search_dense_rag(scope, query_vec, recall_n, access_filter=flt)
         ]
 
         fused = rrf_fuse(sparse_results, dense_results, max(rerank_n, rerank_n * 2))
@@ -112,7 +132,7 @@ class RagRetrievalService:
                     adjacent_keys.add((pid, ord_num + 1))
 
         if adjacent_keys and hasattr(self.store, "find_adjacent_rag_chunks"):
-            for sibling in self.store.find_adjacent_rag_chunks(scope, parent_ids):
+            for sibling in self.store.find_adjacent_rag_chunks(scope, parent_ids, access_filter=flt):
                 key = (sibling.parent_id, infer_chunk_ordinal(sibling.chunk_id))
                 if key in adjacent_keys and sibling.chunk_id not in candidates_map:
                     candidates_map[sibling.chunk_id] = RrfFusionResult(
@@ -128,14 +148,28 @@ class RagRetrievalService:
         final_children = final_rank_fuse(selected, reranked)[:rerank_n]
         return final_children, real_rrf_hits
 
-    def retrieve_chunks(self, scope: AuthScope, query: str, top_n: int = 4) -> List[ChunkSearchResult]:
-        final_children, _ = self._run_pipeline(scope, query, top_n)
+    def retrieve_chunks(
+        self,
+        scope: AuthScope,
+        query: str,
+        top_n: int = 4,
+        *,
+        access_filter: Optional[AccessFilter] = None,
+    ) -> List[ChunkSearchResult]:
+        final_children, _ = self._run_pipeline(scope, query, top_n, access_filter=access_filter)
         return final_children[:top_n]
 
     def retrieve_evidence(
-        self, scope: AuthScope, query: str, top_n: int = 4
+        self,
+        scope: AuthScope,
+        query: str,
+        top_n: int = 4,
+        *,
+        access_filter: Optional[AccessFilter] = None,
     ) -> Tuple[List[ParentEvidenceResult], float]:
-        final_children, real_rrf_hits = self._run_pipeline(scope, query, top_n)
+        final_children, real_rrf_hits = self._run_pipeline(
+            scope, query, top_n, access_filter=access_filter
+        )
         return aggregate_parent_evidences(
             final_children,
             real_rrf_hits,
@@ -151,8 +185,24 @@ class RagRetrievalService:
         top_k: int = 4,
         ctx: Optional[ExecutionContext] = None,
     ) -> RetrievalResult:
+        flt: Optional[AccessFilter] = None
+        if self.access_controller is not None:
+            try:
+                flt = await enforce_filter(self.access_controller, scope, "kb:retrieve", "rag_doc")
+            except AccessControlError as exc:
+                return RetrievalResult(
+                    status="acl_error",
+                    error=str(exc),
+                    formatted_context="[ACL_ERROR] 权限服务暂不可用，已拒绝本次知识检索。",
+                )
         try:
-            evidences, top_score = self.retrieve_evidence(scope, query, top_n=top_k)
+            evidences, top_score = self.retrieve_evidence(scope, query, top_n=top_k, access_filter=flt)
+        except AccessControlError as exc:
+            return RetrievalResult(
+                status="acl_error",
+                error=str(exc),
+                formatted_context="[ACL_ERROR] 权限服务暂不可用，已拒绝本次知识检索。",
+            )
         except Exception as exc:
             return RetrievalResult(status="error", error=type(exc).__name__)
 

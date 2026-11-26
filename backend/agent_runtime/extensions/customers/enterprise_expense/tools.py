@@ -10,7 +10,7 @@ from agent_runtime.framework.tools.decorator import tool
 
 
 def create_expense_tools(store: Any, *, approval_writes: Optional[List[Dict[str, Any]]] = None):
-    """Build domain tools bound to either PG store or InMemoryStore."""
+    """Build domain tools bound to `PgOssStore`."""
 
     @tool(risk_level=RiskLevel.READ)
     async def bi_query(region: str, quarter: str, verbose: bool = False) -> str:
@@ -30,39 +30,27 @@ def create_expense_tools(store: Any, *, approval_writes: Optional[List[Dict[str,
         title: str, amount: float, region: str, ctx: ExecutionContext
     ) -> Dict[str, Any]:
         """向 OA 提交超标专项审批"""
-        if hasattr(store, "rows"):
-            # Reuse the exact op_key claimed by ToolGateway (bound to call.id)
-            key = ctx.op_key or canonical_hash(
-                [ctx.thread_id, ctx.auth_scope.user_id, ctx.request_id, "submit_approval"]
-            )
-            rows = store.rows(
-                """INSERT INTO oa_approvals(approval_id,thread_id,tenant_id,applicant,op_key,title,region,amount)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,op_key)
-                   DO UPDATE SET op_key=EXCLUDED.op_key RETURNING approval_id,title,amount::text""",
-                (
-                    uid("oa"),
-                    ctx.thread_id,
-                    ctx.auth_scope.tenant_id,
-                    ctx.auth_scope.user_id,
-                    key,
-                    title,
-                    region,
-                    amount,
-                ),
-            )
-            return rows[0]
-
-        sink_list = approval_writes if approval_writes is not None else []
-        rec = {
-            "approval_id": f"APR-{len(sink_list) + 1:04d}",
-            "title": title,
-            "amount": amount,
-            "region": region,
-            "applicant": ctx.auth_scope.user_id,
-            "op_key": ctx.op_key,
-        }
-        sink_list.append(rec)
-        return rec
+        key = ctx.op_key or canonical_hash(
+            [ctx.thread_id, ctx.auth_scope.user_id, ctx.request_id, "submit_approval"]
+        )
+        rows = store.rows(
+            """INSERT INTO oa_approvals(approval_id,thread_id,tenant_id,applicant,op_key,title,region,amount)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,op_key)
+               DO UPDATE SET op_key=EXCLUDED.op_key RETURNING approval_id,title,amount::text""",
+            (
+                uid("APR"),
+                ctx.thread_id,
+                ctx.auth_scope.tenant_id,
+                ctx.auth_scope.user_id,
+                key,
+                title,
+                region,
+                amount,
+            ),
+        )
+        if approval_writes is not None:
+            approval_writes.append({**rows[0], "op_key": key})
+        return rows[0]
 
     @tool(risk_level=RiskLevel.READ)
     async def flaky_lookup(id: str) -> str:

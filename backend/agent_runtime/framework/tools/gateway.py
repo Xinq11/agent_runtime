@@ -11,6 +11,8 @@ import json
 import math
 from typing import Any, List, Optional
 
+from langgraph.types import interrupt
+
 from agent_runtime.framework.core.contracts import (
     ExecutionContext,
     RiskLevel,
@@ -19,7 +21,12 @@ from agent_runtime.framework.core.contracts import (
     canonical_hash,
     estimate_tokens,
 )
-from agent_runtime.framework.core.langgraph_compat import interrupt
+from agent_runtime.framework.core.security import (
+    AccessControlError,
+    AuthorizationError,
+    ResourceRef,
+    enforce_check,
+)
 from agent_runtime.framework.tools.registry import IMMUTABLE_BUILTIN_NAMES, ToolRegistry, ToolSpec
 
 
@@ -103,7 +110,16 @@ def compute_op_key(ctx: ExecutionContext, call: ToolCall) -> str:
 
 
 class ToolGateway:
-    def __init__(self, store, registry, tracer=None, max_result_tokens=450, loop_limit=3, middlewares=None):
+    def __init__(
+        self,
+        store,
+        registry,
+        tracer=None,
+        max_result_tokens=450,
+        loop_limit=3,
+        middlewares=None,
+        access_controller=None,
+    ):
         if max_result_tokens < 1 or loop_limit < 1:
             raise ValueError("tool budgets must be positive")
         self.store = store
@@ -112,6 +128,7 @@ class ToolGateway:
         self.max_result_tokens = max_result_tokens
         self.loop_limit = loop_limit
         self.middlewares = middlewares
+        self.access_controller = access_controller
 
     async def execute_one(
         self, call: ToolCall, ctx: ExecutionContext, loop_counts=None
@@ -130,8 +147,25 @@ class ToolGateway:
         spec = self.registry.get(call.name)
         if spec is None:
             return _error(call, "unknown_tool")
-        if not spec.permitted(ctx.auth_scope) or (ctx.depth and not ctx.auth_scope.allowed_tools):
+        if not spec.permitted(ctx.auth_scope) or (ctx.depth and ctx.auth_scope.allowed_tools is None):
             return _error(call, "permission_denied")
+        if self.access_controller is not None:
+            try:
+                await enforce_check(
+                    self.access_controller,
+                    ctx.auth_scope,
+                    "tool:invoke",
+                    ResourceRef(
+                        kind="tool",
+                        id=call.name,
+                        tenant_id=ctx.auth_scope.tenant_id,
+                        attrs={"risk_level": spec.risk_level.value, "is_subagent": spec.is_subagent},
+                    ),
+                )
+            except AuthorizationError as exc:
+                return _error(call, "permission_denied", exc.reason)
+            except AccessControlError as exc:
+                return _error(call, "acl_error", str(exc))
         if spec.is_subagent and ctx.depth >= ctx.max_depth:
             return _error(call, "max_depth")
         if type(call.args) is not dict:

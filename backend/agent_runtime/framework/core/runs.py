@@ -99,6 +99,13 @@ class RunService:
             raise RunNotFoundError("运行记录不存在")
         return rec
 
+    def get_run_in_tenant(self, tenant_id: str, run_id: str) -> RunRecord:
+        """Fetch a run within `tenant_id` (used after authorization for cross-user approval resume)."""
+        rec = self.store.get_run(run_id)
+        if not rec or rec.tenant_id != tenant_id:
+            raise RunNotFoundError("运行记录不存在")
+        return rec
+
     def get_active_run_for_thread(self, scope: AuthScope, thread_id: str) -> Optional[RunRecord]:
         rec = self.store.get_active_run(thread_id)
         if not rec or rec.tenant_id != scope.tenant_id or rec.actor_id != scope.user_id:

@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import importlib
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
 from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import ApprovalDecision, AuthScope, ExecutionContext, Message
-from agent_runtime.framework.core.langgraph_compat import default_checkpointer, make_command
 from agent_runtime.framework.core.middleware import MiddlewareChain
 from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin, AppMetadata
 from agent_runtime.framework.core.runs import RunService, RunStateError
+from agent_runtime.framework.core.security import (
+    AccessController,
+    RbacAccessController,
+    ResourceRef,
+    enforce_check,
+)
 from agent_runtime.framework.core.workflow import (
     DEFAULT_SYSTEM_PROMPT,
     build_agent_graph,
@@ -64,12 +72,12 @@ class AgentRuntimeApp:
         max_steps: int = 8,
         emit_tool_events: bool = True,
         on_event: Optional[Any] = None,
-        prefer_real_langgraph: bool = True,
+        access_controller: Optional[AccessController] = None,
     ) -> None:
         if store is None:
-            from agent_runtime.infra.memory.store import InMemoryStore
+            from agent_runtime.infra.pg.postgres import PgOssStore
 
-            store = InMemoryStore()
+            store = PgOssStore()
         if obs is None:
             from agent_runtime.infra.plg.hub import ObservabilityHub
 
@@ -82,10 +90,9 @@ class AgentRuntimeApp:
         self.store = store
         self.obs = obs
         self.model = model
-        self.checkpointer = (
-            checkpointer
-            if checkpointer is not None
-            else default_checkpointer(prefer_real_langgraph=prefer_real_langgraph)
+        self.checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
+        self.access_controller: AccessController = (
+            access_controller if access_controller is not None else RbacAccessController(admin_roles=None)
         )
         self.run_service = RunService(self.store)
         self.budget = budget or ContextBudget()
@@ -103,7 +110,9 @@ class AgentRuntimeApp:
                 self.middlewares.add(mw)
 
         self.registry = ToolRegistry()
-        register_immutable_builtin_tools(self.registry, self.store)
+        register_immutable_builtin_tools(
+            self.registry, self.store, access_controller=self.access_controller
+        )
 
         gw_cls = EventGateway if emit_tool_events else ToolGateway
         self.gateway = gw_cls(
@@ -113,6 +122,7 @@ class AgentRuntimeApp:
             max_result_tokens=max_result_tokens,
             loop_limit=loop_limit,
             middlewares=self.middlewares,
+            access_controller=self.access_controller,
         )
 
         for spec in tools:
@@ -169,7 +179,7 @@ class AgentRuntimeApp:
             max_steps=max_steps,
             on_event=on_event,
             cancel_checker=self.run_service.is_cancelled,
-            prefer_real_langgraph=prefer_real_langgraph,
+            access_controller=self.access_controller,
         )
 
     def bootstrap_extensions(self) -> None:
@@ -233,6 +243,12 @@ class AgentRuntimeApp:
                 request_id=uid("req"),
                 auth_scope=scope or self.default_identity(),
             )
+        await asyncio.to_thread(
+            self.store.create_thread,
+            ctx.auth_scope,
+            ctx.thread_id,
+            user_text.strip()[:48] or "新对话",
+        )
         run = self.run_service.start_run(
             scope=ctx.auth_scope,
             thread_id=ctx.thread_id,
@@ -241,9 +257,9 @@ class AgentRuntimeApp:
             run_id=ctx.run_id or None,
         )
         ctx.run_id = run.run_id
-        self.store.append_message(ctx.thread_id, Message(role="user", content=user_text))
 
         try:
+            await asyncio.to_thread(self.store.record_turn_start, ctx.thread_id, ctx.trace_id, user_text)
             return await self.execute_run_state(
                 run_id=run.run_id,
                 scope=ctx.auth_scope,
@@ -288,18 +304,39 @@ class AgentRuntimeApp:
         caller = scope or self.default_identity()
         cfg = graph_config(thread_id)
         snapshot = await self.graph.aget_state(cfg)
-        if decision.review_id not in {v["review_id"] for v in pending_tickets(snapshot)}:
+        pending_map = {v["review_id"]: v for v in pending_tickets(snapshot)}
+        ticket_meta = pending_map.get(decision.review_id)
+        if ticket_meta is None:
             raise RunStateError("审批单未处于暂停状态")
+
+        await enforce_check(
+            self.access_controller,
+            caller,
+            "approval:decide",
+            ResourceRef(
+                kind="approval",
+                id=decision.review_id,
+                tenant_id=str(ticket_meta.get("tenant_id") or caller.tenant_id),
+                owner_id=ticket_meta.get("actor_id"),
+                attrs={
+                    "tool_name": ticket_meta.get("tool_name"),
+                    "thread_id": thread_id,
+                },
+            ),
+        )
 
         vals = getattr(snapshot, "values", {}) or {}
         run_id = vals.get("run_id")
         if run_id:
-            rec = self.run_service.get_run(caller, run_id)
+            rec = self.run_service.get_run_in_tenant(caller.tenant_id, run_id)
             if rec.status != "paused":
                 raise RunStateError("该运行已取消或不再处于暂停状态，无法恢复")
 
+        # Always stamp authoritative approver_id from verified caller scope in both SDK and HTTP paths
+        authoritative_decision = replace(decision, approver_id=caller.user_id)
+
         # Record decision BEFORE transitioning run to `running`; then atomically claim resume
-        self.store.record_approval_decision(decision)
+        self.store.record_approval_decision(authoritative_decision)
         if run_id:
             self.run_service.mark_resumed(run_id, caller.tenant_id)
 
@@ -309,7 +346,7 @@ class AgentRuntimeApp:
             result = await invoke_phase(
                 self.graph,
                 self.store,
-                make_command(resume=decision.review_id),
+                Command(resume=decision.review_id),
                 cfg,
                 trace_id,
                 start_ms,

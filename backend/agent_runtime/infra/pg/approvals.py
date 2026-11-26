@@ -67,6 +67,16 @@ class PgApprovalsMixin:
         )
         return rows[0]["thread_id"] if rows else None
 
+    def get_approval_ticket(self, review_id: str, tenant_id: str) -> Optional[ApprovalTicket]:
+        """Look up an approval ticket within `tenant_id` without binding requester == approver."""
+        with self.transaction() as cur:
+            cur.execute(
+                f"SELECT {self._TICKET} FROM tool_approvals WHERE review_id=%s AND tenant_id=%s",
+                (review_id, tenant_id),
+            )
+            row = cur.fetchone()
+            return ApprovalTicket(*row) if row else None
+
     def record_approval_decision(self, decision: ApprovalDecision) -> ApprovalTicket:
         if not decision.approver_id or type(decision.approved) is not bool:
             raise ValueError("invalid_approval_decision")

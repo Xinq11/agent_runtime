@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from agent_runtime.infra.oss.minio import MinioObjectStore
@@ -14,6 +15,8 @@ from agent_runtime.infra.pg.runs import PgRunsMixin
 from agent_runtime.infra.pg.sessions import PgSessionsMixin
 from agent_runtime.infra.pg.skills import PgSkillsMixin
 
+DEFAULT_PG_DSN = "postgresql://agent:agent_demo@localhost:5432/agent_runtime"
+
 
 class PgOssStore(
     PgBase,
@@ -25,10 +28,10 @@ class PgOssStore(
     PgRagMixin,
     PgOpsQueriesMixin,
 ):
-    """Production PostgreSQL + MinIO OSS store facade."""
+    """Unified PostgreSQL + pgvector + MinIO OSS store facade."""
 
-    def __init__(self, dsn: str, oss: Optional[MinioObjectStore] = None):
-        super().__init__(dsn)
+    def __init__(self, dsn: Optional[str] = None, oss: Optional[MinioObjectStore] = None):
+        super().__init__(dsn or os.getenv("PG_DSN", DEFAULT_PG_DSN))
         self.oss = oss or MinioObjectStore()
         self.s3 = self.oss.client
 

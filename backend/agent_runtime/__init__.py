@@ -49,32 +49,60 @@ from agent_runtime.framework.core.protocols import (
     QuickPromptSpec,
     RAGStrategy,
 )
+from agent_runtime.framework.core.security import (
+    AccessControlError,
+    AccessController,
+    AccessDecision,
+    AccessFilter,
+    AuthenticationError,
+    AuthorizationError,
+    HeaderIdentityResolver,
+    IdentityResolver,
+    NoopAccessController,
+    RbacAccessController,
+    ResourceRef,
+    StaticIdentityResolver,
+    load_access_controller,
+    load_identity_resolver,
+)
 
 __version__ = "1.0.0"
 
 __all__ = [
     "PROTOCOL_VERSION",
+    "AccessControlError",
+    "AccessController",
+    "AccessDecision",
+    "AccessFilter",
     "AgentMiddleware",
     "AgentPlugin",
     "AgentRuntimeApp",
     "AppMetadata",
     "ApprovalDecision",
     "AuthScope",
+    "AuthenticationError",
+    "AuthorizationError",
     "BaseAgent",
     "ChunkSearchResult",
     "EmbeddingClient",
     "ExecutionContext",
+    "HeaderIdentityResolver",
+    "IdentityResolver",
     "LLMProvider",
     "Message",
     "MiddlewareChain",
+    "NoopAccessController",
     "ParentEvidenceResult",
+    "PgOssStore",
     "QuickPromptSpec",
     "RAGChunk",
     "RAGStrategy",
     "RagExtension",
     "RagRetrievalService",
+    "RbacAccessController",
     "RerankClient",
     "RerankItem",
+    "ResourceRef",
     "RetrievalResult",
     "RiskLevel",
     "RunRecord",
@@ -82,6 +110,7 @@ __all__ = [
     "SkillsExtension",
     "SpanRecord",
     "SSEEvent",
+    "StaticIdentityResolver",
     "SubAgentProfile",
     "ToolCall",
     "ToolResult",
@@ -89,7 +118,9 @@ __all__ = [
     "WorkspaceFileRecord",
     "diversify_candidates",
     "final_rank_fuse",
+    "load_access_controller",
     "load_extension",
+    "load_identity_resolver",
     "rerank_candidates",
     "rrf_fuse",
     "tool",
@@ -137,4 +168,8 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.extensions.skills.extension import SkillsExtension as _skills
 
         return _skills
+    if name == "PgOssStore":
+        from agent_runtime.infra.pg.postgres import PgOssStore as _pg
+
+        return _pg
     raise AttributeError(f"module 'agent_runtime' has no attribute {name!r}")
