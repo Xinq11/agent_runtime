@@ -3,15 +3,19 @@ ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS title text NOT NULL DEFAULT '
 ALTER TABLE tool_outputs ADD COLUMN IF NOT EXISTS oss_key text;
 ALTER TABLE tool_outputs ADD COLUMN IF NOT EXISTS thread_id text REFERENCES agent_threads;
 ALTER TABLE rag_parents ADD COLUMN IF NOT EXISTS oss_key text;
-CREATE TABLE IF NOT EXISTS oa_approvals (
-    approval_id text PRIMARY KEY,
-    thread_id text NOT NULL REFERENCES agent_threads,
-    tenant_id text NOT NULL, applicant text NOT NULL,
-    op_key text NOT NULL, title text NOT NULL, region text NOT NULL,
-    amount numeric NOT NULL CHECK (amount >= 0),
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (tenant_id, op_key)
-);
+-- Older releases created this demo table in the shared schema. Transfer cleanup
+-- to its foreign key so historical rows still follow thread deletion after upgrade.
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass('oa_approvals')
+          AND conname = 'oa_approvals_thread_id_fkey' AND confdeltype <> 'c'
+    ) THEN
+        ALTER TABLE oa_approvals DROP CONSTRAINT oa_approvals_thread_id_fkey,
+            ADD CONSTRAINT oa_approvals_thread_id_fkey FOREIGN KEY (thread_id)
+            REFERENCES agent_threads ON DELETE CASCADE;
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS runtime_traces (
     trace_id text PRIMARY KEY, thread_id text NOT NULL REFERENCES agent_threads,
     created_at timestamptz NOT NULL DEFAULT now()

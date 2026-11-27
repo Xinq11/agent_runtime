@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import List, Optional, Tuple
 
-from agent_runtime.extensions.rag.text_utils import chunk_text, embed_text, terms
+from agent_runtime.infra.search_text import chunk_text, embed_text, terms
 from agent_runtime.framework.core.config import BUCKET, uid
 from agent_runtime.framework.core.contracts import AuthScope, RAGChunk
 from agent_runtime.framework.core.security import AccessFilter

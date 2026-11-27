@@ -89,9 +89,12 @@ class PgBase:
             return [SpanRecord(*row) for row in cursor.fetchall()]
 
     def bootstrap(self) -> None:
-        sql_dir = Path(__file__).resolve().parents[4] / "sql"
-        if not sql_dir.exists():
-            sql_dir = Path("/app/sql")
+        candidates = (
+            Path(__file__).resolve().parents[4] / "deploy" / "sql",
+            Path("/app/deploy/sql"),
+            Path("/app/sql"),
+        )
+        sql_dir = next((p for p in candidates if p.exists()), candidates[0])
         with self.transaction() as cur:
             for fname in ("002_oss_and_kb.sql", "003_runs_artifacts_skills.sql"):
                 mig = sql_dir / fname

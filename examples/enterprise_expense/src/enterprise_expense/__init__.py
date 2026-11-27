@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from importlib.resources import files
 from typing import Any, Dict, List, Optional
 
-from agent_runtime.extensions.customers.enterprise_expense.tools import create_expense_tools
+from .mock_script import route_enterprise_expense_mock
+from .tools import create_expense_tools
 from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
 from agent_runtime.framework.tools.registry import ToolSpec
@@ -77,6 +79,9 @@ class EnterpriseExpensePlugin(AgentPlugin):
         )
 
     def register_tools(self, *, registry, store, model, gateway, obs) -> None:
+        configure_mock = getattr(model, "set_default_mock_router", None)
+        if configure_mock is not None:
+            configure_mock(route_enterprise_expense_mock)
         for spec in create_expense_tools(store, approval_writes=self.approval_writes):
             registry.register(spec)
         register_subagent_tool(
@@ -95,6 +100,10 @@ class EnterpriseExpensePlugin(AgentPlugin):
         )
 
     def bootstrap_store(self, store: Any) -> None:
+        ddl = files(__package__).joinpath("schema.sql").read_text(encoding="utf-8")
+        with store.transaction() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('enterprise_expense.schema'))")
+            cur.execute(ddl)
         scope = AuthScope("t_acme", "seed", ("employee", "exec"))
         store.index_document(
             scope,

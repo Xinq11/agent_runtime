@@ -21,8 +21,7 @@ from agent_runtime.infra.plg.telemetry import Telemetry
 
 DEFAULT_EXTENSIONS = (
     "agent_runtime.extensions.rag.extension:RagExtension,"
-    "agent_runtime.extensions.skills.extension:SkillsExtension,"
-    "agent_runtime.extensions.customers.enterprise_expense:EnterpriseExpensePlugin"
+    "agent_runtime.extensions.skills.extension:SkillsExtension"
 )
 
 

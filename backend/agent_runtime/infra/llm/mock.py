@@ -28,14 +28,7 @@ def _default_router(
     tool_msgs: List[Message],
     tool_names: Set[str],
 ) -> Message:
-    try:
-        from agent_runtime.extensions.customers.enterprise_expense.mock_script import (
-            route_enterprise_expense_mock,
-        )
-
-        return route_enterprise_expense_mock(ctx, last_user, tool_msgs, tool_names)
-    except Exception:
-        return Message(role="assistant", content=f"已收到消息：{last_user}")
+    return Message(role="assistant", content=f"已收到消息：{last_user}")
 
 
 class MockScriptedLLM(ModelClient):
@@ -50,6 +43,10 @@ class MockScriptedLLM(ModelClient):
         self.obs = obs
         self.router = router or _default_router
         self.calls: List[dict] = []
+
+    def set_default_mock_router(self, router: ScriptRouter) -> None:
+        if self.router is _default_router:
+            self.router = router
 
     async def generate(
         self,

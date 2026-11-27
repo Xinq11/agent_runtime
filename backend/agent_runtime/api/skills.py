@@ -18,7 +18,7 @@ from agent_runtime.api.deps import (
     resolve_filter,
 )
 from agent_runtime.api.schemas import SkillUploadRequest, StatusUpdateRequest
-from agent_runtime.extensions.skills.extension import validate_resource_name, validate_skill_slug
+from agent_runtime.framework.core.contracts.skill_resources import validate_resource_name, validate_skill_slug
 from agent_runtime.framework.core.config import MAX_DOCUMENT
 from agent_runtime.framework.core.security import ResourceRef
 

@@ -1,0 +1,8 @@
+services:
+  backend:
+    build:
+      target: with-extension
+      args:
+        EXTENSION_DIR: examples/enterprise_expense
+    environment:
+      AGENT_EXTENSIONS: agent_runtime.extensions.rag.extension:RagExtension,agent_runtime.extensions.skills.extension:SkillsExtension,enterprise_expense:EnterpriseExpensePlugin

@@ -33,8 +33,12 @@ _ORIGINAL_PG_DBNAME: Optional[str] = None
 
 
 def _sql_dir() -> Path:
-    local = Path(__file__).resolve().parents[2] / "sql"
-    return local if local.exists() else Path("/app/sql")
+    candidates = (
+        Path(__file__).resolve().parents[2] / "deploy" / "sql",
+        Path("/app/deploy/sql"),
+        Path("/app/sql"),
+    )
+    return next((p for p in candidates if p.exists()), candidates[0])
 
 
 def get_test_store() -> PgOssStore:
@@ -90,7 +94,7 @@ def reset_test_db() -> PgOssStore:
         cur.execute(
             """TRUNCATE agent_threads, session_messages, session_summaries, tool_approvals,
                         tool_outputs, tool_runs, rag_parents, rag_chunks, agent_spans,
-                        oa_approvals, runtime_traces, agent_runs, workspace_files,
+                        runtime_traces, agent_runs, workspace_files,
                         agent_skills, agent_skill_versions
                RESTART IDENTITY CASCADE"""
         )

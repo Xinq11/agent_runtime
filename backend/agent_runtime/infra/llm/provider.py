@@ -12,7 +12,7 @@ import httpx
 
 from agent_runtime.framework.core.config import ModelSettings
 from agent_runtime.framework.core.contracts import ExecutionContext, Message, ToolCall
-from agent_runtime.infra.llm.mock import MockScriptedLLM
+from agent_runtime.infra.llm.mock import MockScriptedLLM, ScriptRouter
 
 
 def wire_message(m: Message) -> dict:
@@ -76,9 +76,14 @@ class OpenAICompatibleProvider:
         *,
         settings: Optional[ModelSettings] = None,
     ) -> None:
+        self.mock_router: Optional[ScriptRouter] = None
         self.config = settings or ModelSettings(os.getenv("DEEPSEEK_API_KEY", ""))
         self.client = client
         self.obs = obs
+
+    def set_default_mock_router(self, router: ScriptRouter) -> None:
+        if self.mock_router is None:
+            self.mock_router = router
 
     def _observe_ttft(self, mode: str, elapsed_sec: float) -> None:
         ttft = getattr(self.obs, "ttft", None)
@@ -102,7 +107,7 @@ class OpenAICompatibleProvider:
         mode = cfg.effective
         if mode == "mock" or self.client is None:
             index = max((i for i, m in enumerate(messages) if m.role == "user"), default=0)
-            mock = MockScriptedLLM(obs=SimpleNamespace(metrics=_MockMetricsBridge(self.obs)))
+            mock = MockScriptedLLM(obs=SimpleNamespace(metrics=_MockMetricsBridge(self.obs)), router=self.mock_router)
             result = await mock.generate(messages=messages[index:], tool_specs=tool_specs, ctx=ctx)
             self._observe_ttft("mock", time.monotonic() - start)
             if result.content and ctx.depth == 0:

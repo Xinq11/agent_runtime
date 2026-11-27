@@ -171,7 +171,6 @@ class PgSessionsMixin:
             )
             cur.execute("DELETE FROM tool_outputs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM tool_approvals WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
-            cur.execute("DELETE FROM oa_approvals WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM agent_runs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM workspace_files WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM runtime_traces WHERE thread_id=%s", (thread_id,))

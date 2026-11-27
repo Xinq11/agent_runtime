@@ -2,7 +2,7 @@
 
 客户代码决定 Agent 能办什么事。共享 SDK 负责一轮对话怎样运行、调用工具后怎样继续，以及中途暂停后从哪里恢复。Python 应用可以直接装配 SDK，参考 HTTP 服务则把同一条执行路径开放给 Studio 和客户门户。
 
-[项目首页](../README.md) · [HTTP / SSE v1 契约](API.md) · [后端源码](agent_runtime/)
+[项目首页](../README.md) · [HTTP / SSE v1 契约](API.md) · [后端源码](../backend/agent_runtime/)
 
 ---
 
@@ -14,14 +14,15 @@
 
 | 层 | 负责什么 | 从哪里读代码 |
 | --- | --- | --- |
-| 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流 | [api/main.py](agent_runtime/api/main.py) · [chat_stream.py](agent_runtime/api/chat_stream.py) |
-| 内核 (`framework/`) | 装配模型与扩展，构建执行图，管理上下文预算、Run 状态机与工具网关 | [agent/app.py](agent_runtime/framework/agent/app.py) · [core/workflow.py](agent_runtime/framework/core/workflow.py) |
-| 扩展 (`extensions/`) | 提供 RAG、Skills 标准扩展与客户业务工具；费用包演示查询 BI 与写回执 | [RAG](agent_runtime/extensions/rag/) · [Skills](agent_runtime/extensions/skills/) · [费用包](agent_runtime/extensions/customers/enterprise_expense/) |
-| 基础设施 (`infra/`) | 适配 PostgreSQL + pgvector、MinIO 对象存储、LLM 服务与 PLG 观测 | [PG](agent_runtime/infra/pg/) · [OSS](agent_runtime/infra/oss/) · [LLM](agent_runtime/infra/llm/) · [PLG](agent_runtime/infra/plg/) |
+| 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流 | [api/main.py](../backend/agent_runtime/api/main.py) · [chat_stream.py](../backend/agent_runtime/api/chat_stream.py) |
+| 内核 (`framework/`) | 装配模型与扩展，构建执行图，管理上下文预算、Run 状态机、安全 ACL 与工具网关 | [agent/app.py](../backend/agent_runtime/framework/agent/app.py) · [core/workflow.py](../backend/agent_runtime/framework/core/workflow.py) |
+| 扩展 (`extensions/`) | 内置标准可选扩展（RAG、Skills），运行期按需装配或替换为客户自定义实现 | [RAG](../backend/agent_runtime/extensions/rag/) · [Skills](../backend/agent_runtime/extensions/skills/) |
+| 基础设施 (`infra/`) | 适配 PostgreSQL + pgvector、MinIO 对象存储、LLM 服务与 PLG 观测 | [PG](../backend/agent_runtime/infra/pg/) · [OSS](../backend/agent_runtime/infra/oss/) · [LLM](../backend/agent_runtime/infra/llm/) · [PLG](../backend/agent_runtime/infra/plg/) |
 
 **依赖方向与客户隔离原则：**
-- 目标依赖方向为 `api -> extensions -> framework <- infra`：内核只依赖稳定契约与协议，基础设施适配内核契约，客户业务表、提示词与外部系统连接器封装在独立客户包内（不写入平台 `sql/` 或 `framework/`）。
-- *当前工作树已知待收敛偏差*：① 示例表 `oa_approvals` 仍在 `sql/002_oss_and_kb.sql` 与 `infra/pg/sessions.py` 的删除逻辑中；② `infra/llm/mock.py` 直接导入费用演示脚本；③ `infra/pg/rag_repo.py` 导入 `extensions/rag/text_utils.py`；④ `AgentRuntimeApp.__init__` 懒导入默认 PG/PLG/Mock 实现。新增客户包请严格遵守上述隔离原则，避免继续向公共层写入业务代码。
+- 目标依赖方向为 `api -> extensions -> framework <- infra`：内核只依赖稳定契约与协议，基础设施适配内核契约，客户业务表、提示词与外部系统连接器封装在独立客户包内（不写入平台 `deploy/sql/` 或 `framework/`）。
+- [费用示例](../examples/enterprise_expense/) 作为独立 Python 包依赖 SDK。启用后，插件注册业务工具与离线 Mock 脚本，在启动时创建 OA 表并初始化演示资料。旧库升级时，平台 SQL 将已有 OA 表的会话外键改为级联删除，保留历史记录。
+- PG 建索引与标准 RAG 扩展共用分词和向量编码。`AgentRuntimeApp` 延迟加载默认 PG、PLG 和 Mock 适配器。
 
 ### 启动装配 vs 每次执行
 
@@ -38,10 +39,10 @@
 
 ![模型请求工具后接收结果继续推理，高危调用等待审批后恢复](assets/turn-execution.png)
 
-1. **组装上下文（`before_model`）**：读出历史摘要与摘要游标之后的消息，拼接当前轮尚未持久化的临时消息。预算超限时以**原子工具组**（`assistant(tool_calls)` + 对应全部 `tool` 结果）为单位从旧到新连续裁剪；若最新一组自身超窗则截断工具正文而非丢弃配对，避免模型看到孤立的 `tool_call`。[上下文组装](agent_runtime/framework/context/memory.py)
-2. **执行工具（`tools_node` → `ToolGateway`）**：按 `RiskLevel` 分流（只读工具受限并行，写/高危工具串行），依次执行权限收窄校验、JSON Schema 参数校验、循环熔断、高危审批拦截、幂等抢占与超时控制。返回过大时将原文落 MinIO，仅把预览与 `ref_id` 放回上下文，由 `read_tool_output` 分页续读。[工具网关](agent_runtime/framework/tools/gateway.py)
-3. **按步记录进度**：每批工具完成后，图节点以 `(thread_id, trace_id, step_key)` 幂等写入本批消息并推进 `persisted_count`。最终答复在 `finish` 节点落库后，再判断是否触发 `compact_after_agent` 推进摘要游标。[执行图](agent_runtime/framework/core/workflow.py)
-4. **跨轮审批恢复**：`HIGH_RISK` 工具通过 LangGraph `interrupt()` 暂停，前端收到 `approval_required`。提交决定后，服务校验检查点挂起票据与运行状态，记录决定并以 `Command(resume=review_id)` 恢复同一检查点继续执行。[审批入口](agent_runtime/api/approvals.py) · [运行状态](agent_runtime/framework/core/runs.py)
+1. **组装上下文（`before_model`）**：读出历史摘要与摘要游标之后的消息，拼接当前轮尚未持久化的临时消息。预算超限时以**原子工具组**（`assistant(tool_calls)` + 对应全部 `tool` 结果）为单位从旧到新连续裁剪；若最新一组自身超窗则截断工具正文而非丢弃配对，避免模型看到孤立的 `tool_call`。[上下文组装](../backend/agent_runtime/framework/context/memory.py)
+2. **执行工具（`tools_node` → `ToolGateway`）**：按 `RiskLevel` 分流（只读工具受限并行，写/高危工具串行），依次执行权限收窄校验、JSON Schema 参数校验、循环熔断、高危审批拦截、幂等抢占与超时控制。返回过大时将原文落 MinIO，仅把预览与 `ref_id` 放回上下文，由 `read_tool_output` 分页续读。[工具网关](../backend/agent_runtime/framework/tools/gateway.py)
+3. **按步记录进度**：每批工具完成后，图节点以 `(thread_id, trace_id, step_key)` 幂等写入本批消息并推进 `persisted_count`。最终答复在 `finish` 节点落库后，再判断是否触发 `compact_after_agent` 推进摘要游标。[执行图](../backend/agent_runtime/framework/core/workflow.py)
+4. **跨轮审批恢复**：`HIGH_RISK` 工具通过 LangGraph `interrupt()` 暂停，前端收到 `approval_required`。提交决定后，服务校验检查点挂起票据与运行状态，记录决定并以 `Command(resume=review_id)` 恢复同一检查点继续执行。[审批入口](../backend/agent_runtime/api/approvals.py) · [运行状态](../backend/agent_runtime/framework/core/runs.py)
 
 ---
 
@@ -58,7 +59,7 @@
 | 哪一步拖慢了响应？ | Prometheus（首 token / 工具状态）、Loki（结构化日志）、PG `agent_spans`（步骤耗时）、Grafana 看板 | `trace_id` |
 
 **检查点与连接生命周期**：
-- FastAPI `lifespan` 启动时打开 `psycopg_pool.ConnectionPool`（`PgOssStore`）、初始化 `AsyncPostgresSaver`、装配 `OpenAICompatibleProvider` 与后台日志推送协程，关闭时优雅刷盘并释放连接池。[启动与关闭](agent_runtime/api/main.py) · [PG 仓储](agent_runtime/infra/pg/postgres.py)
+- FastAPI `lifespan` 启动时打开 `psycopg_pool.ConnectionPool`（`PgOssStore`）、初始化 `AsyncPostgresSaver`、装配 `OpenAICompatibleProvider` 与后台日志推送协程，关闭时优雅刷盘并释放连接池。[启动与关闭](../backend/agent_runtime/api/main.py) · [PG 仓储](../backend/agent_runtime/infra/pg/postgres.py)
 - 直接嵌入 Python SDK 时，默认检查点为进程内 `InMemorySaver`；需要跨进程或跨重启恢复审批时，应显式传入持久化 checkpointer（如 `AsyncPostgresSaver`）。Mock 模型仅替代推理服务，PostgreSQL 与 MinIO 仍全程参与执行。
 
 ---
@@ -79,10 +80,10 @@
 
 | 扩展协议 | 定位与适用场景 | 源码入口 |
 | --- | --- | --- |
-| `AgentPlugin` | 统一的能力包与客户业务打包入口（声明系统提示词、工具、子 Agent、受控中间件与前端元信息），支持 `extensions=[...]` 与 `AGENT_EXTENSIONS` 挂载 | [core/protocols.py](agent_runtime/framework/core/protocols.py) |
-| `AgentMiddleware` | 受控生命周期切面（`extra_context` 纳入内核预算、`transform_user_input`、`on_before_model` 只读快照、`after_model`、`wrap_tool`、`after_turn`），不可破坏上下文裁剪与工具配对 | [core/middleware.py](agent_runtime/framework/core/middleware.py) |
-| `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider 与脚本 Mock） | [infra/llm/provider.py](agent_runtime/infra/llm/provider.py) |
-| `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](agent_runtime/extensions/rag/extension.py) |
+| `AgentPlugin` | 统一的能力包与客户业务打包入口（声明系统提示词、工具、子 Agent、受控中间件与前端元信息），支持 `extensions=[...]` 与 `AGENT_EXTENSIONS` 挂载 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) |
+| `AgentMiddleware` | 受控生命周期切面（`extra_context` 纳入内核预算、`transform_user_input`、`on_before_model` 只读快照、`after_model`、`wrap_tool`、`after_turn`），不可破坏上下文裁剪与工具配对 | [core/middleware.py](../backend/agent_runtime/framework/core/middleware.py) |
+| `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider 与脚本 Mock） | [infra/llm/provider.py](../backend/agent_runtime/infra/llm/provider.py) |
+| `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](../backend/agent_runtime/extensions/rag/extension.py) |
 
 | 新客户需求 | 推荐接入方式 |
 | --- | --- |
@@ -95,7 +96,7 @@
 
 ## 6. 安全边界与可拔插 ACL 架构（现状与演进）
 
-> 本节严格区分 **Phase 1 已落地能力** 与 **Phase 2–3 规划能力**。核心源码见 [security.py](agent_runtime/framework/core/security.py) 与 [acl_sql.py](agent_runtime/infra/pg/acl_sql.py)。
+> 本节严格区分 **Phase 1 已落地能力** 与 **Phase 2–3 规划能力**。核心源码见 [security/](../backend/agent_runtime/framework/core/security/) 与 [acl_sql.py](../backend/agent_runtime/infra/pg/acl_sql.py)。
 
 ### 6.1 可拔插双协议（Phase 1 已实现）
 

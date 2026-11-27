@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+backend/build/
+extensions/build/
 .venv/
 .pytest_cache/
 .DS_Store
