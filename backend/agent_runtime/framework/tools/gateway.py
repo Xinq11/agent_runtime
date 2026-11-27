@@ -158,7 +158,6 @@ class ToolGateway:
                     ResourceRef(
                         kind="tool",
                         id=call.name,
-                        tenant_id=ctx.auth_scope.tenant_id,
                         attrs={"risk_level": spec.risk_level.value, "is_subagent": spec.is_subagent},
                     ),
                 )
@@ -241,7 +240,7 @@ class ToolGateway:
             except asyncio.CancelledError:
                 if op_key:
                     self.store.finish_tool_run(
-                        ctx.auth_scope.tenant_id, op_key, status="reconcile", error_code="cancelled"
+                        op_key, status="reconcile", error_code="cancelled"
                     )
                 raise
             except asyncio.TimeoutError:
@@ -253,7 +252,6 @@ class ToolGateway:
                 span.attributes.update({"truncated": result.truncated, "error_code": result.error_code})
             if op_key:
                 self.store.finish_tool_run(
-                    ctx.auth_scope.tenant_id,
                     op_key,
                     status="done" if result.ok else "reconcile",
                     receipt={"call_id": call.id} if result.ok else None,

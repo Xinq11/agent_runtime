@@ -1,17 +1,4 @@
-"""Cloud-native Skills extension backed by PG + OSS (`list_skills` & `get_skill` tools).
-
-Zero local filesystem dependency:
-  - Skills live in PG (`agent_skills` + immutable `agent_skill_versions`) and OSS (`skills/...`).
-  - Two-layer Progressive Disclosure (Claude Code / Codex pattern):
-      * Layer 1 (transient `extra_context` in `before_model`): when the caller has <= `inline_limit`
-        authorized skills and can invoke `get_skill`, inject a deterministic sorted `[AVAILABLE_SKILLS]`
-        metadata catalog so the model can directly call `get_skill(slug)` on step 1 while preserving
-        Prefix Cache stability and per-request ACL isolation.
-      * Layer 2 (`list_skills` & `get_skill`): bilingual token-overlap search (with clear non-misleading
-        fallback when query misses) and on-demand full `SKILL.md` / resource loading from OSS.
-  - Executable code uploads (.py/.sh/.exe) are strictly rejected at upload boundary; executable
-    customer capabilities must go through reviewed Python `AgentPlugin` packages.
-"""
+"""Cloud-native Skills extension backed by PG + OSS (`list_skills` & `get_skill` tools + optional router)."""
 
 from __future__ import annotations
 
@@ -19,8 +6,13 @@ import asyncio
 import json
 from typing import Any, Callable, Optional, Sequence, Tuple
 
-from agent_runtime.framework.core.contracts import ExecutionContext, RiskLevel, SkillSummary, ToolResult
-from agent_runtime.framework.core.contracts.skill_resources import validate_resource_name, validate_skill_slug
+from agent_runtime.extensions.skills.models import (
+    SkillSummary,
+    validate_resource_name,
+    validate_skill_slug,
+)
+from agent_runtime.extensions.skills.repo import PgSkillsRepository, filter_skills_by_query
+from agent_runtime.framework.core.contracts import ExecutionContext, RiskLevel, ToolResult
 from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin
 from agent_runtime.framework.core.security import (
     AccessControlError,
@@ -30,7 +22,6 @@ from agent_runtime.framework.core.security import (
     enforce_filter,
 )
 from agent_runtime.framework.tools.gateway import ToolSpec
-from agent_runtime.infra.pg.skills import filter_skills_by_query
 
 
 def _serialize_skills(items: Sequence[SkillSummary]) -> str:
@@ -68,11 +59,10 @@ class _SkillCatalogMiddleware(AgentMiddleware):
     async def extra_context(self, latest_user_text: str, ctx: ExecutionContext) -> Optional[str]:
         if self._inline_limit == 0:
             return None
-        store, access_controller = self._get_deps()
-        if store is None or not hasattr(store, "list_skills"):
+        repo, access_controller = self._get_deps()
+        if repo is None or not hasattr(repo, "list_skills"):
             return None
 
-        # Never leak Skill catalog into scopes/subagents that are not allowed to invoke `get_skill`
         allowed = ctx.auth_scope.allowed_tools
         if allowed is not None and "get_skill" not in allowed:
             return None
@@ -87,22 +77,19 @@ class _SkillCatalogMiddleware(AgentMiddleware):
                     ResourceRef(
                         kind="tool",
                         id="get_skill",
-                        tenant_id=ctx.auth_scope.tenant_id,
                         attrs={"risk_level": RiskLevel.READ.value, "is_subagent": False},
                     ),
                 )
             except AuthorizationError:
                 return None
-            # `AccessControlError` propagates fail-closed; never swallow controller outages
             flt = await enforce_filter(access_controller, ctx.auth_scope, "skill:read", "skill")
 
         items: Sequence[SkillSummary] = await asyncio.to_thread(
-            store.list_skills, ctx.auth_scope, query="", access_filter=flt
+            repo.list_skills, ctx.auth_scope, query="", access_filter=flt
         )
         if not items:
             return None
 
-        # Deterministic sort by slug (no timestamps or query-dependent strings -> Prefix Cache friendly)
         ordered = sorted(items, key=lambda s: s.slug)
         if len(ordered) > self._inline_limit:
             return (
@@ -134,7 +121,7 @@ class _SkillCatalogMiddleware(AgentMiddleware):
 
 
 class SkillsExtension(AgentPlugin):
-    """Registers read-only `list_skills` & `get_skill` tools plus Layer-1 catalog middleware."""
+    """Registers read-only `list_skills` & `get_skill` tools, catalog middleware, schema, and router."""
 
     name = "skills"
     system_prompt = (
@@ -146,13 +133,28 @@ class SkillsExtension(AgentPlugin):
     def __init__(self, *, inline_limit: int = 20, max_inline_chars: int = 1600) -> None:
         self.inline_limit = inline_limit
         self.max_inline_chars = max_inline_chars
-        self._store: Any = None
+        self.repo: Optional[PgSkillsRepository] = None
         self._access_controller: Any = None
+
+    def bootstrap_store(self, store: Any) -> None:
+        repo = self.repo or PgSkillsRepository(store)
+        self.repo = repo
+        repo.bootstrap_schema()
+
+    def routers(self) -> Sequence[Any]:
+        from agent_runtime.extensions.skills.router import build_skills_router
+
+        return (build_skills_router(),)
+
+    def list_visible_skills(self, scope: Any, *, access_filter: Any = None) -> Sequence[SkillSummary]:
+        if self.repo is None:
+            return ()
+        return self.repo.list_skills(scope, access_filter=access_filter)
 
     def middlewares(self) -> Sequence[AgentMiddleware]:
         return (
             _SkillCatalogMiddleware(
-                lambda: (self._store, self._access_controller),
+                lambda: (self.repo, self._access_controller),
                 inline_limit=self.inline_limit,
                 max_inline_chars=self.max_inline_chars,
             ),
@@ -160,7 +162,7 @@ class SkillsExtension(AgentPlugin):
 
     def register_tools(self, *, registry: Any, store: Any, model: Any, gateway: Any, obs: Any) -> None:
         access_controller = getattr(gateway, "access_controller", None)
-        self._store = store
+        self.repo = store if hasattr(store, "list_skills") and hasattr(store, "get_skill_content") else PgSkillsRepository(store)
         self._access_controller = access_controller
 
         async def _list_skills(args: dict, ctx: ExecutionContext) -> Any:
@@ -171,7 +173,7 @@ class SkillsExtension(AgentPlugin):
                     flt = await enforce_filter(access_controller, ctx.auth_scope, "skill:read", "skill")
                 except AccessControlError as exc:
                     return ToolResult("", "list_skills", f"[acl_error] {exc}", ok=False, error_code="acl_error")
-            all_items = store.list_skills(ctx.auth_scope, query="", access_filter=flt)
+            all_items = self.repo.list_skills(ctx.auth_scope, query="", access_filter=flt)
             if not all_items:
                 return "当前权限下暂无可用 Skill。"
 
@@ -199,7 +201,7 @@ class SkillsExtension(AgentPlugin):
                     flt = await enforce_filter(access_controller, ctx.auth_scope, "skill:read", "skill")
                 except AccessControlError as exc:
                     return ToolResult("", "get_skill", f"[acl_error] {exc}", ok=False, error_code="acl_error")
-            content, meta, err = store.get_skill_content(
+            content, meta, err = self.repo.get_skill_content(
                 ctx.auth_scope, slug, resource=resource or None, access_filter=flt
             )
             if err or content is None:
@@ -249,3 +251,12 @@ class SkillsExtension(AgentPlugin):
                 },
             )
         )
+
+
+__all__ = [
+    "PgSkillsRepository",
+    "SkillSummary",
+    "SkillsExtension",
+    "validate_resource_name",
+    "validate_skill_slug",
+]

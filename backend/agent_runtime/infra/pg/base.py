@@ -97,17 +97,23 @@ class PgBase:
         sql_dir = next((p for p in candidates if p.exists()), candidates[0])
         with self.transaction() as cur:
             for fname in (
+                "001_init_pg_schema.sql",
                 "002_oss_and_kb.sql",
                 "003_runs_artifacts_skills.sql",
                 "004_message_feedback.sql",
                 "005_workspace_attachments.sql",
+                "006_drop_tenant_id.sql",
             ):
                 mig = sql_dir / fname
                 if mig.exists():
                     cur.execute(mig.read_text(), prepare=False)
-            cur.execute(
-                sql.SQL("ALTER ROLE grafana_reader PASSWORD {}").format(
-                    sql.Literal(os.environ["GRAFANA_PG_PASSWORD"])
-                )
-            )
+            grafana_pw = os.getenv("GRAFANA_PG_PASSWORD", "").strip()
+            if grafana_pw:
+                cur.execute("SELECT 1 FROM pg_roles WHERE rolname='grafana_reader'")
+                if cur.fetchone():
+                    cur.execute(
+                        sql.SQL("ALTER ROLE grafana_reader PASSWORD {}").format(
+                            sql.Literal(grafana_pw)
+                        )
+                    )
         self.oss.head_bucket()

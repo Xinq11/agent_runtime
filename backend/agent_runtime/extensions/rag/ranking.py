@@ -9,11 +9,11 @@ from typing import Dict, List, Sequence, Set, Tuple
 from agent_runtime.extensions.rag.models import (
     ChunkSearchResult,
     DenseSearchResult,
+    RAGChunk,
     RerankClient,
     RrfFusionResult,
     SparseSearchResult,
 )
-from agent_runtime.framework.core.contracts import RAGChunk
 
 log = logging.getLogger("agent-runtime.rag")
 

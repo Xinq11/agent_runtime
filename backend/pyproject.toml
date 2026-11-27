@@ -34,3 +34,7 @@ docs = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent_runtime*"]
+
+[tool.setuptools.package-data]
+"agent_runtime.extensions.rag" = ["*.sql"]
+"agent_runtime.extensions.skills" = ["*.sql"]

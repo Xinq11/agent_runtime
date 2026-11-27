@@ -14,7 +14,9 @@ from agent_runtime.extensions.rag.models import (
     DenseSearchResult,
     EmbeddingClient,
     ParentEvidenceResult,
+    RAGChunk,
     RerankClient,
+    RetrievalResult,
     RrfFusionResult,
     SparseSearchResult,
 )
@@ -27,13 +29,9 @@ from agent_runtime.extensions.rag.ranking import (
     rerank_candidates,
     rrf_fuse,
 )
+from agent_runtime.extensions.rag.repo import PgRagRepository
 from agent_runtime.extensions.rag.text_utils import chunk_text, terms
-from agent_runtime.framework.core.contracts import (
-    AuthScope,
-    ExecutionContext,
-    RAGChunk,
-    RetrievalResult,
-)
+from agent_runtime.framework.core.contracts import AuthScope, ExecutionContext
 from agent_runtime.framework.core.security import (
     AccessControlError,
     AccessController,
@@ -43,6 +41,12 @@ from agent_runtime.framework.core.security import (
 )
 
 log = logging.getLogger("agent-runtime.rag")
+
+
+def _as_rag_repo(store_or_repo: Any) -> Any:
+    if hasattr(store_or_repo, "search_sparse_rag") and hasattr(store_or_repo, "search_dense_rag"):
+        return store_or_repo
+    return PgRagRepository(store_or_repo)
 
 
 class RagRetrievalService:
@@ -59,7 +63,7 @@ class RagRetrievalService:
         rerank_max_chars: int = RERANK_MAX_DOCUMENT_CHARS,
         access_controller: Optional[AccessController] = None,
     ) -> None:
-        self.store = store
+        self.store = _as_rag_repo(store)
         self.embedding_client = embedding_client or LocalHashEmbeddingClient()
         self.rerank_client = rerank_client or LocalLexicalRerankClient()
         self.min_rerank_score = min_rerank_score
@@ -224,7 +228,6 @@ class RagRetrievalService:
             RAGChunk(
                 chunk_id=ev.matched_child_ids[0] if ev.matched_child_ids else ev.parent_id,
                 parent_id=ev.parent_id,
-                tenant_id=scope.tenant_id,
                 doc_title=ev.doc_title,
                 section_path=ev.section_path,
                 doc_url=ev.doc_url,

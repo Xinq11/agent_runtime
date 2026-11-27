@@ -1,9 +1,6 @@
-"""Shared data contracts for the `agent_runtime` SDK (grouped by domain)."""
+"""Shared core data contracts for the `agent_runtime` SDK (grouped by domain)."""
 
 from agent_runtime.framework.core.contracts.artifacts import (
-    RAGChunk,
-    RetrievalResult,
-    SkillSummary,
     ToolOutputBlob,
     WorkspaceFileRecord,
 )
@@ -38,11 +35,8 @@ __all__ = [
     "ExecutionContext",
     "Message",
     "ProgressCallback",
-    "RAGChunk",
-    "RetrievalResult",
     "RiskLevel",
     "RunRecord",
-    "SkillSummary",
     "SpanRecord",
     "SSEEvent",
     "ToolCall",

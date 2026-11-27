@@ -129,7 +129,7 @@ class TestProductionRegressions(unittest.TestCase):
 
             fake_req = SimpleNamespace(
                 app=fake_app,
-                headers={"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"},
+                headers={"X-User-Id": "u_alice", "X-User-Roles": "employee"},
                 is_disconnected=_is_disconnected,
             )
 
@@ -144,7 +144,7 @@ class TestProductionRegressions(unittest.TestCase):
             # Background worker must finish cleanly (not hang on Queue.put) and transition run to `completed`
             for _ in range(50):
                 active = runtime.run_service.get_active_run_for_thread(
-                    AuthScope("t_acme", "u_alice", ("employee",)), "th_sse_disc"
+                    AuthScope("u_alice", ("employee",)), "th_sse_disc"
                 )
                 if active is None:
                     break
@@ -152,7 +152,7 @@ class TestProductionRegressions(unittest.TestCase):
 
             self.assertIsNone(
                 runtime.run_service.get_active_run_for_thread(
-                    AuthScope("t_acme", "u_alice", ("employee",)), "th_sse_disc"
+                    AuthScope("u_alice", ("employee",)), "th_sse_disc"
                 ),
                 "Thread still has an active running/paused run after client disconnect!",
             )
@@ -161,7 +161,7 @@ class TestProductionRegressions(unittest.TestCase):
             follow = await runtime.run_turn(
                 "刷新页面后的下一轮提问",
                 thread_id="th_sse_disc",
-                scope=AuthScope("t_acme", "u_alice", ("employee",)),
+                scope=AuthScope("u_alice", ("employee",)),
             )
             self.assertEqual(follow["final_answer"], "完整长回答已生成")
 
@@ -271,7 +271,7 @@ class TestProductionRegressions(unittest.TestCase):
                         )
                     return Message("assistant", f"收到历史，已完成凭证列表：{writes_executed}")
 
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             app = AgentRuntimeApp(
                 store=get_test_store(),
                 model=TwoStepScriptedModel(),
@@ -357,7 +357,7 @@ class TestProductionRegressions(unittest.TestCase):
                         )
                     return Message("assistant", "done")
 
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             app = AgentRuntimeApp(
                 store=get_test_store(),
                 model=SameBatchModel(),
@@ -409,7 +409,7 @@ class TestProductionRegressions(unittest.TestCase):
                 trace_id=uid("tr"),
                 thread_id="th_types",
                 request_id=uid("req"),
-                auth_scope=AuthScope("t_acme", "u_alice", ("employee",)),
+                auth_scope=AuthScope("u_alice", ("employee",)),
             )
 
             # 1. Passing string for integer `count` -> `invalid_args` (NOT `tool_error`)
@@ -464,7 +464,7 @@ class TestProductionRegressions(unittest.TestCase):
         async def _run():
             store = CountingStore()
             app = AgentRuntimeApp(store=store)
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             store.create_thread(scope, "th_perf", "perf")
             rec = app.run_service.start_run(
                 scope=scope, thread_id="th_perf", trace_id="tr_perf", request_id="req_perf"
@@ -543,7 +543,7 @@ class TestProductionRegressions(unittest.TestCase):
             self.assertEqual(app.max_steps, 2)
             self.assertGreaterEqual(graph_config("th_dsml", max_steps=15)["recursion_limit"], 64)
 
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             res = await app.run_turn("拉取大结果", thread_id="th_dsml", scope=scope)
             self.assertEqual(len(seen_calls), 2)
             # Identical tool list kept across Step 1 and Step 2 (Prefix Cache intact)

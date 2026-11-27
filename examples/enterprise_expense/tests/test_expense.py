@@ -114,7 +114,7 @@ class TestExpensePlugin(unittest.TestCase):
     def test_01_high_risk_approval_interrupt_resume_and_idempotency(self):
         async def _run():
             app, approval_writes = build_full_app()
-            scope = AuthScope(tenant_id="t_acme", user_id="u_alice", roles=("employee",))
+            scope = AuthScope(user_id="u_alice", roles=("employee",))
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_test_1",
@@ -171,7 +171,7 @@ class TestExpensePlugin(unittest.TestCase):
     def test_legacy_oa_receipts_survive_upgrade_and_follow_thread_deletion(self):
         app, _ = build_full_app()
         store = app.store
-        scope = AuthScope("t_acme", "u_alice", ("employee",))
+        scope = AuthScope("u_alice", ("employee",))
         store.create_thread(scope, "legacy_thread", "Historical approval")
         with store.transaction() as cur:
             cur.execute(
@@ -179,18 +179,18 @@ class TestExpensePlugin(unittest.TestCase):
                 "ADD FOREIGN KEY (thread_id) REFERENCES agent_threads"
             )
             cur.execute(
-                "INSERT INTO oa_approvals(approval_id,thread_id,tenant_id,applicant,op_key,title,region,amount) "
-                "VALUES ('receipt','legacy_thread','t_acme','u_alice','old_key','Report','HQ',5)"
+                "INSERT INTO oa_approvals(approval_id,thread_id,applicant,op_key,title,region,amount) "
+                "VALUES ('receipt','legacy_thread','u_alice','old_key','Report','HQ',5)"
             )
         store.bootstrap()
         self.assertEqual(store.rows("SELECT approval_id FROM oa_approvals"), [{"approval_id": "receipt"}])
         self.assertTrue(store.delete_thread(scope, "legacy_thread"))
         self.assertEqual(store.rows("SELECT approval_id FROM oa_approvals"), [])
 
-    def test_02_truncation_spill_and_cross_tenant_acl_denial(self):
+    def test_02_truncation_spill_and_cross_user_acl_denial(self):
         async def _run():
             app, _writes = build_full_app()
-            alice_scope = AuthScope(tenant_id="t_acme", user_id="u_alice", roles=("employee",))
+            alice_scope = AuthScope(user_id="u_alice", roles=("employee",))
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_test_2",
@@ -209,7 +209,7 @@ class TestExpensePlugin(unittest.TestCase):
                 trace_id=uid("tr"),
                 thread_id="th_other",
                 request_id="req_other",
-                auth_scope=AuthScope(tenant_id="t_evil", user_id="u_mallory", roles=("employee",)),
+                auth_scope=AuthScope(user_id="u_mallory", roles=("employee",)),
             )
             page, err = app.store.read_tool_output_page(mallory_ctx, ref_id)
             self.assertIsNone(page)
@@ -221,7 +221,6 @@ class TestExpensePlugin(unittest.TestCase):
         async def _run():
             app, _writes = build_full_app()
             scope = AuthScope(
-                tenant_id="t_acme",
                 user_id="u_alice",
                 roles=("employee",),
                 allowed_tools=("call_bi_analyst", "bi_query"),
@@ -260,7 +259,7 @@ class TestExpensePlugin(unittest.TestCase):
                 trace_id=uid("tr"),
                 thread_id="th_loop",
                 request_id="req_loop",
-                auth_scope=AuthScope(tenant_id="t_acme", user_id="u1", roles=("employee",)),
+                auth_scope=AuthScope(user_id="u1", roles=("employee",)),
             )
             app.store.create_thread(ctx.auth_scope, ctx.thread_id, "历史对话")
             app.store.append_message(ctx.thread_id, Message("user", "之前确认了哪些事项？"))
@@ -278,7 +277,7 @@ class TestExpensePlugin(unittest.TestCase):
     def test_11_run_service_abort_blocks_stale_approval_resume(self):
         async def _run():
             app, _writes = build_full_app()
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             ctx = ExecutionContext(trace_id=uid("tr"), thread_id="th_abort_1", request_id=uid("req"), auth_scope=scope)
 
             paused = await app.run_turn("查华东区 Q3 差旅超标并起草审批", ctx=ctx)
@@ -306,9 +305,8 @@ class TestExpensePlugin(unittest.TestCase):
 
     def test_13_consistency_regressions_op_key_expired_ticket_and_unique_oss_keys(self):
         async def _run():
-            # 1. Gateway op_key is propagated to write/high-risk tool handler (matches ticket op_key)
             app, approval_writes = build_full_app()
-            scope = AuthScope(tenant_id="t_acme", user_id="u_alice", roles=("employee",))
+            scope = AuthScope(user_id="u_alice", roles=("employee",))
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_reg_1",
@@ -321,7 +319,7 @@ class TestExpensePlugin(unittest.TestCase):
             review_id = ticket["review_id"]
             op_key = ticket["op_key"]
 
-            # 2. Expired approval ticket MUST fail cleanly WITHOUT stranding run in `running`
+            # Expired approval ticket MUST fail cleanly WITHOUT stranding run in `running`
             with app.store.transaction() as cur:
                 cur.execute(
                     "UPDATE tool_approvals SET expires_at = to_timestamp(1) WHERE review_id=%s",
@@ -349,9 +347,9 @@ class TestExpensePlugin(unittest.TestCase):
             self.assertEqual(len(approval_writes), 1)
             self.assertEqual(approval_writes[0]["op_key"], op_key)
 
-            # 3. Repeated writes to same logical path produce distinct immutable OSS keys & monotonic versions
-            r1 = app.store.write_workspace_file("t_acme", "th_reg_ws", "out.md", "v1", actor_id="u_alice")
-            r2 = app.store.write_workspace_file("t_acme", "th_reg_ws", "out.md", "v2", actor_id="u_alice")
+            # Repeated writes to same logical path produce distinct immutable OSS keys & monotonic versions
+            r1 = app.store.write_workspace_file("th_reg_ws", "out.md", "v1", actor_id="u_alice")
+            r2 = app.store.write_workspace_file("th_reg_ws", "out.md", "v2", actor_id="u_alice")
             self.assertEqual((r1.version, r2.version), (1, 2))
             self.assertNotEqual(r1.oss_key, r2.oss_key)
 

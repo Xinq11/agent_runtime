@@ -21,21 +21,22 @@ class RiskLevel(str, Enum):
 class AuthScope:
     """Caller identity & tool scope carried across execution boundaries.
 
+    Each customer deploys independently; the kernel only requires a trusted `user_id`
+    (plus optional business `roles` and custom `attrs`).
     `allowed_tools=None` means unrestricted; `allowed_tools=()` means zero tools allowed.
     """
 
-    tenant_id: str
     user_id: str
     roles: Tuple[str, ...] = ()
-    dept_ids: Tuple[str, ...] = ()
     allowed_tools: Optional[Tuple[str, ...]] = None
     allow_write: bool = True
     authenticated: bool = False
     attrs: Tuple[Tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.user_id, str) or not self.user_id.strip():
+            raise ValueError("AuthScope.user_id must be a non-empty string")
         object.__setattr__(self, "roles", tuple(self.roles or ()))
-        object.__setattr__(self, "dept_ids", tuple(self.dept_ids or ()))
         if self.allowed_tools is not None:
             object.__setattr__(self, "allowed_tools", tuple(self.allowed_tools))
         if isinstance(self.attrs, dict):
@@ -55,10 +56,8 @@ class AuthScope:
         else:
             intersected = tuple(sorted(set(allowed_tools)))
         return AuthScope(
-            tenant_id=self.tenant_id,
             user_id=self.user_id,
             roles=self.roles,
-            dept_ids=self.dept_ids,
             allowed_tools=intersected,
             allow_write=self.allow_write and allow_write,
             authenticated=self.authenticated,

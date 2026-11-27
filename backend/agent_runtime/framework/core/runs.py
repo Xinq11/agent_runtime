@@ -53,7 +53,6 @@ class RunService:
         rid = run_id or uid("run")
         rec = RunRecord(
             run_id=rid,
-            tenant_id=scope.tenant_id,
             thread_id=thread_id,
             actor_id=scope.user_id,
             trace_id=trace_id,
@@ -95,20 +94,20 @@ class RunService:
 
     def get_run(self, scope: AuthScope, run_id: str) -> RunRecord:
         rec = self.store.get_run(run_id)
-        if not rec or rec.tenant_id != scope.tenant_id or rec.actor_id != scope.user_id:
+        if not rec or rec.actor_id != scope.user_id:
             raise RunNotFoundError("运行记录不存在")
         return rec
 
-    def get_run_in_tenant(self, tenant_id: str, run_id: str) -> RunRecord:
-        """Fetch a run within `tenant_id` (used after authorization for cross-user approval resume)."""
+    def get_run_by_id(self, run_id: str) -> RunRecord:
+        """Internal run lookup used only after explicit `approval:decide` authorization."""
         rec = self.store.get_run(run_id)
-        if not rec or rec.tenant_id != tenant_id:
+        if not rec:
             raise RunNotFoundError("运行记录不存在")
         return rec
 
     def get_active_run_for_thread(self, scope: AuthScope, thread_id: str) -> Optional[RunRecord]:
         rec = self.store.get_active_run(thread_id)
-        if not rec or rec.tenant_id != scope.tenant_id or rec.actor_id != scope.user_id:
+        if not rec or rec.actor_id != scope.user_id:
             return None
         return rec
 
@@ -133,7 +132,7 @@ class RunService:
         if rec.status in ("completed", "cancelled", "failed"):
             return rec
 
-        updated = self.store.mark_run_cancelled(rec.run_id, scope.tenant_id)
+        updated = self.store.mark_run_cancelled(rec.run_id)
         ev = self._cancel_flags.get(rec.run_id)
         if ev is not None:
             ev.set()
@@ -142,15 +141,11 @@ class RunService:
             task.cancel()
         return updated or rec
 
-    def mark_paused(self, run_id: str, tenant_id: str) -> Optional[RunRecord]:
-        return self.store.transition_run_status(
-            run_id, tenant_id, expected=("running",), new_status="paused"
-        )
+    def mark_paused(self, run_id: str) -> Optional[RunRecord]:
+        return self.store.transition_run_status(run_id, expected=("running",), new_status="paused")
 
-    def mark_resumed(self, run_id: str, tenant_id: str) -> RunRecord:
-        updated = self.store.transition_run_status(
-            run_id, tenant_id, expected=("paused",), new_status="running"
-        )
+    def mark_resumed(self, run_id: str) -> RunRecord:
+        updated = self.store.transition_run_status(run_id, expected=("paused",), new_status="running")
         if updated is None:
             raise RunStateError("该运行已取消或不再处于暂停状态，无法恢复")
         self._cancel_flags[run_id] = asyncio.Event()
@@ -160,14 +155,12 @@ class RunService:
     def mark_finished(
         self,
         run_id: str,
-        tenant_id: str,
         *,
         status: str,
         error_detail: Optional[str] = None,
     ) -> Optional[RunRecord]:
         return self.store.transition_run_status(
             run_id,
-            tenant_id,
             expected=("running", "paused"),
             new_status=status,
             error_detail=error_detail,

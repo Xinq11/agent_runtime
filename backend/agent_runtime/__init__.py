@@ -1,21 +1,8 @@
 """`agent_runtime` — Unified Internal General Agent SDK.
 
-Stable public import surface:
-    from agent_runtime import (
-        AgentRuntimeApp,
-        AgentPlugin,
-        AgentMiddleware,
-        RAGStrategy,
-        RagExtension,
-        RagRetrievalService,
-        SkillsExtension,
-        tool,
-        ToolSpec,
-        SubAgentProfile,
-        AuthScope,
-        ExecutionContext,
-        RiskLevel,
-    )
+Core SDK requires ZERO pgvector, RAG, Skills, or Ops tables/routes.
+Optional official extensions (`RagExtension`, `SkillsExtension`) are lazily exported here
+for convenience without creating any reverse dependency from core `framework/` to `extensions/`.
 """
 
 from __future__ import annotations
@@ -28,11 +15,8 @@ from agent_runtime.framework.core.contracts import (
     AuthScope,
     ExecutionContext,
     Message,
-    RAGChunk,
-    RetrievalResult,
     RiskLevel,
     RunRecord,
-    SkillSummary,
     SpanRecord,
     SSEEvent,
     ToolCall,
@@ -46,7 +30,6 @@ from agent_runtime.framework.core.protocols import (
     AppMetadata,
     LLMProvider,
     QuickPromptSpec,
-    RAGStrategy,
 )
 from agent_runtime.framework.core.security import (
     AccessControlError,
@@ -92,6 +75,8 @@ __all__ = [
     "NoopAccessController",
     "ParentEvidenceResult",
     "PgOssStore",
+    "PgRagRepository",
+    "PgSkillsRepository",
     "QuickPromptSpec",
     "RAGChunk",
     "RAGStrategy",
@@ -146,11 +131,24 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.extensions.rag.retrieval import RagRetrievalService as _rag
 
         return _rag
+    if name == "PgRagRepository":
+        from agent_runtime.extensions.rag.repo import PgRagRepository as _rag_repo
+
+        return _rag_repo
     if name in ("rrf_fuse", "diversify_candidates", "rerank_candidates", "final_rank_fuse"):
         from agent_runtime.extensions.rag import ranking as _rank
 
         return getattr(_rank, name)
-    if name in ("ChunkSearchResult", "ParentEvidenceResult", "EmbeddingClient", "RerankClient", "RerankItem"):
+    if name in (
+        "RAGChunk",
+        "RAGStrategy",
+        "RetrievalResult",
+        "ChunkSearchResult",
+        "ParentEvidenceResult",
+        "EmbeddingClient",
+        "RerankClient",
+        "RerankItem",
+    ):
         from agent_runtime.extensions.rag import models as _rm
 
         return getattr(_rm, name)
@@ -162,6 +160,14 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.extensions.skills.extension import SkillsExtension as _skills
 
         return _skills
+    if name == "PgSkillsRepository":
+        from agent_runtime.extensions.skills.repo import PgSkillsRepository as _skills_repo
+
+        return _skills_repo
+    if name == "SkillSummary":
+        from agent_runtime.extensions.skills.models import SkillSummary as _skill_summary
+
+        return _skill_summary
     if name == "PgOssStore":
         from agent_runtime.infra.pg.postgres import PgOssStore as _pg
 

@@ -10,13 +10,12 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from agent_runtime.framework.context.memory import ContextWindowExceeded
 from agent_runtime.api.deps import caller_scope, caller_scope_async
 from agent_runtime.api.schemas import AbortRequest, ChatRequest
-from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink, uid
+from agent_runtime.framework.context.memory import ContextWindowExceeded
+from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink
 from agent_runtime.framework.core.contracts import SSEEvent
 from agent_runtime.framework.core.runs import RunConflictError, RunNotFoundError
-from agent_runtime.framework.core.workflow import graph_config, pending_tickets
 from agent_runtime.infra.llm.provider import ModelNotConfiguredError
 
 log = logging.getLogger("agent-runtime.chat")
@@ -36,7 +35,7 @@ def get_run(run_id: str, req: Request):
 async def abort_chat(req: Request, body: AbortRequest):
     scope = await caller_scope_async(req)
     try:
-        rec = req.app.state.runtime.run_service.request_abort(
+        rec = await req.app.state.runtime.abort_run(
             scope=scope, run_id=body.run_id, thread_id=body.thread_id
         )
     except RunNotFoundError as exc:
@@ -60,25 +59,22 @@ async def chat_sse(req: Request, body: ChatRequest):
 
     scope = await caller_scope_async(req)
     runtime = req.app.state.runtime
-    store, graph, obs = req.app.state.store, req.app.state.graph, req.app.state.obs
+    store, obs = req.app.state.store, req.app.state.obs
     run_service = runtime.run_service
 
-    tid = body.thread_id or uid("th")
-    trace = uid("tr")
-    request_id = body.request_id or uid("req")
     try:
-        await asyncio.to_thread(store.create_thread, scope, tid, text.strip()[:48])
+        ctx, run_rec = await runtime.prepare_turn_run(
+            text,
+            scope=scope,
+            thread_id=body.thread_id or None,
+            request_id=body.request_id or None,
+        )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
-
-    try:
-        run_rec = run_service.start_run(
-            scope=scope, thread_id=tid, trace_id=trace, request_id=request_id
-        )
     except RunConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
 
-    cfg = graph_config(tid, max_steps=getattr(runtime, "max_steps", None))
+    tid, trace, request_id = ctx.thread_id, ctx.trace_id, ctx.request_id
     queue: asyncio.Queue = asyncio.Queue(256)
     stream_meta = {"run_id": run_rec.run_id, "seq": 0, "closed": False}
 
@@ -86,22 +82,10 @@ async def chat_sse(req: Request, body: ChatRequest):
         token_sink = sse_sink.set(queue)
         token_meta = sse_meta.set(stream_meta)
         try:
-            if pending_tickets(await graph.aget_state(cfg)):
-                run_service.mark_finished(
-                    run_rec.run_id, scope.tenant_id, status="failed", error_detail="pending_approval"
-                )
-                await publish_sse(
-                    SSEEvent(
-                        "error",
-                        {"error": "请先处理或中止当前对话的待审批操作", "trace_id": trace, "run_id": run_rec.run_id},
-                    )
-                )
-                return
-
             model_cfg = getattr(req.app.state.model, "config", None)
             if model_cfg is not None and not getattr(model_cfg, "api_key", ""):
                 run_service.mark_finished(
-                    run_rec.run_id, scope.tenant_id, status="failed", error_detail="ModelNotConfiguredError"
+                    run_rec.run_id, status="failed", error_detail="ModelNotConfiguredError"
                 )
                 await publish_sse(
                     SSEEvent(
@@ -161,7 +145,7 @@ async def chat_sse(req: Request, body: ChatRequest):
                     )
                 )
         except asyncio.CancelledError:
-            run_service.mark_finished(run_rec.run_id, scope.tenant_id, status="cancelled")
+            run_service.mark_finished(run_rec.run_id, status="cancelled")
             obs.log_event("turn_cancelled", trace, tid, run_id=run_rec.run_id)
             with suppress(Exception):
                 await publish_sse(
@@ -170,7 +154,7 @@ async def chat_sse(req: Request, body: ChatRequest):
         except Exception as exc:
             log.exception("Turn failed: %s", trace)
             run_service.mark_finished(
-                run_rec.run_id, scope.tenant_id, status="failed", error_detail=type(exc).__name__
+                run_rec.run_id, status="failed", error_detail=type(exc).__name__
             )
             obs.log_event("turn_error", trace, tid, run_id=run_rec.run_id, error=type(exc).__name__)
             if isinstance(exc, HTTPException):

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from importlib.resources import files
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .tools import create_expense_tools
+from agent_runtime.extensions.rag.repo import PgRagRepository
+from agent_runtime.extensions.skills.repo import PgSkillsRepository
 from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
-from agent_runtime.framework.tools.registry import ToolSpec
-from agent_runtime.framework.tools.subagent import SubAgentProfile, register_subagent_tool
+from agent_runtime.framework.tools.subagent import SubAgentProfile
 
 DEFAULT_EXPENSE_SKILL_MD = """# 差旅超标分析与报告 SOP
 
@@ -42,7 +43,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
         self.approval_writes = approval_writes if approval_writes is not None else []
 
     def default_identity(self) -> AuthScope:
-        return AuthScope(tenant_id="t_acme", user_id="u_alice", roles=("employee", "exec"))
+        return AuthScope(user_id="u_alice", roles=("employee", "exec"))
 
     def metadata(self) -> AppMetadata:
         return AppMetadata(
@@ -80,18 +81,15 @@ class EnterpriseExpensePlugin(AgentPlugin):
     def register_tools(self, *, registry, store, model, gateway, obs) -> None:
         for spec in create_expense_tools(store, approval_writes=self.approval_writes):
             registry.register(spec)
-        register_subagent_tool(
-            registry=registry,
-            profile=SubAgentProfile(
+
+    def subagents(self) -> Sequence[SubAgentProfile]:
+        return (
+            SubAgentProfile(
                 subagent_name="bi_analyst",
                 description="委派只读 BI 分析师",
                 system_prompt="你负责核验差旅数字并汇总结果。",
                 allowed_tools=("bi_query",),
             ),
-            model_client=model,
-            tool_gateway=gateway,
-            obs=obs,
-            tool_spec_cls=ToolSpec,
         )
 
     def bootstrap_store(self, store: Any) -> None:
@@ -99,29 +97,33 @@ class EnterpriseExpensePlugin(AgentPlugin):
         with store.transaction() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(hashtext('enterprise_expense.schema'))")
             cur.execute(ddl)
-        scope = AuthScope("t_acme", "seed", ("employee", "exec"))
-        store.index_document(
-            scope,
-            "2026 差旅与费用报销制度",
-            "一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
-            ["employee", "finance"],
-            parent="travel_2026",
-            section="住宿标准与超标审批红线",
-        )
-        store.index_document(
-            scope,
-            "高管薪酬方案（绝密）",
-            "高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
-            ["exec"],
-            parent="exec_comp",
-            section="奖金池",
-        )
-        if not store.list_skills(scope, query="expense-audit-report", include_disabled=True, bypass_acl=True):
-            store.publish_skill(
-                scope=scope,
-                slug="expense-audit-report",
-                description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
-                content=DEFAULT_EXPENSE_SKILL_MD,
-                acl_roles=["employee", "finance", "exec"],
-                tags=["finance", "report", "sop"],
+        scope = AuthScope("seed", ("employee", "exec"))
+        if store.rows("SELECT to_regclass('rag_parents') AS tbl")[0]["tbl"]:
+            rag_repo = PgRagRepository(store)
+            rag_repo.index_document(
+                scope,
+                "2026 差旅与费用报销制度",
+                "一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
+                ["employee", "finance"],
+                parent="travel_2026",
+                section="住宿标准与超标审批红线",
             )
+            rag_repo.index_document(
+                scope,
+                "高管薪酬方案（绝密）",
+                "高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
+                ["exec"],
+                parent="exec_comp",
+                section="奖金池",
+            )
+        if store.rows("SELECT to_regclass('agent_skills') AS tbl")[0]["tbl"]:
+            skills_repo = PgSkillsRepository(store)
+            if not skills_repo.list_skills(scope, query="expense-audit-report", include_disabled=True, bypass_acl=True):
+                skills_repo.publish_skill(
+                    scope=scope,
+                    slug="expense-audit-report",
+                    description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
+                    content=DEFAULT_EXPENSE_SKILL_MD,
+                    acl_roles=["employee", "finance", "exec"],
+                    tags=["finance", "report", "sop"],
+                )

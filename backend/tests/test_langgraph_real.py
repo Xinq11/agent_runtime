@@ -82,7 +82,7 @@ class TestRealLangGraphEngine(unittest.TestCase):
                 tools=[log_draft, wire_transfer],
             )
 
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             ctx = ExecutionContext(
                 trace_id=uid("tr"),
                 thread_id="th_lg_replay_1",
@@ -149,7 +149,7 @@ class TestRealLangGraphEngine(unittest.TestCase):
                 checkpointer=InMemorySaver(),
                 tools=[drop_table],
             )
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             paused = await app.run_turn("删除 users 表", thread_id="th_lg_abort", scope=scope)
             review_id = paused["__interrupt__"][0]["review_id"]
 

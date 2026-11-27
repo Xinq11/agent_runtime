@@ -19,30 +19,27 @@ from agent_runtime.framework.core.contracts import (
 class PgApprovalsMixin:
     """Transactional approval ticket consumption and idempotent tool-run claiming."""
 
-    _TICKET = """review_id,tenant_id,thread_id,actor_id,op_key,tool_name,args_hash,policy_rev,summary,
+    _TICKET = """review_id,thread_id,actor_id,op_key,tool_name,args_hash,policy_rev,summary,
                  extract(epoch from expires_at)::float8,decision,approver_id,
-                 extract(epoch from consumed_at)::float8"""
-    _TOOL_RUN = """tenant_id,op_key,actor_id,tool_name,args_hash,status,receipt,result_ref,preview,
+                 extract(epoch from consumed_at)::float8,run_id"""
+    _TOOL_RUN = """op_key,actor_id,tool_name,args_hash,status,receipt,result_ref,preview,
                    error_code,extract(epoch from lease_until)::float8"""
 
     @staticmethod
-    def _lock_op(cur, tenant: str, key: str) -> None:
-        cur.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (json.dumps([tenant, key]),),
-        )
+    def _lock_op(cur, key: str) -> None:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
 
     def get_or_create_approval(
         self, ctx, op_key, tool_name, args_hash, summary, ttl_sec=600
     ) -> ApprovalTicket:
-        tenant, actor = ctx.auth_scope.tenant_id, ctx.auth_scope.user_id
-        fields = (tenant, ctx.thread_id, actor, op_key, tool_name, args_hash, ctx.policy_rev)
+        actor = ctx.auth_scope.user_id
+        fields = (ctx.thread_id, actor, op_key, tool_name, args_hash, ctx.policy_rev)
         with self.transaction() as cur:
-            self._lock_op(cur, tenant, op_key)
+            self._lock_op(cur, op_key)
             cur.execute(
                 f"""SELECT {self._TICKET} FROM tool_approvals
-                    WHERE (tenant_id,thread_id,actor_id,op_key,tool_name,args_hash,policy_rev)
-                        = (%s,%s,%s,%s,%s,%s,%s)
+                    WHERE (thread_id,actor_id,op_key,tool_name,args_hash,policy_rev)
+                        = (%s,%s,%s,%s,%s,%s)
                       AND (expires_at>clock_timestamp() OR consumed_at IS NOT NULL)
                     ORDER BY expires_at DESC LIMIT 1""",
                 fields,
@@ -51,28 +48,28 @@ class PgApprovalsMixin:
             if row is None:
                 cur.execute(
                     f"""INSERT INTO tool_approvals
-                        (review_id,tenant_id,thread_id,actor_id,op_key,tool_name,args_hash,
-                         policy_rev,summary,expires_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
-                                clock_timestamp()+%s*interval '1 second') RETURNING {self._TICKET}""",
-                    (uuid4().hex, *fields, json.dumps(summary), ttl_sec),
+                        (review_id,thread_id,actor_id,op_key,tool_name,args_hash,
+                         policy_rev,summary,expires_at,run_id)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
+                                clock_timestamp()+%s*interval '1 second',%s) RETURNING {self._TICKET}""",
+                    (uuid4().hex, *fields, json.dumps(summary), ttl_sec, ctx.run_id or ""),
                 )
                 row = cur.fetchone()
             return ApprovalTicket(*row)
 
     def find_approval_thread(self, review_id: str, scope: AuthScope) -> Optional[str]:
         rows = self.rows(
-            "SELECT thread_id FROM tool_approvals WHERE review_id=%s AND tenant_id=%s AND actor_id=%s",
-            (review_id, scope.tenant_id, scope.user_id),
+            "SELECT thread_id FROM tool_approvals WHERE review_id=%s AND actor_id=%s",
+            (review_id, scope.user_id),
         )
         return rows[0]["thread_id"] if rows else None
 
-    def get_approval_ticket(self, review_id: str, tenant_id: str) -> Optional[ApprovalTicket]:
-        """Look up an approval ticket within `tenant_id` without binding requester == approver."""
+    def get_approval_ticket(self, review_id: str) -> Optional[ApprovalTicket]:
+        """Look up an approval ticket by `review_id` (caller authorization enforced in runtime)."""
         with self.transaction() as cur:
             cur.execute(
-                f"SELECT {self._TICKET} FROM tool_approvals WHERE review_id=%s AND tenant_id=%s",
-                (review_id, tenant_id),
+                f"SELECT {self._TICKET} FROM tool_approvals WHERE review_id=%s",
+                (review_id,),
             )
             row = cur.fetchone()
             return ApprovalTicket(*row) if row else None
@@ -97,10 +94,9 @@ class PgApprovalsMixin:
         self, ctx, op_key, tool_name, args_hash, review_id=None
     ) -> Tuple[bool, ToolRunRecord, Optional[str]]:
         run = make_tool_run_record(ctx, op_key, tool_name, args_hash)
-        key = (run.tenant_id, op_key)
         with self.transaction() as cur:
-            self._lock_op(cur, *key)
-            cur.execute(f"SELECT {self._TOOL_RUN} FROM tool_runs WHERE tenant_id=%s AND op_key=%s", key)
+            self._lock_op(cur, op_key)
+            cur.execute(f"SELECT {self._TOOL_RUN} FROM tool_runs WHERE op_key=%s", (op_key,))
             row = cur.fetchone()
             if row:
                 old = ToolRunRecord(*row)
@@ -108,7 +104,7 @@ class PgApprovalsMixin:
                     return False, replace(run, status="failed"), "op_key_conflict"
                 return False, old, None if old.status == "done" else old.error_code or old.status
             if review_id is None:
-                cur.execute("SELECT 1 FROM tool_approvals WHERE tenant_id=%s AND op_key=%s LIMIT 1", key)
+                cur.execute("SELECT 1 FROM tool_approvals WHERE op_key=%s LIMIT 1", (op_key,))
                 if cur.fetchone():
                     return False, replace(run, status="failed"), "approval_mismatch"
             else:
@@ -128,30 +124,27 @@ class PgApprovalsMixin:
                 if not cur.fetchone():
                     return False, replace(run, status="failed"), "approval_expired"
             cur.execute(
-                """INSERT INTO tool_runs (tenant_id,op_key,actor_id,tool_name,args_hash,status,lease_until)
-                   VALUES (%s,%s,%s,%s,%s,'running',to_timestamp(%s))""",
-                (*key, run.actor_id, tool_name, args_hash, run.lease_until),
+                """INSERT INTO tool_runs (op_key,actor_id,tool_name,args_hash,status,lease_until)
+                   VALUES (%s,%s,%s,%s,'running',to_timestamp(%s))""",
+                (op_key, run.actor_id, tool_name, args_hash, run.lease_until),
             )
             return True, run, None
 
     def finish_tool_run(
-        self, tenant_id, op_key, *, status, receipt=None, preview=None, result_ref=None, error_code=None
+        self, op_key, *, status, receipt=None, preview=None, result_ref=None, error_code=None
     ) -> ToolRunRecord:
         if status not in ("done", "failed", "reconcile"):
             raise ValueError("invalid run status")
         with self.transaction() as cur:
             cur.execute(
                 f"""UPDATE tool_runs SET status=%s,receipt=%s::jsonb,preview=%s,result_ref=%s,error_code=%s
-                    WHERE tenant_id=%s AND op_key=%s AND status IN ('running','reconcile')
+                    WHERE op_key=%s AND status IN ('running','reconcile')
                     RETURNING {self._TOOL_RUN}""",
-                (status, json.dumps(receipt), preview, result_ref, error_code, tenant_id, op_key),
+                (status, json.dumps(receipt), preview, result_ref, error_code, op_key),
             )
             row = cur.fetchone()
             if row is None:
-                cur.execute(
-                    f"SELECT {self._TOOL_RUN} FROM tool_runs WHERE tenant_id=%s AND op_key=%s",
-                    (tenant_id, op_key),
-                )
+                cur.execute(f"SELECT {self._TOOL_RUN} FROM tool_runs WHERE op_key=%s", (op_key,))
                 row = cur.fetchone()
                 if row is None:
                     raise KeyError(op_key)

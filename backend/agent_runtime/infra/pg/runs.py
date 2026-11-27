@@ -10,7 +10,7 @@ from agent_runtime.framework.core.contracts import RunRecord
 class PgRunsMixin:
     """Short-transaction durable run state machine replacing long-lived advisory locks."""
 
-    _RUN_COLS = """run_id,tenant_id,thread_id,actor_id,trace_id,request_id,status,owner_epoch,
+    _RUN_COLS = """run_id,thread_id,actor_id,trace_id,request_id,status,owner_epoch,
                    extract(epoch from cancel_requested_at)::float8,error_detail"""
 
     def create_run(self, rec: RunRecord) -> Tuple[bool, Optional[str]]:
@@ -20,11 +20,10 @@ class PgRunsMixin:
             with self.transaction() as cur:
                 cur.execute(
                     """INSERT INTO agent_runs
-                       (run_id,tenant_id,thread_id,actor_id,trace_id,request_id,status,owner_epoch)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       (run_id,thread_id,actor_id,trace_id,request_id,status,owner_epoch)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                     (
                         rec.run_id,
-                        rec.tenant_id,
                         rec.thread_id,
                         rec.actor_id,
                         rec.trace_id,
@@ -53,30 +52,26 @@ class PgRunsMixin:
             row = cur.fetchone()
             return RunRecord(*row) if row else None
 
-    def mark_run_cancelled(self, run_id: str, tenant_id: str) -> Optional[RunRecord]:
+    def mark_run_cancelled(self, run_id: str) -> Optional[RunRecord]:
         with self.transaction() as cur:
             cur.execute(
                 f"""UPDATE agent_runs
                     SET status='cancelled', cancel_requested_at=COALESCE(cancel_requested_at, now()),
                         owner_epoch=owner_epoch+1, updated_at=now()
-                    WHERE run_id=%s AND tenant_id=%s AND status IN ('running','paused')
+                    WHERE run_id=%s AND status IN ('running','paused')
                     RETURNING {self._RUN_COLS}""",
-                (run_id, tenant_id),
+                (run_id,),
             )
             row = cur.fetchone()
             if row:
                 return RunRecord(*row)
-            cur.execute(
-                f"SELECT {self._RUN_COLS} FROM agent_runs WHERE run_id=%s AND tenant_id=%s",
-                (run_id, tenant_id),
-            )
+            cur.execute(f"SELECT {self._RUN_COLS} FROM agent_runs WHERE run_id=%s", (run_id,))
             row = cur.fetchone()
             return RunRecord(*row) if row else None
 
     def transition_run_status(
         self,
         run_id: str,
-        tenant_id: str,
         *,
         expected: Tuple[str, ...],
         new_status: str,
@@ -87,9 +82,9 @@ class PgRunsMixin:
                 f"""UPDATE agent_runs
                     SET status=%s, owner_epoch=owner_epoch+1,
                         error_detail=COALESCE(%s, error_detail), updated_at=now()
-                    WHERE run_id=%s AND tenant_id=%s AND status = ANY(%s)
+                    WHERE run_id=%s AND status = ANY(%s)
                     RETURNING {self._RUN_COLS}""",
-                (new_status, error_detail, run_id, tenant_id, list(expected)),
+                (new_status, error_detail, run_id, list(expected)),
             )
             row = cur.fetchone()
             return RunRecord(*row) if row else None

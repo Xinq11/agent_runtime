@@ -45,7 +45,8 @@ def app_meta(req: Request):
     runtime = req.app.state.runtime
     scope = caller_scope(req)
     skills = []
-    if hasattr(req.app.state.store, "list_skills"):
+    skills_ext = runtime.get_extension("skills")
+    if skills_ext is not None and hasattr(skills_ext, "list_visible_skills"):
         sk_flt = resolve_filter(req, scope, "skill:read", "skill")
         skills = [
             {
@@ -55,7 +56,7 @@ def app_meta(req: Request):
                 "tags": list(s.tags),
                 "resources": list(s.resources),
             }
-            for s in req.app.state.store.list_skills(scope, access_filter=sk_flt)
+            for s in skills_ext.list_visible_skills(scope, access_filter=sk_flt)
         ]
     visible_tools = []
     ac = runtime.access_controller
@@ -64,7 +65,7 @@ def app_meta(req: Request):
             decision = ac.check(
                 scope,
                 "tool:list",
-                ResourceRef("tool", id=s.name, tenant_id=scope.tenant_id, attrs={"risk_level": s.risk_level.value}),
+                ResourceRef("tool", id=s.name, attrs={"risk_level": s.risk_level.value}),
             )
         except Exception as exc:
             raise HTTPException(503, f"access_controller_error:{type(exc).__name__}") from exc
@@ -108,7 +109,7 @@ async def get_model(req: Request):
 @router.post("/config/model", summary="热更新当前进程模型配置")
 async def update_model(req: Request, payload: ModelConfigUpdateRequest):
     scope = await caller_scope_async(req)
-    await require_access_async(req, scope, "system:update_model", ResourceRef("system", tenant_id=scope.tenant_id))
+    await require_access_async(req, scope, "system:update_model", ResourceRef("system"))
     body = payload.model_dump(exclude_none=True)
     current = req.app.state.model.config
     cfg = replace(current, **{k: str(v).strip() for k, v in body.items()})

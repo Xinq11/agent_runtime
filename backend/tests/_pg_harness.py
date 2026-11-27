@@ -1,4 +1,8 @@
-"""Shared PostgreSQL + pgvector + MinIO test harness using an isolated `agent_runtime_test` DB."""
+"""Shared PostgreSQL + MinIO test harness using an isolated `agent_runtime_test` DB.
+
+Core `bootstrap()` creates ONLY core execution tables; extension tables are truncated
+dynamically via `to_regclass` so tests work with or without RAG/Skills schemas installed.
+"""
 
 from __future__ import annotations
 
@@ -29,9 +33,29 @@ class EchoTestModel:
             return self.router(ctx, last_user, tool_msgs, tool_names)
         return Message(role="assistant", content=f"已收到消息：{last_user}")
 
+
 TEST_DB_NAME = os.getenv("AGENT_TEST_DB", "agent_runtime_test")
 TEST_BUCKET = os.getenv("AGENT_TEST_BUCKET", "agent-artifacts-test")
 _PROTECTED_DBS = frozenset({"agent_runtime", "postgres", "template0", "template1"})
+
+_ALL_KNOWN_TABLES = (
+    "agent_threads",
+    "session_messages",
+    "session_summaries",
+    "message_feedback",
+    "tool_approvals",
+    "tool_outputs",
+    "tool_runs",
+    "agent_spans",
+    "runtime_traces",
+    "agent_runs",
+    "workspace_files",
+    "rag_parents",
+    "rag_chunks",
+    "agent_skills",
+    "agent_skill_versions",
+    "oa_approvals",
+)
 
 
 def validate_test_db_name(db_name: str) -> str:
@@ -44,6 +68,7 @@ def validate_test_db_name(db_name: str) -> str:
             "AGENT_TEST_DB must end with '_test' or start with 'test_'."
         )
     return cleaned
+
 
 _SHARED_STORE: Optional[PgOssStore] = None
 _ORIGINAL_PG_DBNAME: Optional[str] = None
@@ -87,12 +112,6 @@ def get_test_store() -> PgOssStore:
 
     store = PgOssStore(test_dsn, oss=oss)
     store.open_pool(min_size=1, max_size=8)
-
-    sdir = _sql_dir()
-    with store.transaction() as cur:
-        cur.execute("SELECT to_regclass('public.agent_threads')")
-        if not cur.fetchone()[0]:
-            cur.execute((sdir / "001_init_pg_schema.sql").read_text(), prepare=False)
     store.bootstrap()
 
     _SHARED_STORE = store
@@ -100,7 +119,7 @@ def get_test_store() -> PgOssStore:
 
 
 def reset_test_db() -> PgOssStore:
-    """Truncate all domain tables in `agent_runtime_test` so every test starts from a clean slate."""
+    """Dynamically truncate all existing domain/extension tables in `agent_runtime_test`."""
     db_name = validate_test_db_name(TEST_DB_NAME)
     store = get_test_store()
     with store.transaction() as cur:
@@ -108,11 +127,15 @@ def reset_test_db() -> PgOssStore:
         actual_db = str(cur.fetchone()[0])
         if actual_db != db_name or actual_db in _PROTECTED_DBS:
             raise RuntimeError(f"Refusing TRUNCATE on unexpected database '{actual_db}' (expected '{db_name}')")
-        cur.execute(
-            """TRUNCATE agent_threads, session_messages, session_summaries, message_feedback,
-                        tool_approvals, tool_outputs, tool_runs, rag_parents, rag_chunks,
-                        agent_spans, runtime_traces, agent_runs, workspace_files,
-                        agent_skills, agent_skill_versions
-               RESTART IDENTITY CASCADE"""
-        )
+        existing = []
+        for tbl in _ALL_KNOWN_TABLES:
+            cur.execute("SELECT to_regclass(%s)", (f"public.{tbl}",))
+            if cur.fetchone()[0]:
+                existing.append(tbl)
+        if existing:
+            cur.execute(
+                sql.SQL("TRUNCATE {} RESTART IDENTITY CASCADE").format(
+                    sql.SQL(", ").join(sql.Identifier(t) for t in existing)
+                )
+            )
     return store

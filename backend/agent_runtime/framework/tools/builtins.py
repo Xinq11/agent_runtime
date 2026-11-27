@@ -55,7 +55,7 @@ def register_immutable_builtin_tools(
             return ToolResult("", "read", f"[invalid_path] {exc}", ok=False, error_code="invalid_path")
 
         if path == ".":
-            files = store.list_workspace_files(ctx.auth_scope.tenant_id, ctx.thread_id)
+            files = store.list_workspace_files(ctx.thread_id)
             if not files:
                 return "当前会话工作区暂无文件。"
             return json.dumps(
@@ -77,7 +77,7 @@ def register_immutable_builtin_tools(
         if offset < 0 or limit < 1:
             return ToolResult("", "read", "[invalid_args] offset/limit invalid", ok=False, error_code="invalid_args")
 
-        content, meta, err = store.read_workspace_file(ctx.auth_scope.tenant_id, ctx.thread_id, path)
+        content, meta, err = store.read_workspace_file(ctx.thread_id, path)
         if err or content is None:
             return ToolResult("", "read", f"[{err or 'file_not_found'}] {path}", ok=False, error_code=err or "file_not_found")
         total = len(content)
@@ -107,7 +107,6 @@ def register_immutable_builtin_tools(
 
         content_type = str(args.get("content_type") or "text/plain; charset=utf-8")
         rec = store.write_workspace_file(
-            ctx.auth_scope.tenant_id,
             ctx.thread_id,
             path,
             content,
@@ -134,7 +133,6 @@ def register_immutable_builtin_tools(
                     ResourceRef(
                         kind="artifact",
                         id=args["ref_id"],
-                        tenant_id=ctx.auth_scope.tenant_id,
                         owner_id=ctx.auth_scope.user_id,
                     ),
                 )

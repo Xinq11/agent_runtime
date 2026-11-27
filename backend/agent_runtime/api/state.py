@@ -1,4 +1,4 @@
-"""Thread Trace waterfall, summary cursor, workspace files, and event log snapshot route."""
+"""Thread Trace waterfall, summary cursor, workspace files, context budget, and event log snapshot route."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 
 from fastapi import APIRouter, HTTPException, Request
 
-from agent_runtime.api.deps import caller_scope_async, resolve_filter_async
+from agent_runtime.api.deps import caller_scope_async
 from agent_runtime.framework.context.memory import ContextBudget, _msg_tokens
 from agent_runtime.framework.core.contracts import Message, estimate_tokens
 from agent_runtime.infra.llm.provider import wire_spec
@@ -51,7 +51,6 @@ def _compute_context_budget_snapshot(runtime, store, scope, thread_id: str, snap
 @router.get("/state", summary="获取会话 Trace 瀑布图、摘要游标、工作区文件与事件日志快照")
 async def runtime_state(req: Request, thread_id: str = "", trace_id: str = ""):
     scope = await caller_scope_async(req)
-    kb_filter = await resolve_filter_async(req, scope, "kb:retrieve", "rag_doc")
     store, obs = req.app.state.store, req.app.state.obs
     try:
         snapshot = await asyncio.to_thread(
@@ -59,25 +58,25 @@ async def runtime_state(req: Request, thread_id: str = "", trace_id: str = ""):
             scope,
             thread_id,
             trace_id,
-            kb_filter=kb_filter,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
 
+    resolved_tid = snapshot.get("thread_id") or thread_id
     active_run = (
         await asyncio.to_thread(
-            req.app.state.runtime.run_service.get_active_run_for_thread, scope, thread_id
+            req.app.state.runtime.run_service.get_active_run_for_thread, scope, resolved_tid
         )
-        if thread_id
+        if resolved_tid
         else None
     )
-    logs = await obs.trace_logs(snapshot["trace_id"]) if hasattr(obs, "trace_logs") else []
+    logs = await obs.trace_logs(snapshot["trace_id"]) if (snapshot.get("trace_id") and hasattr(obs, "trace_logs")) else []
     context_budget = await asyncio.to_thread(
         _compute_context_budget_snapshot,
         req.app.state.runtime,
         store,
         scope,
-        thread_id,
+        resolved_tid,
         snapshot,
     )
     return {

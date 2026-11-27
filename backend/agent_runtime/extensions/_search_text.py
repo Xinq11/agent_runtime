@@ -1,4 +1,4 @@
-"""Shared tokenizer and vector encoding for indexing and querying the same corpus."""
+"""Shared bilingual tokenizer and hash-embedding helpers for RAG & Skills extensions."""
 
 from __future__ import annotations
 
@@ -6,10 +6,8 @@ from collections import Counter
 import hashlib
 import math
 import re
-from typing import List, Tuple
+from typing import Any, List, Tuple
 import unicodedata
-
-from agent_runtime.framework.core.contracts import RAGChunk
 
 VECTOR_DIM = 256
 _WORDS = re.compile(r"[\u3400-\u9fff]+|[^\W_]+", re.UNICODE)
@@ -38,5 +36,5 @@ def embed_text(text: str) -> Tuple[float, ...]:
     return tuple(x / norm for x in vector)
 
 
-def chunk_text(chunk: RAGChunk) -> str:
+def chunk_text(chunk: Any) -> str:
     return f"{chunk.doc_title} {chunk.section_path} {chunk.content}"

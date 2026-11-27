@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional
 
-from agent_runtime.framework.core.contracts import RAGChunk
-from agent_runtime.infra.search_text import VECTOR_DIM, chunk_text, embed_text, terms
+from agent_runtime.extensions._search_text import VECTOR_DIM, chunk_text, embed_text, terms
+from agent_runtime.extensions.rag.models import RAGChunk
 
 
 def cosine(left: Iterable[float], right: Iterable[float]) -> float:

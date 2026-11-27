@@ -34,13 +34,12 @@ def create_expense_tools(store: Any, *, approval_writes: Optional[List[Dict[str,
             [ctx.thread_id, ctx.auth_scope.user_id, ctx.request_id, "submit_approval"]
         )
         rows = store.rows(
-            """INSERT INTO oa_approvals(approval_id,thread_id,tenant_id,applicant,op_key,title,region,amount)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant_id,op_key)
+            """INSERT INTO oa_approvals(approval_id,thread_id,applicant,op_key,title,region,amount)
+               VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(op_key)
                DO UPDATE SET op_key=EXCLUDED.op_key RETURNING approval_id,title,amount::text""",
             (
                 uid("APR"),
                 ctx.thread_id,
-                ctx.auth_scope.tenant_id,
                 ctx.auth_scope.user_id,
                 key,
                 title,

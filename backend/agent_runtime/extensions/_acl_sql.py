@@ -1,4 +1,4 @@
-"""Parameterized SQL compiler for whitelisted `AccessFilter` predicates."""
+"""Parameterized SQL compiler for whitelisted `AccessFilter` predicates (used by RAG & Skills extensions)."""
 
 from __future__ import annotations
 
@@ -27,9 +27,8 @@ def default_access_filter(
     unrestricted: bool = False,
     include_disabled: bool = False,
 ) -> AccessFilter:
-    """Construct a safe default `AccessFilter` when storage methods are called directly."""
+    """Construct a safe default `AccessFilter` when extension repositories are called directly."""
     return AccessFilter(
-        tenant_id=scope.tenant_id,
         unrestricted=unrestricted,
         any_roles=scope.roles,
         include_public=True,
@@ -42,7 +41,6 @@ def compile_acl_sql(
     *,
     scope: Optional[AuthScope] = None,
     alias: str = "",
-    tenant_col: str = "tenant_id",
     roles_col: str = "acl_roles",
     status_col: Optional[str] = "status",
     owner_col: Optional[str] = None,
@@ -52,19 +50,13 @@ def compile_acl_sql(
     """Compile an `AccessFilter` into a parameterized SQL WHERE fragment.
 
     Fail-closed invariants:
-      - Rejects tenant mismatch when `scope` is supplied.
       - Rejects unsupported `owner_id` / `any_depts` predicates rather than silently widening.
-      - Always binds `tenant_id`.
       - Empty `any_roles` never bypasses `acl_roles`; matches only public (`cardinality=0`)
         when `include_public=True`, or `FALSE` when `include_public=False`.
     """
-    if scope is not None and flt.tenant_id != scope.tenant_id:
-        raise AccessControlError("access_filter_tenant_mismatch")
-
-    tcol = _safe_col(alias, tenant_col)
     rcol = _safe_col(alias, roles_col)
-    clauses = [f"{tcol}=%({param_prefix}_tenant)s"]
-    params: Dict[str, Any] = {f"{param_prefix}_tenant": flt.tenant_id}
+    clauses = []
+    params: Dict[str, Any] = {}
 
     if status_col and not flt.include_disabled:
         scol = _safe_col(alias, status_col)
@@ -101,4 +93,4 @@ def compile_acl_sql(
             else:
                 clauses.append("FALSE")
 
-    return " AND ".join(clauses), params
+    return (" AND ".join(clauses) if clauses else "TRUE"), params

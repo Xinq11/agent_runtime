@@ -9,7 +9,6 @@ from typing import Any, Dict, Optional
 @dataclass
 class ApprovalTicket:
     review_id: str
-    tenant_id: str
     thread_id: str
     actor_id: str
     op_key: str
@@ -21,6 +20,7 @@ class ApprovalTicket:
     decision: str = "pending"  # pending | approved | rejected
     approver_id: Optional[str] = None
     consumed_at: Optional[float] = None
+    run_id: str = ""
 
 
 @dataclass
@@ -33,7 +33,6 @@ class ApprovalDecision:
 
 @dataclass
 class ToolRunRecord:
-    tenant_id: str
     op_key: str
     actor_id: str
     tool_name: str
@@ -51,7 +50,6 @@ class RunRecord:
     """Durable conversation turn run record backing concurrency control & safe Abort."""
 
     run_id: str
-    tenant_id: str
     thread_id: str
     actor_id: str
     trace_id: str

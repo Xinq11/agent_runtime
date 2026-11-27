@@ -1,4 +1,7 @@
-"""Thin `PgOssStore` facade composing PostgreSQL + pgvector + MinIO OSS repositories."""
+"""Thin core `PgOssStore` facade composing PostgreSQL + MinIO OSS kernel repositories.
+
+Zero RAG, Skills, or Ops coupling — extensions own their own schemas and repositories.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +12,8 @@ from agent_runtime.infra.oss.minio import MinioObjectStore
 from agent_runtime.infra.pg.approvals import PgApprovalsMixin
 from agent_runtime.infra.pg.artifacts import PgArtifactsMixin
 from agent_runtime.infra.pg.base import PgBase
-from agent_runtime.infra.pg.ops_queries import PgOpsQueriesMixin
-from agent_runtime.infra.pg.rag_repo import PgRagMixin
 from agent_runtime.infra.pg.runs import PgRunsMixin
 from agent_runtime.infra.pg.sessions import PgSessionsMixin
-from agent_runtime.infra.pg.skills import PgSkillsMixin
 
 DEFAULT_PG_DSN = "postgresql://agent:agent_demo@localhost:5432/agent_runtime"
 
@@ -24,11 +24,8 @@ class PgOssStore(
     PgRunsMixin,
     PgApprovalsMixin,
     PgArtifactsMixin,
-    PgSkillsMixin,
-    PgRagMixin,
-    PgOpsQueriesMixin,
 ):
-    """Unified PostgreSQL + pgvector + MinIO OSS store facade."""
+    """Unified core PostgreSQL + MinIO OSS store facade."""
 
     def __init__(self, dsn: Optional[str] = None, oss: Optional[MinioObjectStore] = None):
         super().__init__(dsn or os.getenv("PG_DSN", DEFAULT_PG_DSN))

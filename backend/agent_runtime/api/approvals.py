@@ -21,7 +21,7 @@ async def resume_approval(review_id: str, req: Request, body: ApprovalResumeRequ
     runtime = req.app.state.runtime
     scope = await caller_scope_async(req)
 
-    ticket = await asyncio.to_thread(store.get_approval_ticket, review_id, scope.tenant_id)
+    ticket = await asyncio.to_thread(store.get_approval_ticket, review_id)
     if ticket is None or (body.thread_id and body.thread_id != ticket.thread_id):
         raise HTTPException(404, "审批单不存在")
 

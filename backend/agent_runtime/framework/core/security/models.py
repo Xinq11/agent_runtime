@@ -34,7 +34,6 @@ class ResourceRef:
 
     kind: str  # "thread" | "run" | "approval" | "tool" | "rag_doc" | "skill" | "artifact" | "ops" | "system"
     id: str = "*"
-    tenant_id: Optional[str] = None
     owner_id: Optional[str] = None
     attrs: Mapping[str, Any] = field(default_factory=dict)
 
@@ -51,12 +50,11 @@ class AccessDecision:
 
 @dataclass(frozen=True)
 class AccessFilter:
-    """Structured whitelist predicate pushed down to PG SQL or external retrieval engines.
+    """Structured whitelist predicate pushed down to extension stores or external retrieval engines.
 
     Plugins never emit raw SQL strings; storage adapters compile only whitelisted fields.
     """
 
-    tenant_id: str
     unrestricted: bool = False
     any_roles: Tuple[str, ...] = ()
     any_depts: Tuple[str, ...] = ()
@@ -67,8 +65,6 @@ class AccessFilter:
     policy_rev: int = 1
 
     def __post_init__(self) -> None:
-        if not self.tenant_id:
-            raise ValueError("AccessFilter.tenant_id is required")
         object.__setattr__(self, "any_roles", tuple(self.any_roles or ()))
         object.__setattr__(self, "any_depts", tuple(self.any_depts or ()))
 
@@ -82,7 +78,7 @@ class IdentityResolver(Protocol):
 
 @runtime_checkable
 class AccessController(Protocol):
-    """AuthZ protocol: point action checks, SQL-pushable data filters, and policy revision."""
+    """AuthZ protocol: point action checks, pushable data filters, and policy revision."""
 
     def check(self, scope: AuthScope, action: str, resource: ResourceRef) -> Any: ...
 
@@ -144,14 +140,14 @@ async def enforce_filter(
     action: str,
     resource_kind: str,
 ) -> AccessFilter:
-    """Fail-closed data filter builder enforcing permanent tenant_id invariant."""
+    """Fail-closed data filter builder."""
     try:
         flt = await _maybe_await(controller.filter_for(scope, action, resource_kind))
     except AccessControlError:
         raise
     except Exception as exc:
         raise AccessControlError(f"access_filter_error:{type(exc).__name__}") from exc
-    if not isinstance(flt, AccessFilter) or flt.tenant_id != scope.tenant_id:
+    if not isinstance(flt, AccessFilter):
         raise AccessControlError("invalid_access_filter")
     return flt
 
@@ -172,7 +168,7 @@ def enforce_filter_sync(
     if inspect.isawaitable(flt):
         flt.close()  # type: ignore[union-attr]
         raise AccessControlError("async_access_filter_in_sync_path")
-    if not isinstance(flt, AccessFilter) or flt.tenant_id != scope.tenant_id:
+    if not isinstance(flt, AccessFilter):
         raise AccessControlError("invalid_access_filter")
     return flt
 

@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 import importlib
 import os
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -15,10 +15,10 @@ from langgraph.types import Command
 from agent_runtime.framework.context.compaction import SessionCompactor
 from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
-from agent_runtime.framework.core.contracts import ApprovalDecision, AuthScope, ExecutionContext, Message
+from agent_runtime.framework.core.contracts import ApprovalDecision, AuthScope, ExecutionContext, RunRecord
 from agent_runtime.framework.core.middleware import MiddlewareChain
 from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin, AppMetadata
-from agent_runtime.framework.core.runs import RunService, RunStateError
+from agent_runtime.framework.core.runs import RunNotFoundError, RunService, RunStateError
 from agent_runtime.framework.core.security import (
     AccessController,
     RbacAccessController,
@@ -132,14 +132,7 @@ class AgentRuntimeApp:
         for spec in tools:
             self.registry.register(spec)
         for profile in subagents:
-            register_subagent_tool(
-                registry=self.registry,
-                profile=profile,
-                model_client=self.model,
-                tool_gateway=self.gateway,
-                obs=self.obs,
-                tool_spec_cls=ToolSpec,
-            )
+            self._wire_subagent(profile)
         for ext in self.extensions:
             ext.register_tools(
                 registry=self.registry,
@@ -148,6 +141,8 @@ class AgentRuntimeApp:
                 gateway=self.gateway,
                 obs=self.obs,
             )
+            for profile in ext.subagents():
+                self._wire_subagent(profile)
         self.registry.freeze()
 
         metas = [m for ext in self.extensions if (m := ext.metadata()) is not None]
@@ -162,7 +157,7 @@ class AgentRuntimeApp:
         self._default_identity = (
             identities[-1]
             if identities
-            else AuthScope(tenant_id="default", user_id="local_user", roles=("user",))
+            else AuthScope(user_id="local_user", roles=("user",))
         )
 
         if system_prompt is not None:
@@ -188,8 +183,27 @@ class AgentRuntimeApp:
             access_controller=self.access_controller,
         )
 
+    def _wire_subagent(self, profile: SubAgentProfile) -> None:
+        register_subagent_tool(
+            registry=self.registry,
+            profile=profile,
+            model_client=self.model,
+            tool_gateway=self.gateway,
+            obs=self.obs,
+            tool_spec_cls=ToolSpec,
+        )
+
+    def get_extension(self, name: str) -> Optional[AgentPlugin]:
+        return next((e for e in self.extensions if e.name == name), None)
+
+    def extension_routers(self) -> List[Any]:
+        out: List[Any] = []
+        for ext in self.extensions:
+            out.extend(ext.routers())
+        return out
+
     def bootstrap_extensions(self) -> None:
-        """Invoke idempotent extension bootstrap hooks (seed knowledge, default skills, etc.)."""
+        """Invoke idempotent extension bootstrap hooks (extension schemas, seeds, etc.)."""
         for ext in self.extensions:
             ext.bootstrap_store(self.store)
 
@@ -198,6 +212,40 @@ class AgentRuntimeApp:
 
     def default_identity(self) -> AuthScope:
         return self._default_identity
+
+    async def prepare_turn_run(
+        self,
+        user_text: str,
+        *,
+        ctx: Optional[ExecutionContext] = None,
+        thread_id: Optional[str] = None,
+        scope: Optional[AuthScope] = None,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> Tuple[ExecutionContext, RunRecord]:
+        """Unified thread-ownership verification + Run creation shared by SDK and HTTP."""
+        if ctx is None:
+            ctx = ExecutionContext(
+                trace_id=trace_id or uid("tr"),
+                thread_id=thread_id or uid("th"),
+                request_id=request_id or uid("req"),
+                auth_scope=scope or self.default_identity(),
+            )
+        await asyncio.to_thread(
+            self.store.create_thread,
+            ctx.auth_scope,
+            ctx.thread_id,
+            user_text.strip()[:48] or "新对话",
+        )
+        run = self.run_service.start_run(
+            scope=ctx.auth_scope,
+            thread_id=ctx.thread_id,
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            run_id=ctx.run_id or None,
+        )
+        ctx.run_id = run.run_id
+        return ctx, run
 
     async def execute_run_state(
         self,
@@ -227,15 +275,15 @@ class AgentRuntimeApp:
             self.graph,
             self.store,
             state,
-            graph_config(thread_id, max_steps=self.max_steps),
+            graph_config(run_id, max_steps=self.max_steps),
             trace_id,
             t0,
         )
         if result.get("__interrupt__"):
             result["__interrupt__"] = extract_interrupt_tickets(result["__interrupt__"])
-            self.run_service.mark_paused(run_id, scope.tenant_id)
+            self.run_service.mark_paused(run_id)
         else:
-            self.run_service.mark_finished(run_id, scope.tenant_id, status="completed")
+            self.run_service.mark_finished(run_id, status="completed")
         result["run_id"] = run_id
         return result
 
@@ -248,29 +296,12 @@ class AgentRuntimeApp:
         scope: Optional[AuthScope] = None,
     ) -> Dict[str, Any]:
         """Execute a single turn via the unified LangGraph engine + durable RunService."""
-        if ctx is None:
-            tid = thread_id or uid("th")
-            ctx = ExecutionContext(
-                trace_id=uid("tr"),
-                thread_id=tid,
-                request_id=uid("req"),
-                auth_scope=scope or self.default_identity(),
-            )
-        await asyncio.to_thread(
-            self.store.create_thread,
-            ctx.auth_scope,
-            ctx.thread_id,
-            user_text.strip()[:48] or "新对话",
+        ctx, run = await self.prepare_turn_run(
+            user_text,
+            ctx=ctx,
+            thread_id=thread_id,
+            scope=scope,
         )
-        run = self.run_service.start_run(
-            scope=ctx.auth_scope,
-            thread_id=ctx.thread_id,
-            trace_id=ctx.trace_id,
-            request_id=ctx.request_id,
-            run_id=ctx.run_id or None,
-        )
-        ctx.run_id = run.run_id
-
         try:
             await asyncio.to_thread(self.store.record_turn_start, ctx.thread_id, ctx.trace_id, user_text)
             return await self.execute_run_state(
@@ -281,11 +312,11 @@ class AgentRuntimeApp:
                 request_id=ctx.request_id,
             )
         except asyncio.CancelledError:
-            self.run_service.mark_finished(run.run_id, ctx.auth_scope.tenant_id, status="cancelled")
+            self.run_service.mark_finished(run.run_id, status="cancelled")
             return {"run_id": run.run_id, "status": "cancelled", "final_answer": ""}
         except Exception as exc:
             self.run_service.mark_finished(
-                run.run_id, ctx.auth_scope.tenant_id, status="failed", error_detail=type(exc).__name__
+                run.run_id, status="failed", error_detail=type(exc).__name__
             )
             raise
 
@@ -311,16 +342,13 @@ class AgentRuntimeApp:
     ) -> Dict[str, Any]:
         """Single unified approval-resume path for both Python SDK and HTTP API.
 
-        Validates checkpoint ticket & records decision cleanly so invalid/expired
-        tickets never leave the run stranded in `running`.
+        Checks ticket existence and caller authorization first, verifies the paused run's
+        per-run checkpoint state, and consumes the decision atomically.
         """
         caller = scope or self.default_identity()
-        cfg = graph_config(thread_id, max_steps=self.max_steps)
-        snapshot = await self.graph.aget_state(cfg)
-        pending_map = {v["review_id"]: v for v in pending_tickets(snapshot)}
-        ticket_meta = pending_map.get(decision.review_id)
-        if ticket_meta is None:
-            raise RunStateError("审批单未处于暂停状态")
+        ticket = await asyncio.to_thread(self.store.get_approval_ticket, decision.review_id)
+        if ticket is None or ticket.thread_id != thread_id:
+            raise RunNotFoundError("审批单不存在")
 
         await enforce_check(
             self.access_controller,
@@ -329,19 +357,25 @@ class AgentRuntimeApp:
             ResourceRef(
                 kind="approval",
                 id=decision.review_id,
-                tenant_id=str(ticket_meta.get("tenant_id") or caller.tenant_id),
-                owner_id=ticket_meta.get("actor_id"),
+                owner_id=ticket.actor_id,
                 attrs={
-                    "tool_name": ticket_meta.get("tool_name"),
+                    "tool_name": ticket.tool_name,
                     "thread_id": thread_id,
                 },
             ),
         )
 
+        checkpoint_id = ticket.run_id or thread_id
+        cfg = graph_config(checkpoint_id, max_steps=self.max_steps)
+        snapshot = await self.graph.aget_state(cfg)
+        pending_map = {v["review_id"]: v for v in pending_tickets(snapshot)}
+        if decision.review_id not in pending_map:
+            raise RunStateError("审批单未处于暂停状态")
+
         vals = getattr(snapshot, "values", {}) or {}
-        run_id = vals.get("run_id")
+        run_id = ticket.run_id or vals.get("run_id")
         if run_id:
-            rec = self.run_service.get_run_in_tenant(caller.tenant_id, run_id)
+            rec = self.run_service.get_run_by_id(run_id)
             if rec.status != "paused":
                 raise RunStateError("该运行已取消或不再处于暂停状态，无法恢复")
 
@@ -351,7 +385,7 @@ class AgentRuntimeApp:
         # Record decision BEFORE transitioning run to `running`; then atomically claim resume
         self.store.record_approval_decision(authoritative_decision)
         if run_id:
-            self.run_service.mark_resumed(run_id, caller.tenant_id)
+            self.run_service.mark_resumed(run_id)
 
         trace_id = vals.get("trace_id") or uid("tr")
         start_ms = int(vals.get("start_ms") or time.time() * 1000)
@@ -368,20 +402,20 @@ class AgentRuntimeApp:
             if tickets:
                 result["__interrupt__"] = tickets
                 if run_id:
-                    self.run_service.mark_paused(run_id, caller.tenant_id)
+                    self.run_service.mark_paused(run_id)
             else:
                 if run_id:
-                    self.run_service.mark_finished(run_id, caller.tenant_id, status="completed")
+                    self.run_service.mark_finished(run_id, status="completed")
             if run_id:
                 result["run_id"] = run_id
             return result
         except asyncio.CancelledError:
             if run_id:
-                self.run_service.mark_finished(run_id, caller.tenant_id, status="cancelled")
+                self.run_service.mark_finished(run_id, status="cancelled")
             return {"run_id": run_id, "status": "cancelled", "final_answer": ""}
         except Exception as exc:
             if run_id:
                 self.run_service.mark_finished(
-                    run_id, caller.tenant_id, status="failed", error_detail=type(exc).__name__
+                    run_id, status="failed", error_detail=type(exc).__name__
                 )
             raise

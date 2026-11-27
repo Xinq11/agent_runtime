@@ -27,7 +27,7 @@ class TestContextCompaction(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.store = History()
         self.ctx = ExecutionContext(trace_id="trace", thread_id="thread", request_id="req",
-                                    auth_scope=AuthScope("tenant", "user"))
+                                    auth_scope=AuthScope("user"))
         self.budget = ContextBudget(max_window_tokens=2000, reserve_output_tokens=200,
                                     max_extra_context_tokens=100, max_summary_tokens=100)
         self.compactor = SessionCompactor(self.store, None, self.budget)

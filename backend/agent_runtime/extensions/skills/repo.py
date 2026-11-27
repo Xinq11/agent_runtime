@@ -1,16 +1,18 @@
-"""PostgreSQL + OSS repository mixin for versioned declarative Skills."""
+"""Standalone PostgreSQL + OSS repository owned by `SkillsExtension`."""
 
 from __future__ import annotations
 
 import hashlib
+from importlib.resources import files
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from agent_runtime.extensions._acl_sql import compile_acl_sql, default_access_filter
+from agent_runtime.extensions._search_text import terms
+from agent_runtime.extensions.skills.models import SkillSummary
 from agent_runtime.framework.core.config import uid
-from agent_runtime.framework.core.contracts import AuthScope, SkillSummary
+from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.security import AccessFilter
-from agent_runtime.infra.pg.acl_sql import compile_acl_sql, default_access_filter
-from agent_runtime.infra.search_text import terms
 
 
 def filter_skills_by_query(items: List[SkillSummary], query: str) -> List[SkillSummary]:
@@ -45,10 +47,8 @@ def filter_skills_by_query(items: List[SkillSummary], query: str) -> List[SkillS
         elif exact_hit:
             score += 0.25 * len(single_hits)
         elif not q_multi and single_hits:
-            # Pure single-char query (e.g. "报")
             score += float(len(single_hits))
         elif q_single and (len(single_hits) / len(q_single)) >= 0.6 and len(single_hits) >= 2:
-            # Fallback when every char in a short non-contiguous Chinese phrase matches
             score += 0.5 * len(single_hits)
 
         if score > 0:
@@ -58,13 +58,21 @@ def filter_skills_by_query(items: List[SkillSummary], query: str) -> List[SkillS
     return [s for _, s in scored]
 
 
-class PgSkillsMixin:
+class PgSkillsRepository:
     """PG skill catalog backed by immutable OSS version prefixes."""
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+
+    def bootstrap_schema(self) -> None:
+        ddl = files(__package__).joinpath("schema.sql").read_text(encoding="utf-8")
+        with self.store.transaction() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('agent_runtime.skills.schema'))")
+            cur.execute(ddl, prepare=False)
 
     @staticmethod
     def _row_to_skill(r: dict) -> SkillSummary:
         return SkillSummary(
-            tenant_id=r["tenant_id"],
             slug=r["slug"],
             version_id=r["version_id"],
             version_num=r["version_num"],
@@ -90,32 +98,30 @@ class PgSkillsMixin:
         raw = content.encode("utf-8")
         digest = hashlib.sha256(raw).hexdigest()
         vid = uid("skv")
-        # Unique immutable OSS prefix keyed by version_id so concurrent publishes never collide
-        prefix = f"skills/{scope.tenant_id}/{slug}/{vid}"
+        prefix = f"skills/{slug}/{vid}"
         main_key = f"{prefix}/SKILL.md"
-        self.oss.put_text(main_key, content, content_type="text/markdown; charset=utf-8")
+        self.store.oss.put_text(main_key, content, content_type="text/markdown; charset=utf-8")
         res_names = sorted((resources or {}).keys())
         for rname in res_names:
-            self.oss.put_text(f"{prefix}/{rname}", (resources or {})[rname])
+            self.store.oss.put_text(f"{prefix}/{rname}", (resources or {})[rname])
 
-        with self.transaction() as cur:
+        with self.store.transaction() as cur:
             cur.execute(
-                """INSERT INTO agent_skills(tenant_id,slug,active_version_id,revision,acl_roles,status,updated_at)
-                   VALUES (%s,%s,NULL,0,%s,'active',now()) ON CONFLICT (tenant_id,slug) DO NOTHING""",
-                (scope.tenant_id, slug, list(acl_roles)),
+                """INSERT INTO agent_skills(slug,active_version_id,revision,acl_roles,status,updated_at)
+                   VALUES (%s,NULL,0,%s,'active',now()) ON CONFLICT (slug) DO NOTHING""",
+                (slug, list(acl_roles)),
             )
             cur.execute(
-                "SELECT revision FROM agent_skills WHERE tenant_id=%s AND slug=%s FOR UPDATE",
-                (scope.tenant_id, slug),
+                "SELECT revision FROM agent_skills WHERE slug=%s FOR UPDATE",
+                (slug,),
             )
             next_ver = int(cur.fetchone()[0]) + 1
             cur.execute(
                 """INSERT INTO agent_skill_versions
-                   (version_id,tenant_id,slug,version_num,description,tags,manifest,oss_key,sha256,resources,created_by)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s)""",
+                   (version_id,slug,version_num,description,tags,manifest,oss_key,sha256,resources,created_by)
+                   VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s)""",
                 (
                     vid,
-                    scope.tenant_id,
                     slug,
                     next_ver,
                     description,
@@ -130,11 +136,10 @@ class PgSkillsMixin:
             cur.execute(
                 """UPDATE agent_skills
                    SET active_version_id=%s, revision=%s, acl_roles=%s, status='active', updated_at=now()
-                   WHERE tenant_id=%s AND slug=%s""",
-                (vid, next_ver, list(acl_roles), scope.tenant_id, slug),
+                   WHERE slug=%s""",
+                (vid, next_ver, list(acl_roles), slug),
             )
         return SkillSummary(
-            tenant_id=scope.tenant_id,
             slug=slug,
             version_id=vid,
             version_num=next_ver,
@@ -155,12 +160,14 @@ class PgSkillsMixin:
         bypass_acl: bool = False,
         access_filter: Optional[AccessFilter] = None,
     ) -> List[SkillSummary]:
+        if not self.store.rows("SELECT to_regclass('agent_skills') AS tbl")[0]["tbl"]:
+            return []
         flt = access_filter or default_access_filter(
             scope, unrestricted=bypass_acl, include_disabled=include_disabled
         )
         acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="s")
-        rows = self.rows(
-            f"""SELECT s.tenant_id, s.slug, v.version_id, v.version_num, v.description,
+        rows = self.store.rows(
+            f"""SELECT s.slug, v.version_id, v.version_num, v.description,
                        v.tags, s.acl_roles, v.resources, s.revision, s.status
                 FROM agent_skills s
                 JOIN agent_skill_versions v ON v.version_id = s.active_version_id
@@ -181,12 +188,14 @@ class PgSkillsMixin:
         bypass_acl: bool = False,
         access_filter: Optional[AccessFilter] = None,
     ) -> Tuple[Optional[str], Optional[SkillSummary], Optional[str]]:
+        if not self.store.rows("SELECT to_regclass('agent_skills') AS tbl")[0]["tbl"]:
+            return None, None, "skill_not_found"
         flt = access_filter or default_access_filter(
             scope, unrestricted=bypass_acl, include_disabled=include_disabled
         )
         acl_sql, acl_params = compile_acl_sql(flt, scope=scope, alias="s")
-        rows = self.rows(
-            f"""SELECT s.tenant_id, s.slug, v.version_id, v.version_num, v.description,
+        rows = self.store.rows(
+            f"""SELECT s.slug, v.version_id, v.version_num, v.description,
                        v.tags, s.acl_roles, v.resources, s.revision, s.status, v.oss_key, v.manifest
                 FROM agent_skills s
                 JOIN agent_skill_versions v ON v.version_id = s.active_version_id
@@ -201,17 +210,16 @@ class PgSkillsMixin:
             if resource not in summary.resources:
                 return None, summary, "resource_not_found"
             prefix = (r["manifest"] or {}).get("oss_prefix") or r["oss_key"].rsplit("/", 1)[0]
-            return self.oss.get_text(f"{prefix}/{resource}"), summary, None
-        return self.oss.get_text(r["oss_key"]), summary, None
+            return self.store.oss.get_text(f"{prefix}/{resource}"), summary, None
+        return self.store.oss.get_text(r["oss_key"]), summary, None
 
     def set_skill_status(self, scope: AuthScope, slug: str, status: str) -> bool:
         if status not in ("active", "disabled"):
             raise ValueError("status must be 'active' or 'disabled'")
-        with self.transaction() as cur:
+        with self.store.transaction() as cur:
             cur.execute(
-                "UPDATE agent_skills SET status=%s, updated_at=now() "
-                "WHERE tenant_id=%s AND slug=%s RETURNING slug",
-                (status, scope.tenant_id, slug),
+                "UPDATE agent_skills SET status=%s, updated_at=now() WHERE slug=%s RETURNING slug",
+                (status, slug),
             )
             return bool(cur.fetchone())
 

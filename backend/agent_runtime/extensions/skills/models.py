@@ -1,10 +1,26 @@
-"""Validation rules for skill identifiers and stored resource names."""
+"""Declarative Skill summary contract and slug/resource validation rules."""
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
+from typing import Tuple
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
 _FORBIDDEN_RESOURCE_EXTS = (".py", ".sh", ".bash", ".zsh", ".exe", ".dll", ".so", ".bin", ".bat", ".ps1")
+
+
+@dataclass
+class SkillSummary:
+    slug: str
+    version_id: str
+    version_num: int
+    description: str
+    tags: Tuple[str, ...] = ()
+    acl_roles: Tuple[str, ...] = ()
+    resources: Tuple[str, ...] = ()
+    revision: int = 1
+    status: str = "active"
 
 
 def validate_skill_slug(slug: str) -> str:

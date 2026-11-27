@@ -145,7 +145,7 @@ def list_thread_files(thread_id: str, req: Request):
         req.app.state.store.own_thread(scope, thread_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
-    files = req.app.state.store.list_workspace_files(scope.tenant_id, thread_id)
+    files = req.app.state.store.list_workspace_files(thread_id)
     return {"thread_id": thread_id, "files": [_public_workspace_file(f) for f in files]}
 
 
@@ -172,7 +172,6 @@ async def upload_thread_file(thread_id: str, req: Request, file: UploadFile = Fi
     try:
         rec = await asyncio.to_thread(
             store.write_workspace_binary,
-            scope.tenant_id,
             thread_id,
             logical_path,
             raw,
@@ -213,7 +212,7 @@ def download_thread_file(thread_id: str, req: Request, path: str = Query(..., mi
     if norm_path == ".":
         raise HTTPException(400, "不能下载目录根路径")
 
-    raw_bytes, rec, err = req.app.state.store.read_workspace_bytes(scope.tenant_id, thread_id, norm_path)
+    raw_bytes, rec, err = req.app.state.store.read_workspace_bytes(thread_id, norm_path)
     if err or raw_bytes is None or rec is None:
         raise HTTPException(404, "文件不存在")
 

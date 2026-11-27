@@ -1,14 +1,15 @@
-"""Pluggable `RagExtension`: defaults to the built-in 7-stage RAG pipeline, or accepts any custom `RAGStrategy`."""
+"""Pluggable `RagExtension`: self-contained 7-stage RAG pipeline + optional schema & admin router."""
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from typing import Any, Optional, Sequence
 
-from agent_runtime.extensions.rag.models import EmbeddingClient, RerankClient
+from agent_runtime.extensions.rag.models import EmbeddingClient, RAGStrategy, RerankClient
+from agent_runtime.extensions.rag.repo import PgRagRepository
 from agent_runtime.extensions.rag.retrieval import RagRetrievalService
 from agent_runtime.extensions.rag.text_utils import format_grounded_context
-from agent_runtime.framework.core.contracts import ExecutionContext, Message, RiskLevel
-from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin, RAGStrategy
+from agent_runtime.framework.core.contracts import ExecutionContext, RiskLevel
+from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin
 from agent_runtime.framework.tools.registry import ToolSpec
 
 
@@ -36,7 +37,7 @@ class _AutoInjectRAGMiddleware(AgentMiddleware):
 
 
 class RagExtension(AgentPlugin):
-    """Optional RAG extension decoupled from core kernel."""
+    """Optional RAG extension decoupled from core kernel (owns its schema, repo, and admin router)."""
 
     name = "rag"
 
@@ -58,11 +59,25 @@ class RagExtension(AgentPlugin):
         self.mode = mode
         self.top_k = top_k
         self.min_rerank_score = min_rerank_score
+        self.repo: Optional[PgRagRepository] = None
+
+    def bootstrap_store(self, store: Any) -> None:
+        if self._active_strategy is not None and not isinstance(self._active_strategy, RagRetrievalService):
+            return
+        repo = self.repo or PgRagRepository(store)
+        self.repo = repo
+        repo.bootstrap_schema()
+
+    def routers(self) -> Sequence[Any]:
+        from agent_runtime.extensions.rag.router import build_rag_router
+
+        return (build_rag_router(),)
 
     def register_tools(self, *, registry: Any, store: Any, model: Any, gateway: Any, obs: Any) -> None:
         if self._active_strategy is None:
+            self.repo = PgRagRepository(store)
             self._active_strategy = RagRetrievalService(
-                store,
+                self.repo,
                 embedding_client=self._embedding_client,
                 rerank_client=self._rerank_client,
                 min_rerank_score=self.min_rerank_score,

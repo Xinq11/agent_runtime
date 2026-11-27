@@ -13,7 +13,6 @@ const API_BASE = "/api/v1";
 
 function identityHeaders(): Record<string, string> {
   return {
-    "X-Tenant-Id": DEFAULT_IDENTITY.tenantId,
     "X-User-Id": DEFAULT_IDENTITY.userId,
     "X-User-Roles": DEFAULT_IDENTITY.roles.join(","),
   };

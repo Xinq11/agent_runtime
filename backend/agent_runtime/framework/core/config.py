@@ -26,14 +26,14 @@ def uid(prefix: str) -> str:
 
 def resolve_identity(req, default_scope: Optional[AuthScope] = None) -> AuthScope:
     """Extract caller AuthScope from gateway headers, falling back to runtime/plugin default."""
-    base = default_scope or AuthScope("default", "local_user", ("user",))
+    base = default_scope or AuthScope("local_user", ("user",))
     if "X-User-Id" in req.headers:
         roles = tuple(
             r.strip()
             for r in req.headers.get("X-User-Roles", ",".join(base.roles)).split(",")
             if r.strip()
         )
-        return AuthScope(req.headers.get("X-Tenant-Id", base.tenant_id), req.headers["X-User-Id"], roles)
+        return AuthScope(req.headers["X-User-Id"], roles)
     return base
 
 

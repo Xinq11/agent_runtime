@@ -16,19 +16,20 @@ from agent_runtime.framework.core.security.models import (
 
 
 class NoopAccessController:
-    """Explicit single-permission deployment policy (all actions allowed within tenant)."""
+    """Minimal single-deployment policy: enforces creator-only approvals, opens other hooks."""
 
     def __init__(self, *, policy_rev: int = 1) -> None:
         self._policy_rev = policy_rev
 
     def check(self, scope: AuthScope, action: str, resource: ResourceRef) -> AccessDecision:
-        if resource.tenant_id and resource.tenant_id != scope.tenant_id:
-            return AccessDecision(False, "cross_tenant_denied", code="not_found", policy_rev=self._policy_rev)
+        if action == "approval:decide" and resource.owner_id and resource.owner_id != scope.user_id:
+            return AccessDecision(
+                False, "approval_not_authorized", code="not_found", policy_rev=self._policy_rev
+            )
         return AccessDecision(True, policy_rev=self._policy_rev)
 
     def filter_for(self, scope: AuthScope, action: str, resource_kind: str) -> AccessFilter:
         return AccessFilter(
-            tenant_id=scope.tenant_id,
             unrestricted=True,
             include_public=True,
             include_disabled=action.endswith(":manage"),
@@ -40,15 +41,15 @@ class NoopAccessController:
 
 
 class RbacAccessController:
-    """Built-in role-based access controller supporting both local default and enterprise RBAC.
+    """Built-in role-based access controller for local default and enterprise RBAC deployments.
 
-    - `admin_roles=None` (default single-role mode): management routes are open within tenant,
-      while RAG/Skills still strictly enforce resource `acl_roles` (with fixed empty-role semantics).
-    - `admin_roles=("admin", ...)` (enterprise RBAC mode): tenant management, platform telemetry/model
-      writes, disabled skill previews, and optional per-tool / approver roles are strictly gated.
+    - `admin_roles=None` (default mode): only the thread creator may decide/resume approvals
+      unless explicit `approver_roles` are configured; extension stores still enforce `acl_roles`.
+    - `admin_roles=("admin", ...)` (RBAC mode): admin routes, platform telemetry/model writes,
+      disabled previews, and optional per-tool / approver roles are strictly gated.
     """
 
-    _TENANT_ADMIN_ACTIONS = frozenset({"ops:view", "kb:manage", "skill:manage"})
+    _ADMIN_ACTIONS = frozenset({"ops:view", "kb:manage", "skill:manage"})
     _PLATFORM_ADMIN_ACTIONS = frozenset({"system:update_model", "platform:view_telemetry"})
 
     def __init__(
@@ -82,6 +83,9 @@ class RbacAccessController:
             return True
         return self._is_platform_admin(scope) or bool(set(scope.roles) & set(self.admin_roles))
 
+    def _has_explicit_admin_role(self, scope: AuthScope) -> bool:
+        return self.admin_roles is not None and self._is_admin(scope)
+
     def bump_policy_rev(self) -> int:
         self._policy_rev += 1
         return self._policy_rev
@@ -90,9 +94,6 @@ class RbacAccessController:
         return self._policy_rev
 
     def check(self, scope: AuthScope, action: str, resource: ResourceRef) -> AccessDecision:
-        if resource.tenant_id and resource.tenant_id != scope.tenant_id:
-            return AccessDecision(False, "cross_tenant_denied", code="not_found", policy_rev=self._policy_rev)
-
         if action in self._PLATFORM_ADMIN_ACTIONS:
             if not self._is_platform_admin(scope):
                 return AccessDecision(
@@ -100,7 +101,7 @@ class RbacAccessController:
                 )
             return AccessDecision(True, policy_rev=self._policy_rev)
 
-        if action in self._TENANT_ADMIN_ACTIONS:
+        if action in self._ADMIN_ACTIONS:
             if not self._is_admin(scope):
                 return AccessDecision(False, "admin_role_required", code="forbidden", policy_rev=self._policy_rev)
             return AccessDecision(True, policy_rev=self._policy_rev)
@@ -116,7 +117,7 @@ class RbacAccessController:
                         False, "approver_role_required", code="forbidden", policy_rev=self._policy_rev
                     )
                 return AccessDecision(True, policy_rev=self._policy_rev)
-            if resource.owner_id and resource.owner_id != scope.user_id and not self._is_admin(scope):
+            if resource.owner_id and resource.owner_id != scope.user_id and not self._has_explicit_admin_role(scope):
                 return AccessDecision(
                     False, "approval_not_authorized", code="not_found", policy_rev=self._policy_rev
                 )
@@ -133,18 +134,16 @@ class RbacAccessController:
         return AccessDecision(True, policy_rev=self._policy_rev)
 
     def filter_for(self, scope: AuthScope, action: str, resource_kind: str) -> AccessFilter:
-        if action in self._TENANT_ADMIN_ACTIONS:
+        if action in self._ADMIN_ACTIONS:
             if not self._is_admin(scope):
-                return AccessFilter(tenant_id=scope.tenant_id, deny_all=True, policy_rev=self._policy_rev)
+                return AccessFilter(deny_all=True, policy_rev=self._policy_rev)
             return AccessFilter(
-                tenant_id=scope.tenant_id,
                 unrestricted=True,
                 include_public=True,
                 include_disabled=True,
                 policy_rev=self._policy_rev,
             )
         return AccessFilter(
-            tenant_id=scope.tenant_id,
             unrestricted=False,
             any_roles=scope.roles,
             include_public=True,

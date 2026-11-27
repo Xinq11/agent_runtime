@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
-import inspect
 import json
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -17,16 +16,16 @@ from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import publish_sse, unpack_message
 from agent_runtime.framework.core.contracts import AuthScope, ExecutionContext, Message, SpanRecord, estimate_tokens
 from agent_runtime.framework.core.middleware import MiddlewareChain
-from agent_runtime.framework.core.security import (
-    AuthorizationError,
-    ResourceRef,
-    enforce_check,
-    get_policy_rev,
+from agent_runtime.framework.core.model_step import (
+    filter_visible_tools,
+    invoke_model_step,
+    supports_tool_choice,
 )
+from agent_runtime.framework.core.security import get_policy_rev
 from agent_runtime.infra.llm.provider import strip_dsml_markup, wire_spec
 
 DEFAULT_SYSTEM_PROMPT = (
-    "你是通用智能助手。必要时先调用工具核实事实再作答，知识库结论标注来源 [1]。"
+    "你是通用智能助手。必要时先调用工具核实事实再作答。"
     "需要生成文档、报表或结构化文件时，可使用内置 write/read 工具读写工作区文件；"
     "涉及外部业务系统写入必须通过对应工具执行。"
 )
@@ -35,29 +34,6 @@ _FINAL_STEP_CONVERGENCE_NOTICE = (
     "请严禁输出任何工具调用或 DSML 标记，直接基于以上已获取的数据汇总给出最终中文答复；"
     "若部分分页数据未读完，请基于已有内容作答并如实注明覆盖范围。]"
 )
-
-
-def _supports_tool_choice(model: Any) -> bool:
-    gen = getattr(model, "generate", None)
-    if gen is None:
-        return False
-    try:
-        sig = inspect.signature(gen)
-    except (TypeError, ValueError):
-        return False
-    if "tool_choice" in sig.parameters:
-        return True
-    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-
-
-def _append_convergence_notice(messages: List[Message]) -> List[Message]:
-    """Attach transient final-step notice without inserting mid-conversation system/user turns."""
-    out = list(messages)
-    if out and out[-1].role == "tool":
-        out[-1] = replace(out[-1], content=(out[-1].content or "") + _FINAL_STEP_CONVERGENCE_NOTICE)
-    else:
-        out.append(Message(role="user", content=_FINAL_STEP_CONVERGENCE_NOTICE.strip()))
-    return out
 
 
 def run_context(
@@ -127,31 +103,20 @@ def build_agent_graph(
             operation_name="before_model",
             parent_span_id=ctx.parent_span_id,
         ) as bm_sp:
-            raw_specs = gateway.registry.visible_specs(ctx.auth_scope)
-            if access_controller is not None and raw_specs:
-                specs = []
-                for sp in raw_specs:
-                    try:
-                        await enforce_check(
-                            access_controller,
-                            ctx.auth_scope,
-                            "tool:list",
-                            ResourceRef(
-                                kind="tool",
-                                id=sp.name,
-                                tenant_id=ctx.auth_scope.tenant_id,
-                                attrs={"risk_level": sp.risk_level.value, "is_subagent": sp.is_subagent},
-                            ),
-                        )
-                        specs.append(sp)
-                    except AuthorizationError:
-                        continue
-            else:
-                specs = raw_specs
+            specs = await filter_visible_tools(
+                gateway.registry,
+                ctx,
+                access_controller=access_controller,
+                include_subagents=True,
+            )
 
             is_final_step = state["step"] >= max_steps - 1
-            sent_specs = specs if not is_final_step or _supports_tool_choice(model) else []
-            wire_overhead = estimate_tokens(json.dumps([wire_spec(s) for s in sent_specs], ensure_ascii=False)) if sent_specs else 0
+            sent_specs = specs if not is_final_step or supports_tool_choice(model) else []
+            wire_overhead = (
+                estimate_tokens(json.dumps([wire_spec(s) for s in sent_specs], ensure_ascii=False))
+                if sent_specs
+                else 0
+            )
             if is_final_step:
                 wire_overhead += estimate_tokens(_FINAL_STEP_CONVERGENCE_NOTICE) + 4
             summary, cursor, history = await compactor.load(ctx.thread_id)
@@ -171,8 +136,13 @@ def build_agent_graph(
                 await mw.run_extra_context(latest_user_text, ctx) if latest_user_text else []
             )
             inputs, bm_stats = await compactor.prepare(
-                ctx, system_prompt=system_prompt, wire_overhead=wire_overhead,
-                summary=summary, cursor=cursor, recent=recent, extras=extra_contexts,
+                ctx,
+                system_prompt=system_prompt,
+                wire_overhead=wire_overhead,
+                summary=summary,
+                cursor=cursor,
+                recent=recent,
+                extras=extra_contexts,
             )
             await mw.run_on_before_model(inputs, ctx)
             bm_sp.attributes.update(
@@ -199,21 +169,14 @@ def build_agent_graph(
             parent_span_id=ctx.parent_span_id,
             attributes={"mode": mode_name, "model": model_name, "step": step_num},
         ) as m_sp:
-            if is_final_step:
-                call_inputs = _append_convergence_notice(inputs)
-                if _supports_tool_choice(model):
-                    # Preserve identical `tools` schema for KV Prefix Cache + disable tool decoding natively
-                    msg = await model.generate(
-                        messages=call_inputs,
-                        tool_specs=specs,
-                        ctx=ctx,
-                        tool_choice="none",
-                    )
-                else:
-                    msg = await model.generate(messages=call_inputs, tool_specs=[], ctx=ctx)
-            else:
-                msg = await model.generate(messages=inputs, tool_specs=specs, ctx=ctx)
-
+            msg = await invoke_model_step(
+                model=model,
+                messages=inputs,
+                tool_specs=specs,
+                ctx=ctx,
+                is_final_step=is_final_step,
+                convergence_notice=_FINAL_STEP_CONVERGENCE_NOTICE,
+            )
             _guard_cancel(ctx)
             msg = await mw.run_after_model(msg, ctx)
             cleaned = strip_dsml_markup(msg.content or "")
@@ -243,7 +206,12 @@ def build_agent_graph(
             model=model_name,
             tool_calls=[c.name for c in msg.tool_calls],
         )
-        return {**state, "step": step_num, "fixed_tokens": estimate_tokens(system_prompt) + 4 + wire_overhead, "messages": [*state["messages"], asdict(msg)]}
+        return {
+            **state,
+            "step": step_num,
+            "fixed_tokens": estimate_tokens(system_prompt) + 4 + wire_overhead,
+            "messages": [*state["messages"], asdict(msg)],
+        }
 
     async def tools_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ctx = run_context(
@@ -273,7 +241,6 @@ def build_agent_graph(
             )
             _guard_cancel(ctx)
         except asyncio.CancelledError:
-            # Never catch GRAPH_INTERRUPT_TYPES here; only flush partial batch when cancelled mid-batch
             if partial_results:
                 by_id = {r.tool_call_id: r for r in partial_results}
                 aborted_tool_msgs = [
@@ -291,7 +258,6 @@ def build_agent_graph(
                 unpersisted_objs = [
                     unpack_message(m) for m in state["messages"][persisted_count:]
                 ] + aborted_tool_msgs
-                # Synchronous flush so an already-cancelling task cannot abort the persistence call
                 store.save_turn_messages(
                     ctx.thread_id,
                     ctx.trace_id,
@@ -302,7 +268,6 @@ def build_agent_graph(
 
         tool_msgs_obj = [_to_tool_msg(r) for r in results]
         new_state_msgs = state["messages"] + [asdict(m) for m in tool_msgs_obj]
-        # Atomically persist this completed [assistant(tool_calls), tool...] group right after tools succeed
         unpersisted_objs = [unpack_message(m) for m in new_state_msgs[persisted_count:]]
         await asyncio.to_thread(
             store.save_turn_messages,
@@ -330,7 +295,7 @@ def build_agent_graph(
             trace_id=ctx.trace_id,
             operation_name="after_agent",
             parent_span_id=ctx.parent_span_id,
-        ) as af_sp:
+        ):
             persisted_count = int(state.get("persisted_count", 0))
             remaining_msgs = [unpack_message(m) for m in state["messages"][persisted_count:]]
             if remaining_msgs:
@@ -381,9 +346,10 @@ async def invoke_phase(graph: Any, store: Any, payload: Any, cfg: dict, trace: s
         await asyncio.to_thread(store.save_span, root)
 
 
-def graph_config(tid: str, *, max_steps: Optional[int] = None) -> dict:
+def graph_config(checkpoint_id: str, *, max_steps: Optional[int] = None) -> dict:
+    """Build LangGraph configurable dict keyed by `run_id` so cancelled interrupts never block new turns."""
     steps = max(1, int(max_steps)) if max_steps is not None else 15
-    return {"configurable": {"thread_id": tid}, "recursion_limit": max(64, 2 * steps + 10)}
+    return {"configurable": {"thread_id": checkpoint_id}, "recursion_limit": max(64, 2 * steps + 10)}
 
 
 def extract_interrupt_tickets(raw_interrupts: Any) -> list:

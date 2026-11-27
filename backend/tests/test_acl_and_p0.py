@@ -1,4 +1,4 @@
-"""P0 security regression tests & Phase 1 pluggable ACL contract tests."""
+"""P0 security regression tests & pluggable ACL contract tests."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from agent_runtime import (
     HeaderIdentityResolver,
     Message,
     NoopAccessController,
+    PgRagRepository,
+    PgSkillsRepository,
     RAGChunk,
     RagExtension,
     RagRetrievalService,
@@ -27,7 +29,7 @@ from agent_runtime import (
     ToolCall,
     tool,
 )
-from agent_runtime.api import approvals, ops, skills, state, system, threads
+from agent_runtime.api import approvals, ops, state, system, threads
 from agent_runtime.framework.core.config import ModelSettings, uid
 from agent_runtime.infra.llm.provider import ModelNotConfiguredError, OpenAICompatibleProvider
 from agent_runtime.infra.plg.hub import ObservabilityHub
@@ -67,8 +69,10 @@ def _make_http_app(runtime: AgentRuntimeApp, *, resolver=None) -> FastAPI:
     if resolver is not None:
         app.state.identity_resolver = resolver
     v1 = APIRouter()
-    for sub in (system.router, threads.router, approvals.router, state.router, skills.router, ops.router):
+    for sub in (system.router, threads.router, approvals.router, state.router, ops.router):
         v1.include_router(sub)
+    for ext_router in runtime.extension_routers():
+        v1.include_router(ext_router)
     app.include_router(v1, prefix="/api/v1")
     return app
 
@@ -89,8 +93,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
             app = AgentRuntimeApp(store=get_test_store(), tools=[alpha, beta])
 
-            # Parent restricted to ("alpha",), subagent asks for ("beta",) -> empty intersection ()
-            parent = AuthScope(tenant_id="t1", user_id="u1", roles=("employee",), allowed_tools=("alpha",))
+            parent = AuthScope(user_id="u1", roles=("employee",), allowed_tools=("alpha",))
             sub = parent.narrowed(allowed_tools=("beta",), allow_write=False)
             self.assertEqual(sub.allowed_tools, ())
             self.assertEqual(app.registry.visible_specs(sub), [])
@@ -106,11 +109,9 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             self.assertFalse(res.ok)
             self.assertEqual(res.error_code, "permission_denied")
 
-            # Explicit empty allowlist at depth=0 also grants zero tools
-            zero_scope = AuthScope(tenant_id="t1", user_id="u1", allowed_tools=())
+            zero_scope = AuthScope(user_id="u1", allowed_tools=())
             self.assertEqual(app.registry.visible_specs(zero_scope), [])
-            # Default allowed_tools=None grants read tools
-            open_scope = AuthScope(tenant_id="t1", user_id="u1")
+            open_scope = AuthScope(user_id="u1")
             self.assertIn("alpha", [s.name for s in app.registry.visible_specs(open_scope)])
 
         asyncio.run(_run())
@@ -118,17 +119,21 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
     def test_p0_empty_roles_semantics_for_rag_and_skills(self):
         async def _run():
             store = get_test_store()
+            rag_repo = PgRagRepository(store)
+            rag_repo.bootstrap_schema()
+            skills_repo = PgSkillsRepository(store)
+            skills_repo.bootstrap_schema()
+
             rag_rbac = RagRetrievalService(
-                store, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
+                rag_repo, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
             )
             rag_noop = RagRetrievalService(
-                store, min_rerank_score=0.35, access_controller=NoopAccessController()
+                rag_repo, min_rerank_score=0.35, access_controller=NoopAccessController()
             )
             rag_rbac.index_chunk(
                 RAGChunk(
                     chunk_id="pub_1",
                     parent_id="p_pub",
-                    tenant_id="t_acme",
                     doc_title="公开手册",
                     section_path="总则",
                     doc_url="kb://pub",
@@ -141,7 +146,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                 RAGChunk(
                     chunk_id="sec_1",
                     parent_id="p_sec",
-                    tenant_id="t_acme",
                     doc_title="高管机密",
                     section_path="薪酬",
                     doc_url="kb://sec",
@@ -150,29 +154,16 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                     acl_roles=("exec",),
                 )
             )
-            rag_rbac.index_chunk(
-                RAGChunk(
-                    chunk_id="other_1",
-                    parent_id="p_other",
-                    tenant_id="t_other",
-                    doc_title="他租户资料",
-                    section_path="总则",
-                    doc_url="kb://other",
-                    content="高管期权激励方案细则",
-                    parent_text="高管期权激励方案细则",
-                    acl_roles=(),
-                )
-            )
 
-            admin = AuthScope("t_acme", "u_admin", ("admin",))
-            store.publish_skill(
+            admin = AuthScope("u_admin", ("admin",))
+            skills_repo.publish_skill(
                 scope=admin,
                 slug="public-guide",
                 description="全员公开流程",
                 content="# 公开内容",
                 acl_roles=[],
             )
-            store.publish_skill(
+            skills_repo.publish_skill(
                 scope=admin,
                 slug="exec-secret",
                 description="高管专属流程",
@@ -180,7 +171,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                 acl_roles=["exec"],
             )
 
-            no_role_scope = AuthScope("t_acme", "u_guest", ())
+            no_role_scope = AuthScope("u_guest", ())
 
             # Under RBAC: empty caller roles sees ONLY public docs/skills, never exec-only!
             pub_hit = await rag_rbac.retrieve(scope=no_role_scope, query="门禁卡补办流程")
@@ -191,14 +182,13 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             rbac_flt = RbacAccessController(admin_roles=("admin",)).filter_for(
                 no_role_scope, "skill:read", "skill"
             )
-            visible_slugs = [s.slug for s in store.list_skills(no_role_scope, access_filter=rbac_flt)]
+            visible_slugs = [s.slug for s in skills_repo.list_skills(no_role_scope, access_filter=rbac_flt)]
             self.assertEqual(visible_slugs, ["public-guide"])
 
-            # Under Noop: sees exec-only within tenant, NEVER cross-tenant
+            # Under Noop: unrestricted retrieval sees exec-only doc
             noop_hit = await rag_noop.retrieve(scope=no_role_scope, query="高管期权激励方案")
             self.assertEqual(noop_hit.status, "ok")
             self.assertIn("p_sec", [h.parent_id for h in noop_hit.hits])
-            self.assertTrue(all(h.tenant_id == "t_acme" for h in noop_hit.hits))
 
         asyncio.run(_run())
 
@@ -215,20 +205,23 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             extensions=[RagExtension(), SkillsExtension()],
             access_controller=rbac,
         )
-        admin_scope = AuthScope("t_acme", "u_admin", ("admin",))
-        store.publish_skill(
+        runtime.bootstrap_extensions()
+        rag_repo = PgRagRepository(store)
+        skills_repo = PgSkillsRepository(store)
+        admin_scope = AuthScope("u_admin", ("admin",))
+        skills_repo.publish_skill(
             scope=admin_scope,
             slug="secret-sop",
             description="高管机密 SOP",
             content="# 绝密流程",
             acl_roles=["exec"],
         )
-        store.set_skill_status(admin_scope, "secret-sop", "disabled")
-        doc = store.index_document(admin_scope, "高管密件", "仅高管可见内容", ["exec"])
-        store.index_document(admin_scope, "全员公告", "全员公开内容", [])
+        skills_repo.set_skill_status(admin_scope, "secret-sop", "disabled")
+        doc = rag_repo.index_document(admin_scope, "高管密件", "仅高管可见内容", ["exec"])
+        rag_repo.index_document(admin_scope, "全员公告", "全员公开内容", [])
 
-        emp_headers = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_emp", "X-User-Roles": "employee"}
-        admin_headers = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_admin", "X-User-Roles": "admin"}
+        emp_headers = {"X-User-Id": "u_emp", "X-User-Roles": "employee"}
+        admin_headers = {"X-User-Id": "u_admin", "X-User-Roles": "admin"}
         client = TestClient(_make_http_app(runtime))
 
         # Non-admin MUST NOT bypass ACL using ?include_disabled=true
@@ -253,20 +246,18 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             403,
         )
 
-        # /state for employee must NOT leak exec-only knowledge chunks
+        # Core /state no longer exposes or queries RAG knowledge_chunks
         r_state = client.get("/api/v1/state", headers=emp_headers)
         self.assertEqual(r_state.status_code, 200)
-        titles = {c["doc_title"] for c in r_state.json()["knowledge_chunks"]}
-        self.assertIn("全员公告", titles)
-        self.assertNotIn("高管密件", titles)
+        self.assertNotIn("knowledge_chunks", r_state.json())
 
         # Admin succeeds on disabled preview, ops overview (with real acl_roles, NO process-global logs), and status toggle
-        obs.loki_events.append({"msg": "tenant_b_secret_log"})
+        obs.loki_events.append({"msg": "process_global_log"})
         r_admin_sk = client.get("/api/v1/skills/secret-sop?include_disabled=true", headers=admin_headers)
         self.assertEqual(r_admin_sk.status_code, 200)
         self.assertIn("绝密流程", r_admin_sk.json()["content"])
 
-        # Tenant admin cannot mutate shared process model config or read process-global Loki logs
+        # Regular admin cannot mutate shared process model config or read process-global Loki logs
         self.assertEqual(
             client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "deepseek"}).status_code,
             403,
@@ -280,7 +271,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         # Platform admin CAN read process telemetry and update model config
         plat_headers = {
-            "X-Tenant-Id": "t_acme",
             "X-User-Id": "u_plat",
             "X-User-Roles": "platform_admin",
         }
@@ -293,12 +283,10 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             ).status_code,
             200,
         )
-        # Mock mode is removed and must be rejected with 422
         self.assertEqual(
             client.post("/api/v1/config/model", headers=plat_headers, json={"mode": "mock"}).status_code,
             422,
         )
-        # Provider without API key fails explicitly instead of falling back to mock
         unconfigured = OpenAICompatibleProvider(None, obs, settings=ModelSettings(api_key=""))
         with self.assertRaises(ModelNotConfiguredError):
             asyncio.run(
@@ -324,8 +312,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                 self.called = 0
 
             async def generate(self, *, messages, tool_specs, ctx):
-                from agent_runtime.framework.core.contracts import Message
-
                 self.called += 1
                 if self.called == 1:
                     return Message("assistant", "", [ToolCall("tc_pay", "submit_payout", {"amount": 900})])
@@ -351,19 +337,19 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(
             client.get(
                 "/api/v1/meta",
-                headers={"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"},
+                headers={"X-User-Id": "u_alice", "X-User-Roles": "employee"},
             ).status_code,
             401,
         )
 
         # Start paused turn as employee u_alice
-        emp_scope = AuthScope("t_acme", "u_alice", ("employee",), authenticated=True)
+        emp_scope = AuthScope("u_alice", ("employee",), authenticated=True)
         paused = asyncio.run(runtime.run_turn("发放 900 元", thread_id="th_pay", scope=emp_scope))
         review_id = paused["__interrupt__"][0]["review_id"]
 
         # Self-approval as u_alice (even spoofing body.approver_id="mgr_bob") -> 403!
         alice_hdr = HeaderIdentityResolver.sign_headers(
-            secret=secret, tenant_id="t_acme", user_id="u_alice", roles=("employee", "manager")
+            secret=secret, user_id="u_alice", roles=("employee", "manager")
         )
         r_self = client.post(
             f"/api/v1/approvals/{review_id}/resume",
@@ -375,7 +361,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         # Authorized manager u_boss approves while spoofing body.approver_id -> recorded as u_boss!
         boss_hdr = HeaderIdentityResolver.sign_headers(
-            secret=secret, tenant_id="t_acme", user_id="u_boss", roles=("manager",)
+            secret=secret, user_id="u_boss", roles=("manager",)
         )
         r_ok = client.post(
             f"/api/v1/approvals/{review_id}/resume",
@@ -385,7 +371,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_ok.status_code, 200)
         self.assertEqual(r_ok.json()["status"], "completed")
         self.assertEqual(writes, [(900, "u_alice")])
-        ticket = store.get_approval_ticket(review_id, "t_acme")
+        ticket = store.get_approval_ticket(review_id)
         self.assertIsNotNone(ticket)
         self.assertEqual(ticket.approver_id, "u_boss")
 
@@ -405,8 +391,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                     self.n = 0
 
                 async def generate(self, *, messages, tool_specs, ctx):
-                    from agent_runtime.framework.core.contracts import Message
-
                     self.n += 1
                     if self.n == 1:
                         return Message("assistant", "", [ToolCall("tc_w", "wire_transfer", {"amount": 500})])
@@ -416,7 +400,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             app = AgentRuntimeApp(
                 model=WireModel(), store=store, obs=obs, tools=[wire_transfer], access_controller=rbac
             )
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            scope = AuthScope("u_alice", ("employee",))
             paused = await app.run_turn("转账", thread_id="th_rev", scope=scope)
             review_id = paused["__interrupt__"][0]["review_id"]
 
@@ -457,14 +441,13 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         async def _run():
             store = get_test_store()
-            app = AgentRuntimeApp(store=store)
-            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            app = AgentRuntimeApp(model=EchoTestModel(), store=store)
+            scope = AuthScope("u_alice", ("employee",))
 
             with patch.object(store, "record_turn_start", side_effect=RuntimeError("db_write_blip")):
                 with self.assertRaises(RuntimeError):
                     await app.run_turn("hello", thread_id="th_fail_start", scope=scope)
 
-        # Run must have converged to failed so next turn is NOT blocked with 409 conflict
             self.assertIsNone(store.get_active_run("th_fail_start"))
             ok_turn = await app.run_turn("hello again", thread_id="th_fail_start", scope=scope)
             self.assertTrue(ok_turn["final_answer"])
@@ -478,20 +461,20 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             AccessFilter,
             AuthenticationError,
         )
-        from agent_runtime.infra.pg.acl_sql import compile_acl_sql
+        from agent_runtime.extensions._acl_sql import compile_acl_sql
 
         async def _run():
             store = get_test_store()
-            # 1. Mixed-ACL parent doc: public chunk + exec-only chunk share same parent_id
+            rag_repo = PgRagRepository(store)
+            rag_repo.bootstrap_schema()
             rag = RagRetrievalService(
-                store, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
+                rag_repo, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
             )
             full_parent = "公开章节：普通差旅每天补助 180 元。\n绝密章节：CEO 特别津贴 99999 元。"
             rag.index_chunk(
                 RAGChunk(
                     chunk_id="mix_1",
                     parent_id="p_mix",
-                    tenant_id="t_acme",
                     doc_title="混合制度",
                     section_path="补助",
                     doc_url="kb://mix",
@@ -504,7 +487,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                 RAGChunk(
                     chunk_id="mix_2",
                     parent_id="p_mix",
-                    tenant_id="t_acme",
                     doc_title="混合制度",
                     section_path="高管",
                     doc_url="kb://mix",
@@ -513,40 +495,38 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                     acl_roles=("exec",),
                 )
             )
-            emp = AuthScope("t_acme", "u_emp", ("employee",))
+            emp = AuthScope("u_emp", ("employee",))
             res_emp = await rag.retrieve(scope=emp, query="普通差旅每天补助")
             self.assertEqual(res_emp.status, "ok")
             self.assertIn("180", res_emp.formatted_context)
             self.assertNotIn("99999", res_emp.formatted_context)
             self.assertNotIn("CEO 特别津贴", res_emp.formatted_context)
 
-            # 2. Unsupported AccessFilter predicates MUST fail closed (never silently widen)
+            # Unsupported AccessFilter predicates MUST fail closed (never silently widen)
             with self.assertRaises(AccessControlError):
-                compile_acl_sql(AccessFilter(tenant_id="t_acme", owner_id="u_other"), scope=emp)
+                compile_acl_sql(AccessFilter(owner_id="u_other"), scope=emp)
             with self.assertRaises(AccessControlError):
-                compile_acl_sql(AccessFilter(tenant_id="t_acme", any_depts=("d_fin",)), scope=emp)
-            with self.assertRaises(AccessControlError):
-                compile_acl_sql(AccessFilter(tenant_id="t_other"), scope=emp)
+                compile_acl_sql(AccessFilter(any_depts=("d_fin",)), scope=emp)
 
-            # 3. Signed gateway header encoding is unambiguous & rejects control/delimiter abuse
+            # Signed gateway header encoding is unambiguous & rejects control/delimiter abuse
             secret = "strict-hmac-secret"
             resolver = HeaderIdentityResolver(hmac_secret=secret)
             hdr1 = HeaderIdentityResolver.sign_headers(
-                secret=secret, tenant_id="a|b", user_id="c", roles=("employee",)
+                secret=secret, user_id="u_alice", roles=("employee",)
             )
-            tampered = {**hdr1, "X-Tenant-Id": "a", "X-User-Id": "b|c"}
+            tampered = {**hdr1, "X-User-Id": "u_bob"}
             with self.assertRaises(AuthenticationError):
                 resolver.resolve(tampered)
             with self.assertRaises(AuthenticationError):
                 HeaderIdentityResolver.sign_headers(
-                    secret=secret, tenant_id="t_acme", user_id="u1", roles=("a,b",)
+                    secret=secret, user_id="u1", roles=("a,b",)
                 )
             with self.assertRaises(AuthenticationError):
                 HeaderIdentityResolver.sign_headers(
-                    secret=secret, tenant_id="t_acme\n", user_id="u1", roles=("employee",)
+                    secret=secret, user_id="u1\n", roles=("employee",)
                 )
 
-            # 4. SDK resume_approval stamps authoritative caller.user_id (ignoring spoofed decision.approver_id)
+            # SDK resume_approval stamps authoritative caller.user_id (ignoring spoofed decision.approver_id)
             @tool(risk_level=RiskLevel.HIGH_RISK)
             async def approve_me(x: int) -> str:
                 return f"ok:{x}"
@@ -556,8 +536,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                     self.i = 0
 
                 async def generate(self, *, messages, tool_specs, ctx):
-                    from agent_runtime.framework.core.contracts import Message
-
                     self.i += 1
                     if self.i == 1:
                         return Message("assistant", "", [ToolCall("tc_a1", "approve_me", {"x": 1})])
@@ -573,17 +551,16 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             app = AgentRuntimeApp(model=OnceModel(), store=store, tools=[approve_me], access_controller=ac)
             paused = await app.run_turn("approve", thread_id="th_sdk_app", scope=emp)
             rid = paused["__interrupt__"][0]["review_id"]
-            mgr = AuthScope("t_acme", "u_real_mgr", ("manager",))
+            mgr = AuthScope("u_real_mgr", ("manager",))
             await app.resume_approval(
                 thread_id="th_sdk_app",
                 decision=ApprovalDecision(review_id=rid, approved=True, approver_id="spoofed_id"),
                 scope=mgr,
             )
-            tkt = store.get_approval_ticket(rid, "t_acme")
+            tkt = store.get_approval_ticket(rid)
             self.assertIsNotNone(tkt)
             self.assertEqual(tkt.approver_id, "u_real_mgr")
 
-            # 5. Builtin read_tool_output enforces artifact:read consistently with HTTP /ops/outputs
             ctx = ExecutionContext(uid("tr"), "th_sdk_app", emp, uid("req"))
             art_res = await app.gateway.execute_one(
                 ToolCall("tc_art", "read_tool_output", {"ref_id": "out_any"}), ctx
@@ -611,14 +588,11 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
                     return "超大背景材料：" + ("制度条款" * 4000)
 
                 async def on_before_model(self, messages, ctx):
-                    # Immutable tuple snapshot prevents accidental mutation
                     self.snapshot_type = type(messages)
                     captured_messages.append(messages)
 
             class CaptureModel:
                 async def generate(self, *, messages, tool_specs, ctx):
-                    from agent_runtime.framework.core.contracts import Message
-
                     return Message("assistant", f"收到({len(messages)}条)")
 
             mw = PiiAndHugeInjectMW()
@@ -639,13 +613,10 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             self.assertIs(mw.snapshot_type, tuple)
             self.assertEqual(len(captured_messages), 1)
             msgs = captured_messages[0]
-            # 1. System prompt preserved intact
             self.assertEqual(msgs[0].role, "system")
             self.assertEqual(msgs[0].content, "BASE_SYSTEM_PROMPT")
-            # 2. Oversized extra_context was truncated inside kernel budget
             self.assertEqual(msgs[1].role, "system")
             self.assertIn("truncated for context budget", msgs[1].content)
-            # 3. User text transformed without breaking message roles
             self.assertEqual(msgs[-1].role, "user")
             self.assertIn("[PHONE_REDACTED]", msgs[-1].content)
             self.assertNotIn("13800138000", msgs[-1].content)
@@ -656,7 +627,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         store = get_test_store()
         obs = _TestTelemetry(store)
         runtime = AgentRuntimeApp(model=EchoTestModel(), store=store, obs=obs)
-        alice_scope = AuthScope("t_acme", "u_alice", ("employee",))
+        alice_scope = AuthScope("u_alice", ("employee",))
         ctx = ExecutionContext(
             trace_id=uid("tr"),
             thread_id="th_fb_1",
@@ -666,10 +637,9 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         asyncio.run(runtime.run_turn("请帮我查一下数据", ctx=ctx))
 
         client = TestClient(_make_http_app(runtime))
-        alice_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"}
-        bob_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_bob", "X-User-Roles": "employee"}
+        alice_h = {"X-User-Id": "u_alice", "X-User-Roles": "employee"}
+        bob_h = {"X-User-Id": "u_bob", "X-User-Roles": "employee"}
 
-        # 1. Submit thumbs-up first, then switch to thumbs-down -> mutually exclusive upsert in PG
         r_up = client.post(
             "/api/v1/threads/th_fb_1/feedback",
             headers=alice_h,
@@ -690,7 +660,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertIsNotNone(fb1["msg_id"])
         self.assertIn("已收到消息", fb1["answer_excerpt"])
 
-        # 2. Updating reason upserts the same record cleanly (no duplicate rows)
         r2 = client.post(
             "/api/v1/threads/th_fb_1/feedback",
             headers=alice_h,
@@ -702,7 +671,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_list.status_code, 200)
         self.assertEqual(len(r_list.json()["feedback"]), 1)
 
-        # 3. Loading thread messages includes persisted feedback attached to assistant message
         r_msgs = client.get("/api/v1/threads/th_fb_1/messages", headers=alice_h)
         self.assertEqual(r_msgs.status_code, 200)
         asst_msgs = [m for m in r_msgs.json()["messages"] if m["role"] == "assistant"]
@@ -710,7 +678,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(asst_msgs[0]["feedback"]["rating"], "down")
         self.assertEqual(asst_msgs[0]["feedback"]["reason"], "回答不够具体")
 
-        # 4. Another user cannot read/write/delete Alice's thread feedback
         self.assertEqual(client.get("/api/v1/threads/th_fb_1/feedback", headers=bob_h).status_code, 404)
         self.assertEqual(
             client.post(
@@ -721,7 +688,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             404,
         )
 
-        # 5. Cancel dislike deletes the row cleanly
         r_del = client.delete(f"/api/v1/threads/th_fb_1/feedback/{ctx.trace_id}", headers=alice_h)
         self.assertEqual(r_del.status_code, 200)
         self.assertTrue(r_del.json()["deleted"])
@@ -738,11 +704,10 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         obs = _TestTelemetry(store)
         runtime = AgentRuntimeApp(model=EchoTestModel(), store=store, obs=obs)
         client = TestClient(_make_http_app(runtime))
-        alice_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"}
-        bob_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_bob", "X-User-Roles": "employee"}
+        alice_h = {"X-User-Id": "u_alice", "X-User-Roles": "employee"}
+        bob_h = {"X-User-Id": "u_bob", "X-User-Roles": "employee"}
         tid = "th_files_1"
 
-        # 1. Upload .docx with Chinese filename + parentheses BEFORE any chat message (draft thread)
         doc_buf = io.BytesIO()
         doc = Document()
         doc.add_paragraph("2026 华东区差旅预算说明")
@@ -764,7 +729,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(f_docx["path"], "uploads/预算说明 (1).docx")
         self.assertGreater(f_docx["extracted_chars"], 10)
 
-        # 2. Upload .xlsx workbook
         xlsx_buf = io.BytesIO()
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -781,7 +745,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         )
         self.assertEqual(r_xlsx.status_code, 200, r_xlsx.text)
 
-        # 3. Upload valid minimal PDF (blank page -> honest scan-PDF notice instead of crash)
         pdf_buf = io.BytesIO()
         writer = PdfWriter()
         writer.add_blank_page(width=200, height=200)
@@ -794,8 +757,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         )
         self.assertEqual(r_pdf.status_code, 200, r_pdf.text)
 
-        # 4. Built-in `read` tool transparently reads extracted Word, Excel, and PDF without oss_key leak
-        ctx = ExecutionContext(uid("tr"), tid, AuthScope("t_acme", "u_alice", ("employee",)), uid("req"))
+        ctx = ExecutionContext(uid("tr"), tid, AuthScope("u_alice", ("employee",)), uid("req"))
         ls_out = asyncio.run(runtime.gateway.execute_one(ToolCall("tc_fls", "read", {"path": "."}), ctx))
         self.assertTrue(ls_out.ok)
         self.assertNotIn("oss_key", ls_out.content)
@@ -822,7 +784,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertTrue(rd_pdf.ok)
         self.assertIn("扫描件", rd_pdf.content)
 
-        # 5. Download returns exact original bytes + hardened RFC 5987 & anti-XSS headers
         r_dl = client.get(
             f"/api/v1/threads/{tid}/files/download",
             headers=alice_h,
@@ -834,8 +795,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertIn("sandbox", r_dl.headers.get("content-security-policy", ""))
         self.assertIn("filename*=UTF-8''", r_dl.headers.get("content-disposition", ""))
 
-        # Active HTML file written by agent MUST downgrade to application/octet-stream on download
-        store.write_workspace_file("t_acme", tid, "reports/page.html", "<script>alert(1)</script>", actor_id="u_alice")
+        store.write_workspace_file(tid, "reports/page.html", "<script>alert(1)</script>", actor_id="u_alice")
         r_html = client.get(
             f"/api/v1/threads/{tid}/files/download",
             headers=alice_h,
@@ -844,7 +804,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_html.status_code, 200)
         self.assertEqual(r_html.headers.get("content-type"), "application/octet-stream")
 
-        # 6. Security rejections: XXE DTD in OOXML, spoofed PDF magic, legacy .xls, cross-user 404
         xxe_buf = io.BytesIO()
         with zipfile.ZipFile(xxe_buf, "w") as zf:
             zf.writestr("word/document.xml", '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "boom">]><w:document/>')
@@ -869,7 +828,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         )
         self.assertEqual(r_old_xls.status_code, 422)
 
-        # Cross-user cannot list, upload into, or download Alice's thread files
         self.assertEqual(client.get(f"/api/v1/threads/{tid}/files", headers=bob_h).status_code, 404)
         self.assertEqual(
             client.get(
@@ -888,9 +846,8 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             404,
         )
 
-        # 7. Deleting thread cleans up PG rows and MinIO objects
-        self.assertTrue(store.delete_thread(AuthScope("t_acme", "u_alice", ("employee",)), tid))
-        self.assertEqual(store.list_workspace_files("t_acme", tid), [])
+        self.assertTrue(store.delete_thread(AuthScope("u_alice", ("employee",)), tid))
+        self.assertEqual(store.list_workspace_files(tid), [])
 
 
 if __name__ == "__main__":

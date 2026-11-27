@@ -1,39 +1,104 @@
-"""Operations & observability routes: global overview, OSS paging, and KB document upload."""
+"""Optional reference Operations & Admin console routes (mounted only when `AGENT_ENABLE_OPS=1`)."""
 
 from __future__ import annotations
 
-import asyncio
+from dataclasses import asdict
+from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from prometheus_client import generate_latest
-from pydantic import ValidationError
-from starlette.datastructures import UploadFile
 
 from agent_runtime.api.deps import (
     caller_scope,
-    caller_scope_async,
     require_access,
-    require_access_async,
     resolve_filter,
 )
-from agent_runtime.api.schemas import KnowledgeUploadRequest, StatusUpdateRequest
-from agent_runtime.framework.core.config import MAX_DOCUMENT
 from agent_runtime.framework.core.contracts import ExecutionContext
 from agent_runtime.framework.core.security import AccessDecision, ResourceRef
 
-router = APIRouter(tags=["Operations & Knowledge"])
+router = APIRouter(tags=["Reference Admin Console (Optional)"])
 
 
-@router.get("/ops/overview", summary="全局监控总览（PLG / 会话上下文 / OSS 工件 / 知识库 / Skills / Runs）")
+def _build_ops_overview(req: Request, scope, skills_filter) -> Dict[str, Any]:
+    store = req.app.state.store
+    runtime = req.app.state.runtime
+
+    threads_rows = store.rows(
+        """
+        SELECT t.thread_id, t.title, t.created_at,
+               (SELECT count(*) FROM session_messages m WHERE m.thread_id=t.thread_id) AS message_count,
+               COALESCE(s.covered_up_to_msg_id, 0) AS covered_up_to_msg_id,
+               COALESCE(s.summary_text, '') AS summary_text
+        FROM agent_threads t
+        LEFT JOIN session_summaries s ON s.thread_id=t.thread_id
+        WHERE EXISTS (SELECT 1 FROM session_messages m WHERE m.thread_id=t.thread_id)
+        ORDER BY t.created_at DESC
+        LIMIT 80
+        """
+    )
+    approval_rows = store.rows(
+        """SELECT review_id, thread_id, actor_id, run_id, op_key, tool_name, args_hash, policy_rev,
+                  summary, EXTRACT(EPOCH FROM expires_at)::float8 AS expires_at, decision, approver_id,
+                  EXTRACT(EPOCH FROM consumed_at)::float8 AS consumed_at
+           FROM tool_approvals ORDER BY expires_at DESC LIMIT 50"""
+    )
+    run_rows = store.rows(
+        """SELECT op_key, actor_id, tool_name, args_hash, status, receipt,
+                  preview, result_ref, error_code, lease_until
+           FROM tool_runs ORDER BY lease_until DESC LIMIT 50"""
+    )
+    output_rows = store.rows(
+        """SELECT ref_id, thread_id, resource_owner, tool_name, total_chars, oss_key,
+                  left(preview, 260) AS preview, expires_at
+           FROM tool_outputs ORDER BY expires_at DESC LIMIT 50"""
+    )
+    trace_rows = store.rows(
+        """SELECT rt.trace_id, rt.thread_id, rt.created_at,
+                  (SELECT count(*) FROM agent_spans sp WHERE sp.trace_id=rt.trace_id) AS span_count,
+                  COALESCE((SELECT max(start_ms + duration_ms) - min(start_ms) FROM agent_spans sp WHERE sp.trace_id=rt.trace_id), 0) AS total_ms
+           FROM runtime_traces rt
+           ORDER BY rt.created_at DESC LIMIT 30"""
+    )
+
+    kb_rows = []
+    rag_ext = runtime.get_extension("rag")
+    if rag_ext is not None and getattr(rag_ext, "repo", None) is not None:
+        kb_rows = rag_ext.repo.list_documents_overview()
+
+    skills = []
+    skills_ext = runtime.get_extension("skills")
+    if skills_ext is not None and getattr(skills_ext, "repo", None) is not None:
+        skills = [asdict(s) for s in skills_ext.repo.list_skills(scope, access_filter=skills_filter)]
+
+    return {
+        "counts": {
+            "threads": len(threads_rows),
+            "tool_approvals": len(approval_rows),
+            "tool_runs": len(run_rows),
+            "tool_outputs": len(output_rows),
+            "knowledge_chunks": len(kb_rows),
+            "skills": len(skills),
+            "traces": len(trace_rows),
+        },
+        "threads": threads_rows,
+        "tool_approvals": approval_rows,
+        "tool_runs": run_rows,
+        "tool_outputs": output_rows,
+        "knowledge_chunks": kb_rows,
+        "skills": skills,
+        "recent_traces": trace_rows,
+    }
+
+
+@router.get("/ops/overview", summary="全局监控总览（PLG / 会话上下文 / OSS 工件 / 可选知识库与 Skills / Runs）")
 def ops_overview(req: Request):
-    scope, store, obs = caller_scope(req), req.app.state.store, req.app.state.obs
-    require_access(req, scope, "ops:view", ResourceRef("ops", tenant_id=scope.tenant_id))
+    scope, obs = caller_scope(req), req.app.state.obs
+    require_access(req, scope, "ops:view", ResourceRef("ops"))
     sk_flt = resolve_filter(req, scope, "skill:manage", "skill")
-    snap = store.get_ops_overview_snapshot(scope, skills_filter=sk_flt)
+    snap = _build_ops_overview(req, scope, sk_flt)
     model_cfg = getattr(req.app.state.model, "config", None)
     model_pub = model_cfg.public() if model_cfg is not None else {"mode": "custom"}
 
-    # Process-global Prometheus metrics & Loki logs require explicit platform telemetry permission
     include_platform_telemetry = False
     ac = req.app.state.runtime.access_controller
     try:
@@ -50,68 +115,12 @@ def ops_overview(req: Request):
     }
 
 
-@router.get("/ops/outputs/{ref_id}", summary="分页读取 MinIO OSS 落盘的大工具输出工件")
+@router.get("/ops/outputs/{ref_id}", summary="分页读取当前用户有权访问的 MinIO OSS 大工具输出工件")
 def ops_read_output(ref_id: str, req: Request, offset: int = 0, limit: int = 1200):
     scope = caller_scope(req)
-    require_access(req, scope, "artifact:read", ResourceRef("artifact", id=ref_id, tenant_id=scope.tenant_id))
+    require_access(req, scope, "artifact:read", ResourceRef("artifact", id=ref_id))
     ctx = ExecutionContext(trace_id="ops", thread_id="ops", request_id="ops", auth_scope=scope)
     page, err = req.app.state.store.read_tool_output_page(ctx, ref_id, offset=offset, limit=limit)
     if err:
         raise HTTPException(404, err)
     return {"ref_id": ref_id, "offset": offset, "content": page}
-
-
-@router.post("/knowledge/upload", summary="上传知识库文档到 MinIO OSS 并切块索引至 pgvector")
-async def upload_knowledge(req: Request):
-    scope = await caller_scope_async(req)
-    await require_access_async(req, scope, "kb:manage", ResourceRef("rag_doc", tenant_id=scope.tenant_id))
-    if req.headers.get("content-type", "").startswith("multipart/form-data"):
-        async with req.form() as form:
-            file = form.get("file")
-            if not isinstance(file, UploadFile):
-                raise HTTPException(422, "需要 UTF-8 文本文件")
-            raw = await file.read(MAX_DOCUMENT + 1)
-            if len(raw) > MAX_DOCUMENT:
-                raise HTTPException(413, "文档上限为 2 MiB")
-            try:
-                content = raw.decode("utf-8-sig")
-            except UnicodeDecodeError as exc:
-                raise HTTPException(422, "文档需要 UTF-8 编码") from exc
-            title = str(form.get("title") or file.filename or "")
-            section = str(form.get("section") or "")
-            roles = form.getlist("acl_roles")
-    else:
-        try:
-            body = KnowledgeUploadRequest.model_validate(await req.json())
-        except ValidationError as exc:
-            raise HTTPException(422, exc.errors()) from exc
-        title, content = body.title, body.content
-        section = body.section
-        roles = body.acl_roles
-
-    if not title.strip() or not content.strip():
-        raise HTTPException(422, "title 和 content 不能为空")
-    if len(content.encode("utf-8")) > MAX_DOCUMENT:
-        raise HTTPException(413, "文档上限为 2 MiB")
-    roles = [str(r).strip() for r in (roles or []) if str(r).strip()]
-
-    result = await asyncio.to_thread(
-        req.app.state.store.index_document,
-        scope,
-        title.strip(),
-        content,
-        roles,
-        section=section.strip() or title.strip(),
-        upload=True,
-    )
-    return {"ok": True, **result, "chunks_indexed": result["chunk_count"]}
-
-
-@router.patch("/knowledge/{parent_id}/status", summary="切换知识库文档生效/下架状态")
-def update_knowledge_status(parent_id: str, req: Request, body: StatusUpdateRequest):
-    scope = caller_scope(req)
-    require_access(req, scope, "kb:manage", ResourceRef("rag_doc", id=parent_id, tenant_id=scope.tenant_id))
-    ok = req.app.state.store.set_document_status(scope, parent_id, body.status)
-    if not ok:
-        raise HTTPException(404, "knowledge_document_not_found")
-    return {"ok": True, "parent_id": parent_id, "status": body.status}

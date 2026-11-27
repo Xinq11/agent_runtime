@@ -18,18 +18,18 @@ class StaticIdentityResolver:
     """Ignores untrusted request headers and always returns a fixed deployment default identity."""
 
     def __init__(self, default_scope: Optional[AuthScope] = None) -> None:
-        self._scope = default_scope or AuthScope("default", "local_user", ("user",))
+        self._scope = default_scope or AuthScope("local_user", ("user",))
 
     def resolve(self, context: Any) -> AuthScope:
         return self._scope
 
 
 class HeaderIdentityResolver:
-    """Resolves identity from trusted upstream gateway headers (with optional HMAC verification).
+    """Resolves trusted caller `user_id` (+ optional `roles`) from upstream gateway headers.
 
-    When `hmac_secret` is configured, requires `X-Tenant-Id`, `X-User-Id`, and a valid
-    `X-Gateway-Signature` produced with `itsdangerous.TimestampSigner(hmac_secret)` over
-    the canonical JSON payload `["v1", tenant_id, user_id, roles]`.
+    When `hmac_secret` is configured, requires `X-User-Id` and a valid `X-Gateway-Signature`
+    produced with `itsdangerous.TimestampSigner(hmac_secret)` over the canonical JSON payload
+    `["v1", user_id, roles]`. Any legacy `X-Tenant-Id` header is ignored.
     """
 
     def __init__(
@@ -40,7 +40,7 @@ class HeaderIdentityResolver:
         hmac_secret: Optional[str] = None,
         max_age_sec: int = 300,
     ) -> None:
-        self._default_scope = default_scope or AuthScope("default", "local_user", ("user",))
+        self._default_scope = default_scope or AuthScope("local_user", ("user",))
         self._trust_headers = trust_headers
         self._hmac_secret = (hmac_secret or "").strip() or None
         self._max_age_sec = max_age_sec
@@ -55,20 +55,18 @@ class HeaderIdentityResolver:
         return cleaned
 
     @staticmethod
-    def _encode_signed_payload(tenant_id: str, user_id: str, roles: Tuple[str, ...]) -> str:
-        return json.dumps(["v1", tenant_id, user_id, list(roles)], separators=(",", ":"), ensure_ascii=False)
+    def _encode_signed_payload(user_id: str, roles: Tuple[str, ...]) -> str:
+        return json.dumps(["v1", user_id, list(roles)], separators=(",", ":"), ensure_ascii=False)
 
     @staticmethod
     def sign_headers(
         *,
         secret: str,
-        tenant_id: str,
         user_id: str,
         roles: Tuple[str, ...] = (),
     ) -> Dict[str, str]:
         from itsdangerous import TimestampSigner
 
-        clean_tenant = HeaderIdentityResolver._validate_identity_field("tenant_id", tenant_id)
         clean_user = HeaderIdentityResolver._validate_identity_field("user_id", user_id)
         clean_roles: list[str] = []
         for raw_role in roles:
@@ -77,10 +75,9 @@ class HeaderIdentityResolver:
                 raise AuthenticationError("invalid_role_delimiter")
             clean_roles.append(r)
         roles_tuple = tuple(clean_roles)
-        payload = HeaderIdentityResolver._encode_signed_payload(clean_tenant, clean_user, roles_tuple)
+        payload = HeaderIdentityResolver._encode_signed_payload(clean_user, roles_tuple)
         sig = TimestampSigner(secret).sign(payload).decode("utf-8")
         return {
-            "X-Tenant-Id": clean_tenant,
             "X-User-Id": clean_user,
             "X-User-Roles": ",".join(roles_tuple),
             "X-Gateway-Signature": sig,
@@ -91,20 +88,18 @@ class HeaderIdentityResolver:
         if self._hmac_secret:
             from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
-            raw_tenant = str(headers.get("X-Tenant-Id") or "")
             raw_user = str(headers.get("X-User-Id") or "")
             raw_roles = str(headers.get("X-User-Roles") or "")
             signature = str(headers.get("X-Gateway-Signature") or "").strip()
-            if not raw_tenant.strip() or not raw_user.strip() or not signature:
+            if not raw_user.strip() or not signature:
                 raise AuthenticationError("missing_gateway_signature")
-            tenant_id = self._validate_identity_field("tenant_id", raw_tenant)
             user_id = self._validate_identity_field("user_id", raw_user)
             if raw_roles.strip():
                 parts = raw_roles.split(",")
                 roles = tuple(self._validate_identity_field("role", p) for p in parts)
             else:
                 roles = ()
-            expected = self._encode_signed_payload(tenant_id, user_id, roles)
+            expected = self._encode_signed_payload(user_id, roles)
             try:
                 unsigned = TimestampSigner(self._hmac_secret).unsign(
                     signature, max_age=self._max_age_sec
@@ -113,7 +108,7 @@ class HeaderIdentityResolver:
                 raise AuthenticationError("invalid_gateway_signature") from exc
             if unsigned != expected:
                 raise AuthenticationError("gateway_signature_mismatch")
-            return AuthScope(tenant_id=tenant_id, user_id=user_id, roles=roles, authenticated=True)
+            return AuthScope(user_id=user_id, roles=roles, authenticated=True)
 
         if not self._trust_headers or "X-User-Id" not in headers:
             return self._default_scope
@@ -123,11 +118,10 @@ class HeaderIdentityResolver:
             roles = self._default_scope.roles
         else:
             roles = tuple(r.strip() for r in str(raw_roles).split(",") if r.strip())
-        tenant_id = str(headers.get("X-Tenant-Id") or self._default_scope.tenant_id).strip()
         user_id = str(headers["X-User-Id"]).strip()
         if not user_id:
             raise AuthenticationError("empty_user_id")
-        return AuthScope(tenant_id=tenant_id, user_id=user_id, roles=roles, authenticated=True)
+        return AuthScope(user_id=user_id, roles=roles, authenticated=True)
 
 
 def load_identity_resolver(

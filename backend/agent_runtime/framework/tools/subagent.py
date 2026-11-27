@@ -1,20 +1,20 @@
-"""Agent as Tool: read-only Sub-Agent runner reusing the unified ToolGateway.
+"""Agent as Tool: lightweight read-only Sub-Agent runner reusing the unified ToolGateway.
 
-Follows the refactored `agent-multi-agent-collaboration.html` design:
-  - Sub-agents run inside an isolated private `messages[]` window.
-  - `max_depth = 1` prevents recursive sub-agent spawning.
-  - Permissions are monotonically narrowed (`allow_write=False`, role allowlist).
-  - Return value flows directly through `ToolGateway`'s truncation & `ref_id` spill.
-  - Progress events stream out-of-band via `ctx.emit("subagent_status", ...)`.
+Kept intentionally outside LangGraph's checkpointer so ephemeral read-only sub-agents
+never bloat checkpoint storage while sharing the core `filter_visible_tools` and
+`invoke_model_step` helpers.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-import inspect
+import asyncio
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from agent_runtime.framework.core.contracts import ExecutionContext, Message, RiskLevel
+from agent_runtime.framework.core.model_step import filter_visible_tools, invoke_model_step
+
+_SUBAGENT_FINAL_NOTICE = "\n\n[运行时提示：子任务已达步数上限，请禁止再调用工具，直接汇总已有结论。]"
 
 
 @dataclass(frozen=True)
@@ -79,63 +79,23 @@ async def run_readonly_subagent(
         final_answer = ""
 
         for step_idx in range(profile.max_steps):
-            raw_specs = tool_gateway.registry.visible_specs(
-                sub_ctx.auth_scope, include_subagents=False
+            if sub_ctx.check_cancelled():
+                raise asyncio.CancelledError("Sub-agent cancelled by user")
+            visible_specs = await filter_visible_tools(
+                tool_gateway.registry,
+                sub_ctx,
+                access_controller=getattr(tool_gateway, "access_controller", None),
+                include_subagents=False,
             )
-            ac = getattr(tool_gateway, "access_controller", None)
-            if ac is not None and raw_specs:
-                from agent_runtime.framework.core.security import (
-                    AuthorizationError,
-                    ResourceRef,
-                    enforce_check,
-                )
-
-                visible_specs = []
-                for sp in raw_specs:
-                    try:
-                        await enforce_check(
-                            ac,
-                            sub_ctx.auth_scope,
-                            "tool:list",
-                            ResourceRef(
-                                kind="tool",
-                                id=sp.name,
-                                tenant_id=sub_ctx.auth_scope.tenant_id,
-                                attrs={"risk_level": sp.risk_level.value, "is_subagent": False},
-                            ),
-                        )
-                        visible_specs.append(sp)
-                    except AuthorizationError:
-                        continue
-            else:
-                visible_specs = raw_specs
             is_final_step = step_idx >= profile.max_steps - 1
-            call_msgs = list(private_msgs)
-            if is_final_step:
-                notice = "\n\n[运行时提示：子任务已达步数上限，请禁止再调用工具，直接汇总已有结论。]"
-                if call_msgs and call_msgs[-1].role == "tool":
-                    call_msgs[-1] = replace(call_msgs[-1], content=(call_msgs[-1].content or "") + notice)
-                else:
-                    call_msgs.append(Message(role="user", content=notice.strip()))
-                gen_sig = inspect.signature(model_client.generate)
-                supports_tc = "tool_choice" in gen_sig.parameters or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in gen_sig.parameters.values()
-                )
-                if supports_tc:
-                    resp = await model_client.generate(
-                        messages=call_msgs,
-                        tool_specs=visible_specs,
-                        ctx=sub_ctx,
-                        tool_choice="none",
-                    )
-                else:
-                    resp = await model_client.generate(messages=call_msgs, tool_specs=[], ctx=sub_ctx)
-            else:
-                resp = await model_client.generate(
-                    messages=call_msgs,
-                    tool_specs=visible_specs,
-                    ctx=sub_ctx,
-                )
+            resp = await invoke_model_step(
+                model=model_client,
+                messages=private_msgs,
+                tool_specs=visible_specs,
+                ctx=sub_ctx,
+                is_final_step=is_final_step,
+                convergence_notice=_SUBAGENT_FINAL_NOTICE,
+            )
             private_msgs.append(resp)
 
             if not resp.tool_calls or is_final_step:

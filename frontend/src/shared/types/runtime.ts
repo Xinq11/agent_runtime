@@ -1,11 +1,9 @@
 export interface IdentityProfile {
-  tenantId: string;
   userId: string;
   roles: string[];
 }
 
 export const DEFAULT_IDENTITY: IdentityProfile = {
-  tenantId: "t_acme",
   userId: "u_alice",
   roles: ["employee", "exec"],
 };
@@ -28,9 +26,9 @@ export interface ThreadSummary {
 
 export interface ApprovalTicket {
   review_id: string;
-  tenant_id: string;
   thread_id: string;
   actor_id: string;
+  run_id?: string;
   op_key: string;
   tool_name: string;
   args_hash: string;
@@ -127,6 +125,7 @@ export interface ContextBudgetSnapshot {
 }
 
 export interface RuntimeStateSnapshot {
+  thread_id?: string;
   trace_id: string | null;
   recent_traces: string[];
   spans: SpanRecord[];
@@ -139,7 +138,6 @@ export interface RuntimeStateSnapshot {
   tool_runs: Array<Record<string, unknown>>;
   tool_outputs: Array<{
     ref_id: string;
-    tenant_id: string;
     thread_id?: string;
     resource_owner?: string;
     tool_name: string;
@@ -149,24 +147,10 @@ export interface RuntimeStateSnapshot {
     expires_at?: string;
   }>;
   workspace_files?: WorkspaceFileSummary[];
-  knowledge_chunks: Array<{
-    chunk_id: string;
-    parent_id?: string;
-    tenant_id: string;
-    doc_title: string;
-    section_path: string;
-    acl_roles: string[];
-    doc_url: string;
-    oss_key?: string | null;
-    snippet?: string;
-    chunk_count?: number;
-    status?: "active" | "disabled";
-  }>;
   loki_logs: Array<Record<string, unknown>>;
 }
 
 export interface SkillSummary {
-  tenant_id?: string;
   slug: string;
   version_id?: string;
   version_num: number;
@@ -223,7 +207,6 @@ export interface OpsOverview {
   knowledge_chunks: Array<{
     chunk_id: string;
     parent_id?: string;
-    tenant_id: string;
     doc_title: string;
     section_path: string;
     acl_roles: string[];

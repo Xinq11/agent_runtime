@@ -1,4 +1,4 @@
-"""PostgreSQL repository mixin for threads, session messages, traces, and summaries."""
+"""PostgreSQL repository mixin for threads, messages, traces, summaries, feedback, and thread state."""
 
 from __future__ import annotations
 
@@ -11,29 +11,41 @@ from agent_runtime.framework.core.contracts import AuthScope, Message, ToolCall
 
 
 class PgSessionsMixin:
-    """Thread metadata, message history, trace records, and compaction summary persistence."""
+    """Thread metadata, message history, trace records, compaction summaries, and core state."""
 
     def own_thread(self, scope: AuthScope, tid: str) -> Dict[str, Any]:
         rows = self.rows(
-            "SELECT * FROM agent_threads WHERE thread_id=%s AND tenant_id=%s AND actor_id=%s",
-            (tid, scope.tenant_id, scope.user_id),
+            "SELECT * FROM agent_threads WHERE thread_id=%s AND actor_id=%s",
+            (tid, scope.user_id),
         )
         if not rows:
             raise LookupError("对话不存在")
         return rows[0]
 
+    def resolve_trace_thread(self, scope: AuthScope, trace_id: str) -> str:
+        """Return the thread_id for `trace_id` iff the owning thread belongs to `scope.user_id`."""
+        rows = self.rows(
+            """SELECT rt.thread_id
+               FROM runtime_traces rt
+               JOIN agent_threads t ON t.thread_id = rt.thread_id
+               WHERE rt.trace_id=%s AND t.actor_id=%s""",
+            (trace_id, scope.user_id),
+        )
+        if not rows:
+            raise LookupError("轨迹不存在")
+        return str(rows[0]["thread_id"])
+
     def create_thread(self, scope: AuthScope, tid: str, title: str) -> Dict[str, Any]:
         with self.transaction() as cur:
             cur.execute(
-                """INSERT INTO agent_threads(thread_id,tenant_id,actor_id,title)
-                   VALUES (%s,%s,%s,%s)
+                """INSERT INTO agent_threads(thread_id,actor_id,title)
+                   VALUES (%s,%s,%s)
                    ON CONFLICT(thread_id) DO UPDATE
                    SET title = EXCLUDED.title
-                   WHERE agent_threads.tenant_id = EXCLUDED.tenant_id
-                     AND agent_threads.actor_id = EXCLUDED.actor_id
+                   WHERE agent_threads.actor_id = EXCLUDED.actor_id
                      AND agent_threads.title = '新对话'
                      AND EXCLUDED.title <> '新对话'""",
-                (tid, scope.tenant_id, scope.user_id, title),
+                (tid, scope.user_id, title),
             )
         return self.own_thread(scope, tid)
 
@@ -43,12 +55,12 @@ class PgSessionsMixin:
             SELECT t.thread_id, t.title, t.created_at,
                    (SELECT count(*) FROM session_messages m WHERE m.thread_id=t.thread_id) AS message_count
             FROM agent_threads t
-            WHERE t.tenant_id=%s AND t.actor_id=%s
+            WHERE t.actor_id=%s
               AND EXISTS (SELECT 1 FROM session_messages m WHERE m.thread_id=t.thread_id)
             ORDER BY t.created_at DESC
             LIMIT %s
             """,
-            (scope.tenant_id, scope.user_id, limit),
+            (scope.user_id, limit),
         )
 
     def record_turn_start(self, thread_id: str, trace_id: str, user_text: str) -> None:
@@ -164,19 +176,30 @@ class PgSessionsMixin:
                    ON CONFLICT (thread_id) DO UPDATE
                    SET summary_text=EXCLUDED.summary_text, covered_up_to_msg_id=EXCLUDED.covered_up_to_msg_id
                    WHERE session_summaries.covered_up_to_msg_id <= EXCLUDED.covered_up_to_msg_id""",
-                (thread_id, summary_text, covered_up_to_msg_id, thread_id, covered_up_to_msg_id,
-                 expected_cursor, thread_id, expected_cursor),
+                (
+                    thread_id,
+                    summary_text,
+                    covered_up_to_msg_id,
+                    thread_id,
+                    covered_up_to_msg_id,
+                    expected_cursor,
+                    thread_id,
+                    expected_cursor,
+                ),
             )
 
     def delete_thread(self, scope: AuthScope, thread_id: str) -> bool:
         """Delete a thread and all dependent messages, traces, spans, runs, approvals, and artifacts."""
         with self.transaction() as cur:
             cur.execute(
-                "SELECT 1 FROM agent_threads WHERE thread_id=%s AND tenant_id=%s AND actor_id=%s FOR UPDATE",
-                (thread_id, scope.tenant_id, scope.user_id),
+                "SELECT 1 FROM agent_threads WHERE thread_id=%s AND actor_id=%s FOR UPDATE",
+                (thread_id, scope.user_id),
             )
             if not cur.fetchone():
                 return False
+
+            cur.execute("SELECT run_id FROM agent_runs WHERE thread_id=%s", (thread_id,))
+            checkpoint_keys = [thread_id, *(r[0] for r in cur.fetchall() if r[0])]
 
             cur.execute(
                 "DELETE FROM agent_spans WHERE trace_id IN (SELECT trace_id FROM runtime_traces WHERE thread_id=%s)",
@@ -184,38 +207,109 @@ class PgSessionsMixin:
             )
             cur.execute(
                 """DELETE FROM tool_runs r
-                   WHERE r.tenant_id=%s AND (
-                       EXISTS (SELECT 1 FROM tool_approvals a WHERE a.tenant_id=r.tenant_id AND a.op_key=r.op_key AND a.thread_id=%s)
-                       OR EXISTS (SELECT 1 FROM tool_outputs o WHERE o.tenant_id=r.tenant_id AND o.ref_id=r.result_ref AND o.thread_id=%s)
-                   )""",
-                (scope.tenant_id, thread_id, thread_id),
+                   WHERE EXISTS (SELECT 1 FROM tool_approvals a WHERE a.op_key=r.op_key AND a.thread_id=%s)
+                      OR EXISTS (SELECT 1 FROM tool_outputs o WHERE o.ref_id=r.result_ref AND o.thread_id=%s)""",
+                (thread_id, thread_id),
             )
-            cur.execute("DELETE FROM tool_outputs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
-            cur.execute("DELETE FROM tool_approvals WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
-            cur.execute("DELETE FROM agent_runs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
+            cur.execute("DELETE FROM tool_outputs WHERE thread_id=%s", (thread_id,))
+            cur.execute("DELETE FROM tool_approvals WHERE thread_id=%s", (thread_id,))
+            cur.execute("DELETE FROM agent_runs WHERE thread_id=%s", (thread_id,))
             cur.execute(
-                "SELECT oss_key, extracted_oss_key FROM workspace_files WHERE tenant_id=%s AND thread_id=%s",
-                (scope.tenant_id, thread_id),
+                "SELECT oss_key, extracted_oss_key FROM workspace_files WHERE thread_id=%s",
+                (thread_id,),
             )
             ws_keys = {k for row in cur.fetchall() for k in row if k}
-            cur.execute("DELETE FROM workspace_files WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
+            cur.execute("DELETE FROM workspace_files WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM message_feedback WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM runtime_traces WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM session_summaries WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM session_messages WHERE thread_id=%s", (thread_id,))
             for tbl in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
-                cur.execute(f"SELECT to_regclass(%s)", (tbl,))
+                cur.execute("SELECT to_regclass(%s)", (tbl,))
                 if cur.fetchone()[0]:
-                    cur.execute(f"DELETE FROM {tbl} WHERE thread_id=%s", (thread_id,))
+                    cur.execute(f"DELETE FROM {tbl} WHERE thread_id = ANY(%s)", (checkpoint_keys,))
             cur.execute(
-                "DELETE FROM agent_threads WHERE thread_id=%s AND tenant_id=%s AND actor_id=%s",
-                (thread_id, scope.tenant_id, scope.user_id),
+                "DELETE FROM agent_threads WHERE thread_id=%s AND actor_id=%s",
+                (thread_id, scope.user_id),
             )
             oss = getattr(self, "oss", None)
             if oss is not None and hasattr(oss, "delete_object"):
                 for k in ws_keys:
                     oss.delete_object(k)
             return True
+
+    def get_thread_state_snapshot(
+        self,
+        scope: AuthScope,
+        thread_id: str = "",
+        trace_id: str = "",
+    ) -> Dict[str, Any]:
+        """Core execution state snapshot for a caller-owned thread/trace (ZERO RAG/Skills queries)."""
+        resolved_tid = (thread_id or "").strip()
+        clean_trace = (trace_id or "").strip()
+
+        if clean_trace:
+            trace_tid = self.resolve_trace_thread(scope, clean_trace)
+            if resolved_tid and resolved_tid != trace_tid:
+                raise LookupError("轨迹不存在")
+            resolved_tid = trace_tid
+        elif resolved_tid:
+            owner = self.rows("SELECT actor_id FROM agent_threads WHERE thread_id=%s", (resolved_tid,))
+            if owner and owner[0]["actor_id"] != scope.user_id:
+                raise LookupError("对话不存在")
+
+        if not resolved_tid:
+            return {
+                "thread_id": "",
+                "trace_id": None,
+                "recent_traces": [],
+                "spans": [],
+                "summary": {"covered_up_to_msg_id": 0, "text": ""},
+                "approvals": [],
+                "tool_runs": [],
+                "tool_outputs": [],
+                "workspace_files": [],
+            }
+
+        traces = self.rows(
+            "SELECT trace_id FROM runtime_traces WHERE thread_id=%s ORDER BY created_at DESC LIMIT 20",
+            (resolved_tid,),
+        )
+        recent = [r["trace_id"] for r in traces]
+        target = clean_trace or next(iter(recent), None)
+        summary, cursor = self.get_summary(resolved_tid)
+        args = (scope.user_id, resolved_tid)
+        approvals = self.rows(
+            """SELECT review_id,thread_id,actor_id,run_id,op_key,tool_name,args_hash,policy_rev,
+               summary,EXTRACT(EPOCH FROM expires_at)::float8 AS expires_at,decision,approver_id,
+               EXTRACT(EPOCH FROM consumed_at)::float8 AS consumed_at FROM tool_approvals
+               WHERE actor_id=%s AND thread_id=%s ORDER BY expires_at DESC LIMIT 50""",
+            args,
+        )
+        runs = self.rows(
+            """SELECT r.* FROM tool_runs r WHERE actor_id=%s AND EXISTS
+               (SELECT 1 FROM tool_approvals a WHERE a.op_key=r.op_key
+                AND a.thread_id=%s) ORDER BY lease_until DESC LIMIT 50""",
+            args,
+        )
+        outputs = self.rows(
+            """SELECT ref_id,resource_owner,tool_name,total_chars,oss_key,left(preview,200) AS preview
+               FROM tool_outputs WHERE resource_owner=%s AND thread_id=%s
+               AND expires_at>now() ORDER BY expires_at DESC LIMIT 50""",
+            args,
+        )
+        workspace_files = [asdict(f) for f in self.list_workspace_files(resolved_tid)]
+        return {
+            "thread_id": resolved_tid,
+            "trace_id": target,
+            "recent_traces": recent,
+            "spans": [asdict(s) for s in self.list_spans(target)] if target else [],
+            "summary": {"covered_up_to_msg_id": cursor, "text": summary},
+            "approvals": approvals,
+            "tool_runs": runs,
+            "tool_outputs": outputs,
+            "workspace_files": workspace_files,
+        }
 
     def save_message_feedback(
         self,
@@ -228,7 +322,7 @@ class PgSessionsMixin:
         msg_id: Optional[int] = None,
         answer_excerpt: str = "",
     ) -> Dict[str, Any]:
-        """Persist or update a user's feedback (e.g. dislike) on an assistant reply."""
+        """Persist or update a user's feedback on an assistant reply."""
         self.own_thread(scope, thread_id)
         clean_reason = (reason or "").strip()[:500]
         clean_excerpt = (answer_excerpt or "").strip()[:400]
@@ -260,9 +354,9 @@ class PgSessionsMixin:
             fid = uid("fb")
             cur.execute(
                 """INSERT INTO message_feedback
-                   (feedback_id, tenant_id, thread_id, actor_id, trace_id, msg_id, rating, reason, answer_excerpt)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (tenant_id, thread_id, actor_id, trace_id) DO UPDATE
+                   (feedback_id, thread_id, actor_id, trace_id, msg_id, rating, reason, answer_excerpt)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (thread_id, actor_id, trace_id) DO UPDATE
                    SET rating=EXCLUDED.rating,
                        reason=EXCLUDED.reason,
                        msg_id=COALESCE(EXCLUDED.msg_id, message_feedback.msg_id),
@@ -271,11 +365,10 @@ class PgSessionsMixin:
                            ELSE message_feedback.answer_excerpt
                        END,
                        updated_at=now()
-                   RETURNING feedback_id, tenant_id, thread_id, actor_id, trace_id, msg_id,
+                   RETURNING feedback_id, thread_id, actor_id, trace_id, msg_id,
                              rating, reason, answer_excerpt, created_at, updated_at""",
                 (
                     fid,
-                    scope.tenant_id,
                     thread_id,
                     scope.user_id,
                     trace_id,
@@ -294,8 +387,8 @@ class PgSessionsMixin:
         with self.transaction() as cur:
             cur.execute(
                 """DELETE FROM message_feedback
-                   WHERE tenant_id=%s AND thread_id=%s AND actor_id=%s AND trace_id=%s""",
-                (scope.tenant_id, thread_id, scope.user_id, trace_id),
+                   WHERE thread_id=%s AND actor_id=%s AND trace_id=%s""",
+                (thread_id, scope.user_id, trace_id),
             )
             return cur.rowcount > 0
 
@@ -306,7 +399,7 @@ class PgSessionsMixin:
             """SELECT feedback_id, thread_id, trace_id, msg_id, rating, reason,
                       answer_excerpt, created_at, updated_at
                FROM message_feedback
-               WHERE tenant_id=%s AND thread_id=%s AND actor_id=%s
+               WHERE thread_id=%s AND actor_id=%s
                ORDER BY created_at DESC""",
-            (scope.tenant_id, thread_id, scope.user_id),
+            (thread_id, scope.user_id),
         )

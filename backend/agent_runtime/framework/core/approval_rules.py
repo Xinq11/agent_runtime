@@ -12,7 +12,6 @@ def make_tool_run_record(
     ctx: ExecutionContext, op_key: str, tool_name: str, args_hash: str
 ) -> ToolRunRecord:
     return ToolRunRecord(
-        ctx.auth_scope.tenant_id,
         op_key,
         ctx.auth_scope.user_id,
         tool_name,
@@ -28,7 +27,6 @@ def validate_approval_ticket(
     run: ToolRunRecord,
 ) -> Optional[str]:
     if not ticket or (
-        ticket.tenant_id,
         ticket.actor_id,
         ticket.thread_id,
         ticket.op_key,
@@ -36,7 +34,6 @@ def validate_approval_ticket(
         ticket.args_hash,
         ticket.policy_rev,
     ) != (
-        run.tenant_id,
         run.actor_id,
         ctx.thread_id,
         run.op_key,

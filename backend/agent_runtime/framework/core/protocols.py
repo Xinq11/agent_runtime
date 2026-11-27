@@ -1,19 +1,19 @@
-"""Public extension protocols for the `agent_runtime` SDK.
+"""Public core extension protocols for the `agent_runtime` SDK.
 
 Downstream teams implement these stable protocols (or subclass `AgentPlugin` /
 `AgentMiddleware`) without modifying framework internals.
+Zero RAG, Skills, or FastAPI hard dependencies live in this module.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from agent_runtime.framework.core.contracts import (
     AuthScope,
     ExecutionContext,
     Message,
-    RetrievalResult,
     ToolCall,
     ToolResult,
 )
@@ -37,7 +37,7 @@ class AppMetadata:
     plugin_name: str = "core"
     welcome_title: str = "今天想处理哪项任务？"
     welcome_description: str = (
-        "通用 Agent Runtime 底座：支持流式对话与随时中止、云原生文件读写、上下文预算压缩、高危审批恢复、RAG 知识检索、Skills 与全链路 Trace 观测。"
+        "通用 Agent Runtime 底座：支持流式对话与随时中止、云原生文件读写、上下文预算压缩、子 Agent 委派、高危审批恢复与全链路 Trace 观测。"
     )
     quick_prompts: Tuple[QuickPromptSpec, ...] = ()
 
@@ -66,20 +66,6 @@ class LLMProvider(Protocol):
         tool_specs: Sequence[Any],
         ctx: ExecutionContext,
     ) -> Message: ...
-
-
-@runtime_checkable
-class RAGStrategy(Protocol):
-    """Protocol for pluggable custom RAG strategies (built-in 7-stage RAG, Milvus, ES, Dify, etc.)."""
-
-    async def retrieve(
-        self,
-        *,
-        scope: AuthScope,
-        query: str,
-        top_k: int = 4,
-        ctx: Optional[ExecutionContext] = None,
-    ) -> RetrievalResult: ...
 
 
 class AgentMiddleware:
@@ -126,8 +112,9 @@ class AgentMiddleware:
 class AgentPlugin:
     """Base class for modular extensions & customer delivery packs.
 
-    Plugins can contribute tools, read-only sub-agents, middlewares, prompt segments,
-    seed documents/skills, and Studio metadata without touching core internals.
+    Plugins contribute tools, declarative read-only sub-agents (`subagents()`),
+    middlewares, prompt segments, optional HTTP routers (`routers()`),
+    storage bootstrapping, and UI metadata without touching core internals.
     """
 
     name: str = "custom"
@@ -147,7 +134,15 @@ class AgentPlugin:
     ) -> None:
         return None
 
+    def subagents(self) -> Sequence[Any]:
+        """Return `SubAgentProfile` declarations auto-wired by `AgentRuntimeApp`."""
+        return ()
+
     def middlewares(self) -> Sequence[AgentMiddleware]:
+        return ()
+
+    def routers(self) -> Sequence[Any]:
+        """Optionally return FastAPI `APIRouter` instances mounted when running the HTTP server."""
         return ()
 
     def bootstrap_store(self, store: Any) -> None:
