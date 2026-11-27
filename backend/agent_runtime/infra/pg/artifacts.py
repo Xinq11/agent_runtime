@@ -89,22 +89,78 @@ class PgArtifactsMixin:
         content_type: str = "text/plain; charset=utf-8",
     ) -> WorkspaceFileRecord:
         raw = content.encode("utf-8")
-        digest = hashlib.sha256(raw).hexdigest()
-        # Unique immutable OSS object key so concurrent writes never overwrite each other
+        return self.write_workspace_binary(
+            tenant_id,
+            thread_id,
+            logical_path,
+            raw,
+            extracted_text=content,
+            is_binary=False,
+            actor_id=actor_id,
+            content_type=content_type,
+        )
+
+    def write_workspace_binary(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        logical_path: str,
+        raw_bytes: bytes,
+        *,
+        extracted_text: str,
+        is_binary: bool,
+        actor_id: str,
+        content_type: str = "application/octet-stream",
+        max_files_per_thread: int = 50,
+    ) -> WorkspaceFileRecord:
+        digest = hashlib.sha256(raw_bytes).hexdigest()
         oss_key = f"workspaces/{tenant_id}/{thread_id}/{uid('wf')}/{logical_path}"
-        self.oss.put_text(oss_key, content, content_type=content_type)
+        self.oss.put_bytes(oss_key, raw_bytes, content_type=content_type)
+        if is_binary:
+            extracted_oss_key = f"{oss_key}.extracted.txt"
+            self.oss.put_text(extracted_oss_key, extracted_text, content_type="text/plain; charset=utf-8")
+        else:
+            extracted_oss_key = oss_key
+        extracted_chars = len(extracted_text)
         with self.transaction() as cur:
             cur.execute(
+                """SELECT 1 FROM workspace_files
+                   WHERE tenant_id=%s AND thread_id=%s AND logical_path=%s""",
+                (tenant_id, thread_id, logical_path),
+            )
+            exists = cur.fetchone() is not None
+            if not exists:
+                cur.execute(
+                    "SELECT count(*) FROM workspace_files WHERE tenant_id=%s AND thread_id=%s",
+                    (tenant_id, thread_id),
+                )
+                if int(cur.fetchone()[0]) >= max_files_per_thread:
+                    raise ValueError(f"单会话工作区文件数已达上限（{max_files_per_thread} 个）")
+            cur.execute(
                 """INSERT INTO workspace_files
-                   (tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,content_type,updated_by,updated_at)
-                   VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,now())
+                   (tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,
+                    content_type,updated_by,extracted_oss_key,extracted_chars,updated_at)
+                   VALUES (%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,now())
                    ON CONFLICT (tenant_id,thread_id,logical_path) DO UPDATE SET
                    version=workspace_files.version + 1, oss_key=EXCLUDED.oss_key,
                    sha256=EXCLUDED.sha256, size_bytes=EXCLUDED.size_bytes,
                    content_type=EXCLUDED.content_type, updated_by=EXCLUDED.updated_by,
+                   extracted_oss_key=EXCLUDED.extracted_oss_key,
+                   extracted_chars=EXCLUDED.extracted_chars,
                    updated_at=now()
                    RETURNING version""",
-                (tenant_id, thread_id, logical_path, oss_key, digest, len(raw), content_type, actor_id),
+                (
+                    tenant_id,
+                    thread_id,
+                    logical_path,
+                    oss_key,
+                    digest,
+                    len(raw_bytes),
+                    content_type,
+                    actor_id,
+                    extracted_oss_key,
+                    extracted_chars,
+                ),
             )
             version = int(cur.fetchone()[0])
         return WorkspaceFileRecord(
@@ -114,27 +170,46 @@ class PgArtifactsMixin:
             version=version,
             oss_key=oss_key,
             sha256=digest,
-            size_bytes=len(raw),
+            size_bytes=len(raw_bytes),
             content_type=content_type,
             updated_by=actor_id,
+            extracted_oss_key=extracted_oss_key,
+            extracted_chars=extracted_chars,
         )
 
     def read_workspace_file(
         self, tenant_id: str, thread_id: str, logical_path: str
     ) -> Tuple[Optional[str], Optional[WorkspaceFileRecord], Optional[str]]:
         rows = self.rows(
-            """SELECT tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,content_type,updated_by
+            """SELECT tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,
+                      content_type,updated_by,extracted_oss_key,extracted_chars
                FROM workspace_files WHERE tenant_id=%s AND thread_id=%s AND logical_path=%s""",
             (tenant_id, thread_id, logical_path),
         )
         if not rows:
             return None, None, "file_not_found"
         rec = WorkspaceFileRecord(**rows[0])
-        return self.oss.get_text(rec.oss_key), rec, None
+        text_key = rec.extracted_oss_key or rec.oss_key
+        return self.oss.get_text(text_key), rec, None
+
+    def read_workspace_bytes(
+        self, tenant_id: str, thread_id: str, logical_path: str
+    ) -> Tuple[Optional[bytes], Optional[WorkspaceFileRecord], Optional[str]]:
+        rows = self.rows(
+            """SELECT tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,
+                      content_type,updated_by,extracted_oss_key,extracted_chars
+               FROM workspace_files WHERE tenant_id=%s AND thread_id=%s AND logical_path=%s""",
+            (tenant_id, thread_id, logical_path),
+        )
+        if not rows:
+            return None, None, "file_not_found"
+        rec = WorkspaceFileRecord(**rows[0])
+        return self.oss.get_bytes(rec.oss_key), rec, None
 
     def list_workspace_files(self, tenant_id: str, thread_id: str) -> List[WorkspaceFileRecord]:
         rows = self.rows(
-            """SELECT tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,content_type,updated_by
+            """SELECT tenant_id,thread_id,logical_path,version,oss_key,sha256,size_bytes,
+                      content_type,updated_by,extracted_oss_key,extracted_chars
                FROM workspace_files WHERE tenant_id=%s AND thread_id=%s ORDER BY logical_path""",
             (tenant_id, thread_id),
         )

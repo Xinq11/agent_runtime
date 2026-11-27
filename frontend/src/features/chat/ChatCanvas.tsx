@@ -1,11 +1,44 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Activity, Check, Copy, Layers, ThumbsDown, ThumbsUp, X } from "lucide-react";
+import { Activity, Check, Copy, Download, FileText, Layers, ThumbsDown, ThumbsUp, X } from "lucide-react";
 import { MarkdownContent } from "../../shared/components/MarkdownContent";
-import { AppMeta, ApprovalTicket, ChatTurnItem, ModelConfig } from "../../shared/types/runtime";
+import {
+  AppMeta,
+  ApprovalTicket,
+  ChatTurnItem,
+  ModelConfig,
+  WorkspaceFileSummary,
+} from "../../shared/types/runtime";
 import type { InspectorTab } from "../trace/TraceDrawer";
 import { ActivityAccordion } from "./ActivityAccordion";
 import { ApprovalCard } from "./ApprovalCard";
 import { Composer } from "./Composer";
+
+const ATTACHMENT_LINE_RE = /\[已上传工作区附件:\s*([^\]]+)\]/g;
+
+function parseUserMessageAttachments(content: string): {
+  text: string;
+  attachments: string[];
+} {
+  const attachments: string[] = [];
+  const text = content
+    .replace(ATTACHMENT_LINE_RE, (_m, raw: string) => {
+      raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .forEach((p) => attachments.push(p));
+      return "";
+    })
+    .trim();
+  return { text, attachments };
+}
+
+function fileExtBadge(path: string): string {
+  const name = path.split("/").pop() || path;
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0 || dot === name.length - 1) return "FILE";
+  return name.slice(dot + 1).toUpperCase().slice(0, 6);
+}
 
 async function copyTextToClipboard(text: string): Promise<void> {
   if (navigator.clipboard && window.isSecureContext) {
@@ -34,6 +67,8 @@ interface ChatCanvasProps {
   onOpenInspector: (tab: InspectorTab) => void;
   onSend: (text: string) => void;
   onAbort?: () => void;
+  onUploadFile: (file: File) => Promise<WorkspaceFileSummary>;
+  onDownloadFile: (path: string) => Promise<void>;
   onApprovalDecision: (itemId: string, ticket: ApprovalTicket, approved: boolean) => void;
   onSetFeedback: (
     itemId: string,
@@ -54,6 +89,8 @@ export const ChatCanvas: React.FC<ChatCanvasProps> = ({
   onOpenInspector,
   onSend,
   onAbort,
+  onUploadFile,
+  onDownloadFile,
   onApprovalDecision,
   onSetFeedback,
   onInspectTrace,
@@ -192,17 +229,64 @@ export const ChatCanvas: React.FC<ChatCanvasProps> = ({
           ) : (
             items.map((item, idx) => {
               if (item.role === "user") {
+                const { text, attachments } = parseUserMessageAttachments(item.content);
                 return (
                   <div key={item.id} className="flex justify-end">
-                    <div
-                      className="max-w-[82%] px-4 py-2.5 rounded-2xl text-[14px] leading-relaxed whitespace-pre-wrap"
-                      style={{
-                        background: "var(--surface-subtle)",
-                        border: "1px solid var(--border)",
-                        color: "var(--ink)",
-                      }}
-                    >
-                      {item.content}
+                    <div className="max-w-[82%] flex flex-col items-end gap-1.5">
+                      {attachments.length > 0 && (
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          {attachments.map((fp) => {
+                            const name = fp.split("/").pop() || fp;
+                            const ext = fileExtBadge(fp);
+                            return (
+                              <button
+                                key={fp}
+                                type="button"
+                                onClick={() => onDownloadFile(fp)}
+                                title={`下载 ${fp}`}
+                                className="interactive-btn inline-flex items-center gap-2 px-3 py-2 rounded-xl border text-left"
+                                style={{
+                                  background: "var(--surface)",
+                                  borderColor: "var(--border-strong)",
+                                  color: "var(--ink)",
+                                }}
+                              >
+                                <div
+                                  className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0"
+                                  style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                                >
+                                  <FileText size={14} />
+                                </div>
+                                <div className="min-w-0">
+                                  <div className="text-[12.5px] font-medium max-w-[200px] truncate leading-tight">
+                                    {name}
+                                  </div>
+                                  <div
+                                    className="font-mono text-[10px] mt-0.5 flex items-center gap-1"
+                                    style={{ color: "var(--ink-muted)" }}
+                                  >
+                                    <span>{ext}</span>
+                                    <span>·</span>
+                                    <span>点击下载</span>
+                                  </div>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {text && (
+                        <div
+                          className="px-4 py-2.5 rounded-2xl text-[14px] leading-relaxed whitespace-pre-wrap"
+                          style={{
+                            background: "var(--surface-subtle)",
+                            border: "1px solid var(--border)",
+                            color: "var(--ink)",
+                          }}
+                        >
+                          {text}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -235,6 +319,52 @@ export const ChatCanvas: React.FC<ChatCanvasProps> = ({
                       <MarkdownContent content={item.content} />
                     </div>
                   )}
+
+                  {!isStreamingCurrent &&
+                    (() => {
+                      const writtenPaths = Array.from(
+                        new Set(
+                          (item.activities || [])
+                            .filter(
+                              (a) =>
+                                a.name === "write" &&
+                                a.phase === "done" &&
+                                a.args &&
+                                typeof a.args.path === "string" &&
+                                a.args.path.trim()
+                            )
+                            .map((a) => String(a.args!.path).trim())
+                        )
+                      );
+                      if (!writtenPaths.length) return null;
+                      return (
+                        <div className="flex flex-wrap gap-2 pt-0.5">
+                          {writtenPaths.map((fp) => (
+                            <button
+                              key={fp}
+                              type="button"
+                              onClick={() => onDownloadFile(fp)}
+                              className="interactive-btn inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-[12px]"
+                              style={{
+                                background: "var(--surface)",
+                                borderColor: "var(--border-strong)",
+                                color: "var(--ink)",
+                              }}
+                            >
+                              <FileText size={13} style={{ color: "var(--accent)" }} />
+                              <span className="font-mono">{fp}</span>
+                              <span
+                                className="inline-flex items-center gap-1 text-[11px] font-medium"
+                                style={{ color: "var(--accent)" }}
+                              >
+                                <Download size={12} />
+                                下载
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
 
                   {showActions && (
                     <div className="pt-0.5 space-y-2">
@@ -365,6 +495,7 @@ export const ChatCanvas: React.FC<ChatCanvasProps> = ({
         modelConfig={modelConfig}
         onSend={onSend}
         onAbort={onAbort}
+        onUploadFile={onUploadFile}
       />
     </main>
   );

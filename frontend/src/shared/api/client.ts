@@ -6,6 +6,7 @@ import {
   RuntimeStateSnapshot,
   SkillSummary,
   ThreadSummary,
+  WorkspaceFileSummary,
 } from "../types/runtime";
 
 const API_BASE = "/api/v1";
@@ -122,6 +123,60 @@ export async function cancelMessageFeedback(
     throw new Error(err || "取消反馈失败");
   }
   return res.json();
+}
+
+export async function uploadThreadFile(
+  threadId: string,
+  file: File
+): Promise<WorkspaceFileSummary> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/files`, {
+    method: "POST",
+    headers: identityHeaders(),
+    body: form,
+  });
+  if (!res.ok) {
+    let msg = "上传附件失败";
+    try {
+      const data = await res.json();
+      if (data?.detail) msg = String(data.detail);
+    } catch {
+      const text = await res.text().catch(() => "");
+      if (text) msg = text;
+    }
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  return data.file as WorkspaceFileSummary;
+}
+
+export async function downloadThreadFile(threadId: string, path: string): Promise<void> {
+  const qs = new URLSearchParams({ path });
+  const res = await fetch(
+    `${API_BASE}/threads/${encodeURIComponent(threadId)}/files/download?${qs.toString()}`,
+    { headers: identityHeaders() }
+  );
+  if (!res.ok) {
+    let msg = "下载文件失败";
+    try {
+      const data = await res.json();
+      if (data?.detail) msg = String(data.detail);
+    } catch {
+      // ignore
+    }
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const filename = path.split("/").pop() || "download";
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  window.setTimeout(() => window.URL.revokeObjectURL(url), 1000);
 }
 
 export async function fetchRuntimeState(

@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 from dataclasses import asdict
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 
-from agent_runtime.api.deps import caller_scope
+from agent_runtime.api.deps import caller_scope, caller_scope_async
 from agent_runtime.api.schemas import CreateThreadRequest, MessageFeedbackRequest
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.runs import RunNotFoundError
+from agent_runtime.framework.tools.builtins import normalize_logical_path
+from agent_runtime.infra.documents import (
+    MAX_ATTACHMENT_BYTES,
+    MAX_FILES_PER_THREAD,
+    DocumentValidationError,
+    build_content_disposition,
+    parse_uploaded_document,
+    safe_download_content_type,
+)
 
 router = APIRouter(tags=["Conversation & Runs"])
 
@@ -113,3 +124,107 @@ def delete_thread(thread_id: str, req: Request):
     if not ok:
         raise HTTPException(404, "对话不存在")
     return {"ok": True, "thread_id": thread_id}
+
+
+def _public_workspace_file(rec) -> dict:
+    return {
+        "path": rec.logical_path,
+        "logical_path": rec.logical_path,
+        "version": rec.version,
+        "size_bytes": rec.size_bytes,
+        "content_type": rec.content_type,
+        "extracted_chars": rec.extracted_chars,
+        "updated_by": rec.updated_by,
+    }
+
+
+@router.get("/threads/{thread_id}/files", summary="列出当前会话工作区文件（含上传附件与生成报告）")
+def list_thread_files(thread_id: str, req: Request):
+    scope = caller_scope(req)
+    try:
+        req.app.state.store.own_thread(scope, thread_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    files = req.app.state.store.list_workspace_files(scope.tenant_id, thread_id)
+    return {"thread_id": thread_id, "files": [_public_workspace_file(f) for f in files]}
+
+
+@router.post("/threads/{thread_id}/files", summary="上传附件到当前会话工作区（支持文本与 PDF/Word/Excel）")
+async def upload_thread_file(thread_id: str, req: Request, file: UploadFile = File(...)):
+    scope = await caller_scope_async(req)
+    raw = await file.read(MAX_ATTACHMENT_BYTES + 1)
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(
+            413, f"文件超过大小上限（最大支持 {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MiB）"
+        )
+    try:
+        parsed = await asyncio.to_thread(parse_uploaded_document, file.filename or "attachment.txt", raw)
+    except DocumentValidationError as exc:
+        raise HTTPException(exc.status_code, exc.message) from exc
+
+    logical_path = normalize_logical_path(f"uploads/{parsed.filename}")
+    store = req.app.state.store
+    try:
+        await asyncio.to_thread(store.create_thread, scope, thread_id, "新对话")
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    try:
+        rec = await asyncio.to_thread(
+            store.write_workspace_binary,
+            scope.tenant_id,
+            thread_id,
+            logical_path,
+            raw,
+            extracted_text=parsed.extracted_text,
+            is_binary=parsed.is_binary,
+            actor_id=scope.user_id,
+            content_type=parsed.content_type,
+            max_files_per_thread=MAX_FILES_PER_THREAD,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    obs = getattr(req.app.state, "obs", None)
+    if obs is not None and hasattr(obs, "log_event"):
+        obs.log_event(
+            "workspace_file_uploaded",
+            "upload",
+            thread_id,
+            path=rec.logical_path,
+            size_bytes=rec.size_bytes,
+            extracted_chars=rec.extracted_chars,
+        )
+    return {"ok": True, "file": _public_workspace_file(rec)}
+
+
+@router.get("/threads/{thread_id}/files/download", summary="下载当前会话工作区文件（原样安全下载）")
+def download_thread_file(thread_id: str, req: Request, path: str = Query(..., min_length=1)):
+    scope = caller_scope(req)
+    try:
+        req.app.state.store.own_thread(scope, thread_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    try:
+        norm_path = normalize_logical_path(path)
+    except ValueError as exc:
+        raise HTTPException(400, f"非法文件路径：{exc}") from exc
+    if norm_path == ".":
+        raise HTTPException(400, "不能下载目录根路径")
+
+    raw_bytes, rec, err = req.app.state.store.read_workspace_bytes(scope.tenant_id, thread_id, norm_path)
+    if err or raw_bytes is None or rec is None:
+        raise HTTPException(404, "文件不存在")
+
+    media_type = safe_download_content_type(rec.logical_path, rec.content_type)
+    return Response(
+        content=raw_bytes,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": build_content_disposition(rec.logical_path),
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cache-Control": "private, no-store",
+        },
+    )

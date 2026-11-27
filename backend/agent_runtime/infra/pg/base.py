@@ -96,7 +96,12 @@ class PgBase:
         )
         sql_dir = next((p for p in candidates if p.exists()), candidates[0])
         with self.transaction() as cur:
-            for fname in ("002_oss_and_kb.sql", "003_runs_artifacts_skills.sql", "004_message_feedback.sql"):
+            for fname in (
+                "002_oss_and_kb.sql",
+                "003_runs_artifacts_skills.sql",
+                "004_message_feedback.sql",
+                "005_workspace_attachments.sql",
+            ):
                 mig = sql_dir / fname
                 if mig.exists():
                     cur.execute(mig.read_text(), prepare=False)

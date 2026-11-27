@@ -727,6 +727,171 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertTrue(r_del.json()["deleted"])
         self.assertEqual(len(client.get("/api/v1/threads/th_fb_1/feedback", headers=alice_h).json()["feedback"]), 0)
 
+    def test_workspace_file_upload_parse_download_and_security(self):
+        import io
+        import zipfile
+        from docx import Document
+        import openpyxl
+        from pypdf import PdfWriter
+
+        store = get_test_store()
+        obs = _TestTelemetry(store)
+        runtime = AgentRuntimeApp(model=EchoTestModel(), store=store, obs=obs)
+        client = TestClient(_make_http_app(runtime))
+        alice_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"}
+        bob_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_bob", "X-User-Roles": "employee"}
+        tid = "th_files_1"
+
+        # 1. Upload .docx with Chinese filename + parentheses BEFORE any chat message (draft thread)
+        doc_buf = io.BytesIO()
+        doc = Document()
+        doc.add_paragraph("2026 华东区差旅预算说明")
+        tbl = doc.add_table(rows=2, cols=2)
+        tbl.cell(0, 0).text = "城市"
+        tbl.cell(0, 1).text = "上限"
+        tbl.cell(1, 0).text = "上海"
+        tbl.cell(1, 1).text = "650元"
+        doc.save(doc_buf)
+        docx_bytes = doc_buf.getvalue()
+
+        r_docx = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("预算说明 (1).docx", docx_bytes, "application/octet-stream")},
+        )
+        self.assertEqual(r_docx.status_code, 200, r_docx.text)
+        f_docx = r_docx.json()["file"]
+        self.assertEqual(f_docx["path"], "uploads/预算说明 (1).docx")
+        self.assertGreater(f_docx["extracted_chars"], 10)
+
+        # 2. Upload .xlsx workbook
+        xlsx_buf = io.BytesIO()
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "费用明细"
+        ws.append(["月份", "超标金额"])
+        ws.append(["7月", 21000])
+        wb.save(xlsx_buf)
+        xlsx_bytes = xlsx_buf.getvalue()
+
+        r_xlsx = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("q3.xlsx", xlsx_bytes, "application/octet-stream")},
+        )
+        self.assertEqual(r_xlsx.status_code, 200, r_xlsx.text)
+
+        # 3. Upload valid minimal PDF (blank page -> honest scan-PDF notice instead of crash)
+        pdf_buf = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        writer.write(pdf_buf)
+        pdf_bytes = pdf_buf.getvalue()
+        r_pdf = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("scan.pdf", pdf_bytes, "application/pdf")},
+        )
+        self.assertEqual(r_pdf.status_code, 200, r_pdf.text)
+
+        # 4. Built-in `read` tool transparently reads extracted Word, Excel, and PDF without oss_key leak
+        ctx = ExecutionContext(uid("tr"), tid, AuthScope("t_acme", "u_alice", ("employee",)), uid("req"))
+        ls_out = asyncio.run(runtime.gateway.execute_one(ToolCall("tc_fls", "read", {"path": "."}), ctx))
+        self.assertTrue(ls_out.ok)
+        self.assertNotIn("oss_key", ls_out.content)
+        self.assertIn("uploads/预算说明 (1).docx", ls_out.content)
+
+        rd_docx = asyncio.run(
+            runtime.gateway.execute_one(ToolCall("tc_f1", "read", {"path": "uploads/预算说明 (1).docx"}), ctx)
+        )
+        self.assertTrue(rd_docx.ok)
+        self.assertIn("2026 华东区差旅预算说明", rd_docx.content)
+        self.assertIn("| 上海 | 650元 |", rd_docx.content)
+        self.assertIn("has_more=false", rd_docx.content)
+
+        rd_xlsx = asyncio.run(
+            runtime.gateway.execute_one(ToolCall("tc_f2", "read", {"path": "uploads/q3.xlsx"}), ctx)
+        )
+        self.assertTrue(rd_xlsx.ok)
+        self.assertIn("[Sheet: 费用明细", rd_xlsx.content)
+        self.assertIn("21000", rd_xlsx.content)
+
+        rd_pdf = asyncio.run(
+            runtime.gateway.execute_one(ToolCall("tc_f3", "read", {"path": "uploads/scan.pdf"}), ctx)
+        )
+        self.assertTrue(rd_pdf.ok)
+        self.assertIn("扫描件", rd_pdf.content)
+
+        # 5. Download returns exact original bytes + hardened RFC 5987 & anti-XSS headers
+        r_dl = client.get(
+            f"/api/v1/threads/{tid}/files/download",
+            headers=alice_h,
+            params={"path": "uploads/预算说明 (1).docx"},
+        )
+        self.assertEqual(r_dl.status_code, 200)
+        self.assertEqual(r_dl.content, docx_bytes)
+        self.assertEqual(r_dl.headers.get("x-content-type-options"), "nosniff")
+        self.assertIn("sandbox", r_dl.headers.get("content-security-policy", ""))
+        self.assertIn("filename*=UTF-8''", r_dl.headers.get("content-disposition", ""))
+
+        # Active HTML file written by agent MUST downgrade to application/octet-stream on download
+        store.write_workspace_file("t_acme", tid, "reports/page.html", "<script>alert(1)</script>", actor_id="u_alice")
+        r_html = client.get(
+            f"/api/v1/threads/{tid}/files/download",
+            headers=alice_h,
+            params={"path": "reports/page.html"},
+        )
+        self.assertEqual(r_html.status_code, 200)
+        self.assertEqual(r_html.headers.get("content-type"), "application/octet-stream")
+
+        # 6. Security rejections: XXE DTD in OOXML, spoofed PDF magic, legacy .xls, cross-user 404
+        xxe_buf = io.BytesIO()
+        with zipfile.ZipFile(xxe_buf, "w") as zf:
+            zf.writestr("word/document.xml", '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "boom">]><w:document/>')
+        r_xxe = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("evil.docx", xxe_buf.getvalue(), "application/octet-stream")},
+        )
+        self.assertEqual(r_xxe.status_code, 422)
+
+        r_fake_pdf = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("fake.pdf", b"NOT_A_PDF", "application/pdf")},
+        )
+        self.assertEqual(r_fake_pdf.status_code, 422)
+
+        r_old_xls = client.post(
+            f"/api/v1/threads/{tid}/files",
+            headers=alice_h,
+            files={"file": ("old.xls", b"legacy", "application/vnd.ms-excel")},
+        )
+        self.assertEqual(r_old_xls.status_code, 422)
+
+        # Cross-user cannot list, upload into, or download Alice's thread files
+        self.assertEqual(client.get(f"/api/v1/threads/{tid}/files", headers=bob_h).status_code, 404)
+        self.assertEqual(
+            client.get(
+                f"/api/v1/threads/{tid}/files/download",
+                headers=bob_h,
+                params={"path": "uploads/q3.xlsx"},
+            ).status_code,
+            404,
+        )
+        self.assertEqual(
+            client.post(
+                f"/api/v1/threads/{tid}/files",
+                headers=bob_h,
+                files={"file": ("hijack.txt", b"hi", "text/plain")},
+            ).status_code,
+            404,
+        )
+
+        # 7. Deleting thread cleans up PG rows and MinIO objects
+        self.assertTrue(store.delete_thread(AuthScope("t_acme", "u_alice", ("employee",)), tid))
+        self.assertEqual(store.list_workspace_files("t_acme", tid), [])
+
 
 if __name__ == "__main__":
     unittest.main()

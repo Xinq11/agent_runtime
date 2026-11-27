@@ -103,6 +103,16 @@ export interface AppMeta {
   }>;
 }
 
+export interface WorkspaceFileSummary {
+  path?: string;
+  logical_path: string;
+  version: number;
+  size_bytes: number;
+  content_type?: string;
+  extracted_chars?: number;
+  updated_by?: string;
+}
+
 export interface RuntimeStateSnapshot {
   trace_id: string | null;
   recent_traces: string[];
@@ -124,6 +134,7 @@ export interface RuntimeStateSnapshot {
     preview: string;
     expires_at?: string;
   }>;
+  workspace_files?: WorkspaceFileSummary[];
   knowledge_chunks: Array<{
     chunk_id: string;
     parent_id?: string;

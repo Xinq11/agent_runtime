@@ -31,6 +31,8 @@ class WorkspaceFileRecord:
     size_bytes: int
     content_type: str = "text/plain; charset=utf-8"
     updated_by: str = ""
+    extracted_oss_key: Optional[str] = None
+    extracted_chars: int = 0
 
 
 @dataclass

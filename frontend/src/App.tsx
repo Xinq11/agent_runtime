@@ -92,6 +92,8 @@ export default function App() {
         onOpenInspector={handleOpenInspector}
         onSend={session.sendMessage}
         onAbort={session.abortRun}
+        onUploadFile={session.uploadAttachment}
+        onDownloadFile={session.downloadFile}
         onApprovalDecision={session.decideApproval}
         onSetFeedback={session.setFeedback}
         onInspectTrace={(trId) => {

@@ -48,13 +48,32 @@ class MinioObjectStore:
             self.client.create_bucket(Bucket=self.bucket)
 
     def put_text(self, key: str, text: str, *, content_type: str = "text/plain; charset=utf-8") -> None:
+        self.put_bytes(key, text.encode("utf-8"), content_type=content_type)
+
+    def put_bytes(
+        self,
+        key: str,
+        data: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+    ) -> None:
         self.client.put_object(
             Bucket=self.bucket,
             Key=key,
-            Body=text.encode("utf-8"),
+            Body=data,
             ContentType=content_type,
         )
 
-    def get_text(self, key: str) -> str:
+    def get_bytes(self, key: str) -> bytes:
         with self.client.get_object(Bucket=self.bucket, Key=key)["Body"] as stream:
-            return stream.read().decode("utf-8")
+            return stream.read()
+
+    def get_text(self, key: str) -> str:
+        return self.get_bytes(key).decode("utf-8")
+
+    def delete_object(self, key: str) -> None:
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+        except Exception:
+            # Best-effort cleanup; never fail thread deletion on a missing/stale object
+            pass

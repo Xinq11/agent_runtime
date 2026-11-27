@@ -142,7 +142,10 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 - `GET /api/v1/threads/{thread_id}/feedback` → 查询当前用户在该会话中的助手回复点赞/点踩记录。
 - `POST /api/v1/threads/{thread_id}/feedback` → 保存或更新点赞/点踩记录（入 PG `message_feedback` 表，按 `(tenant_id, thread_id, actor_id, trace_id)` 互斥幂等更新），请求体：`{ "trace_id": string, "rating": "up" | "down", "reason"?: string, "msg_id"?: number, "answer_excerpt"?: string }`。
 - `DELETE /api/v1/threads/{thread_id}/feedback/{trace_id}` → 取消指定回复的点赞/点踩记录。
-- `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（消息、摘要、反馈、Trace/Span、运行/审批记录、工作区文件与大输出元数据、以及 LangGraph 检查点；当前不同步清理 MinIO 实体对象）。
+- `GET /api/v1/threads/{thread_id}/files` → 列出当前会话工作区文件（含用户上传附件与 Agent `write` 生成的报告，带版本与大小）。
+- `POST /api/v1/threads/{thread_id}/files` → `multipart/form-data` 上传附件到当前会话 `uploads/<文件名>`（最大 10 MiB，支持文本/代码/表格类文件与 `.pdf` / `.docx` / `.xlsx`；原文件二进制存 MinIO 供原样下载，同步提取结构化纯文本存伴生对象供 Agent `read` 透明分页读取，内置 Magic Bytes / OOXML Zip 炸弹 / XXE DTD 防护）。
+- `GET /api/v1/threads/{thread_id}/files/download?path={logical_path}` → 校验会话归属与路径安全后原样下载文件（强制 `Content-Disposition: attachment` + RFC 5987 UTF-8 文件名、`nosniff` 与 `CSP sandbox` 防 Stored XSS）。
+- `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（并同步清理工作区在 MinIO 中的实体与提取文本对象）。
 - `GET /api/v1/state?thread_id={tid}&trace_id={tr}` → 返回单会话 Trace 瀑布图 `spans`、压缩摘要游标 `summary`、当前 `active_run`、`workspace_files`、待审批单、OSS 工件与 Loki 日志。
 
 ---

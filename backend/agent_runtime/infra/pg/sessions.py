@@ -26,7 +26,13 @@ class PgSessionsMixin:
         with self.transaction() as cur:
             cur.execute(
                 """INSERT INTO agent_threads(thread_id,tenant_id,actor_id,title)
-                   VALUES (%s,%s,%s,%s) ON CONFLICT(thread_id) DO NOTHING""",
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT(thread_id) DO UPDATE
+                   SET title = EXCLUDED.title
+                   WHERE agent_threads.tenant_id = EXCLUDED.tenant_id
+                     AND agent_threads.actor_id = EXCLUDED.actor_id
+                     AND agent_threads.title = '新对话'
+                     AND EXCLUDED.title <> '新对话'""",
                 (tid, scope.tenant_id, scope.user_id, title),
             )
         return self.own_thread(scope, tid)
@@ -139,13 +145,27 @@ class PgSessionsMixin:
             return cur.fetchone() or ("", 0)
 
     def save_summary(self, thread_id: str, summary_text: str, covered_up_to_msg_id: int) -> None:
+        self.save_summary_if_current(thread_id, summary_text, covered_up_to_msg_id, expected_cursor=None)
+
+    def save_summary_if_current(
+        self, thread_id: str, summary_text: str, covered_up_to_msg_id: int, *, expected_cursor: Optional[int]
+    ) -> None:
         with self.transaction() as cur:
+            # Reject stale workers, including after thread deletion/recreation.
+            cur.execute("SELECT 1 FROM agent_threads WHERE thread_id=%s FOR UPDATE", (thread_id,))
+            if not cur.fetchone():
+                return
             cur.execute(
                 """INSERT INTO session_summaries (thread_id,summary_text,covered_up_to_msg_id)
-                   VALUES (%s,%s,%s) ON CONFLICT (thread_id) DO UPDATE
+                   SELECT %s,%s,%s WHERE EXISTS (
+                       SELECT 1 FROM session_messages WHERE thread_id=%s AND msg_id=%s)
+                   AND (%s::bigint IS NULL OR COALESCE((
+                       SELECT covered_up_to_msg_id FROM session_summaries WHERE thread_id=%s),0)=%s)
+                   ON CONFLICT (thread_id) DO UPDATE
                    SET summary_text=EXCLUDED.summary_text, covered_up_to_msg_id=EXCLUDED.covered_up_to_msg_id
                    WHERE session_summaries.covered_up_to_msg_id <= EXCLUDED.covered_up_to_msg_id""",
-                (thread_id, summary_text, covered_up_to_msg_id),
+                (thread_id, summary_text, covered_up_to_msg_id, thread_id, covered_up_to_msg_id,
+                 expected_cursor, thread_id, expected_cursor),
             )
 
     def delete_thread(self, scope: AuthScope, thread_id: str) -> bool:
@@ -173,6 +193,11 @@ class PgSessionsMixin:
             cur.execute("DELETE FROM tool_outputs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM tool_approvals WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM agent_runs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
+            cur.execute(
+                "SELECT oss_key, extracted_oss_key FROM workspace_files WHERE tenant_id=%s AND thread_id=%s",
+                (scope.tenant_id, thread_id),
+            )
+            ws_keys = {k for row in cur.fetchall() for k in row if k}
             cur.execute("DELETE FROM workspace_files WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM message_feedback WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM runtime_traces WHERE thread_id=%s", (thread_id,))
@@ -186,6 +211,10 @@ class PgSessionsMixin:
                 "DELETE FROM agent_threads WHERE thread_id=%s AND tenant_id=%s AND actor_id=%s",
                 (thread_id, scope.tenant_id, scope.user_id),
             )
+            oss = getattr(self, "oss", None)
+            if oss is not None and hasattr(oss, "delete_object"):
+                for k in ws_keys:
+                    oss.delete_object(k)
             return True
 
     def save_message_feedback(

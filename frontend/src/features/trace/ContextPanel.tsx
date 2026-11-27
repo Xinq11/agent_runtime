@@ -1,8 +1,14 @@
 import React, { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Layers, Sparkles } from "lucide-react";
-import { fetchThreadMessages } from "../../shared/api/client";
+import { ChevronDown, ChevronRight, Download, FileText, Layers, Sparkles } from "lucide-react";
+import { downloadThreadFile, fetchThreadMessages } from "../../shared/api/client";
 import { MarkdownContent } from "../../shared/components/MarkdownContent";
 import { RuntimeStateSnapshot } from "../../shared/types/runtime";
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 interface ContextPanelProps {
   threadId: string;
@@ -126,6 +132,56 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
         ))}
       </div>
 
+      {/* Workspace files (uploaded attachments + agent-generated reports) */}
+      {state?.workspace_files && state.workspace_files.length > 0 && (
+        <div
+          className="rounded-xl border p-3 space-y-2"
+          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        >
+          <div className="flex items-center justify-between text-[11.5px] font-semibold" style={{ color: "var(--ink-secondary)" }}>
+            <span className="inline-flex items-center gap-1.5">
+              <FileText size={13} style={{ color: "var(--accent)" }} />
+              工作区文件 ({state.workspace_files.length})
+            </span>
+            <span className="text-[10.5px] font-normal" style={{ color: "var(--ink-muted)" }}>
+              附件 / 生成报告
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {state.workspace_files.map((wf) => {
+              const p = wf.logical_path || wf.path || "";
+              return (
+                <div
+                  key={p}
+                  className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg border text-[11.5px]"
+                  style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="font-mono text-[11.5px] truncate">{p}</div>
+                    <div className="text-[10px] font-mono" style={{ color: "var(--ink-muted)" }}>
+                      v{wf.version} · {formatFileSize(wf.size_bytes)}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => downloadThreadFile(threadId, p)}
+                    className="interactive-btn inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] shrink-0"
+                    style={{
+                      background: "var(--surface)",
+                      borderColor: "var(--border)",
+                      color: "var(--accent)",
+                    }}
+                  >
+                    <Download size={11} />
+                    下载
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Compressed structured summary card */}
       <div
         className="rounded-xl border p-3 space-y-2"
@@ -147,7 +203,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
             className="rounded-lg border px-3 py-2.5 text-[11.5px] leading-relaxed"
             style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--ink-muted)" }}
           >
-            尚未触发自动压缩（会话消息达到 8 条时会在 after_agent 阶段由模型自动提炼结构化摘要并推进游标）。
+            尚未触发自动压缩（默认在历史摘要和未压缩消息超过历史 token 预算的 70% 后，后台按完整对话轮次生成摘要）。
           </div>
         )}
       </div>

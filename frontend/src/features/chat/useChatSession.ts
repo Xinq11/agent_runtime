@@ -3,6 +3,7 @@ import {
   abortChatRun,
   cancelMessageFeedback,
   deleteThread,
+  downloadThreadFile,
   fetchAppMeta,
   fetchModelConfig,
   fetchRuntimeState,
@@ -12,6 +13,7 @@ import {
   streamChatSSE,
   submitMessageFeedback,
   updateModelConfig,
+  uploadThreadFile,
 } from "../../shared/api/client";
 import {
   ActivityBlock,
@@ -381,6 +383,20 @@ export function useChatSession(route: "chat" | "ops") {
     return null;
   };
 
+  const uploadAttachment = async (file: File) => {
+    const tid = activeThreadIdRef.current;
+    const uploaded = await uploadThreadFile(tid, file);
+    if (activeThreadIdRef.current === tid) {
+      setIsDraftThread(false);
+      await refreshAll(tid, selectedTraceId, false);
+    }
+    return uploaded;
+  };
+
+  const downloadFile = async (path: string) => {
+    await downloadThreadFile(activeThreadIdRef.current, path);
+  };
+
   const activeThreadTitle = isDraftThread
     ? "新对话"
     : threads.find((t) => t.thread_id === activeThreadId)?.title || "新对话";
@@ -406,6 +422,8 @@ export function useChatSession(route: "chat" | "ops") {
     abortRun,
     decideApproval,
     setFeedback,
+    uploadAttachment,
+    downloadFile,
     saveModelConfig,
   };
 }

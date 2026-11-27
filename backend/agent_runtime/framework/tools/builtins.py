@@ -21,7 +21,7 @@ from agent_runtime.framework.core.security import (
 from agent_runtime.framework.tools.gateway import ToolRegistry, ToolSpec
 
 MAX_WORKSPACE_FILE_BYTES = 1024 * 1024  # 1 MiB
-_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff./ -]+$")
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff./()（） -]+$")
 
 
 def normalize_logical_path(raw: str) -> str:
@@ -64,7 +64,8 @@ def register_immutable_builtin_tools(
                         "path": f.logical_path,
                         "version": f.version,
                         "size_bytes": f.size_bytes,
-                        "oss_key": f.oss_key,
+                        "content_type": f.content_type,
+                        "extracted_chars": f.extracted_chars,
                     }
                     for f in files
                 ],
@@ -79,8 +80,16 @@ def register_immutable_builtin_tools(
         content, meta, err = store.read_workspace_file(ctx.auth_scope.tenant_id, ctx.thread_id, path)
         if err or content is None:
             return ToolResult("", "read", f"[{err or 'file_not_found'}] {path}", ok=False, error_code=err or "file_not_found")
-        sliced = content[offset : offset + limit]
-        return f"[file={path} v{meta.version} chars={len(content)} offset={offset}]\n{sliced}"
+        total = len(content)
+        if offset >= total:
+            return f"[file={path} v{meta.version} chars={total}..{total}/{total} has_more=false EOF]"
+        end = min(offset + limit, total)
+        sliced = content[offset:end]
+        if end < total:
+            header = f"[file={path} v{meta.version} chars={offset}..{end}/{total} has_more=true next_offset={end}]"
+        else:
+            header = f"[file={path} v{meta.version} chars={offset}..{end}/{total} has_more=false]"
+        return f"{header}\n{sliced}"
 
     async def handle_write(args: dict, ctx: ExecutionContext) -> Any:
         try:
@@ -145,7 +154,10 @@ def register_immutable_builtin_tools(
     registry.register_builtin(
         ToolSpec(
             name="read",
-            description="读取当前会话工作区文件（传 path='.' 列出全部工作区文件，支持 offset/limit 分页读取）。",
+            description=(
+                "读取当前会话工作区文件（支持文本/CSV/JSON/Markdown 及用户上传的 PDF/Word/Excel 附件；"
+                "传 path='.' 列出全部工作区文件，支持 offset/limit 分页读取）。"
+            ),
             required_args=(),
             allowed_args=("path", "offset", "limit"),
             risk_level=RiskLevel.READ,
