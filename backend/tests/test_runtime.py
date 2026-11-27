@@ -1,4 +1,4 @@
-"""Integration coverage for the shared SDK and standard extensions."""
+"""Integration coverage for the pure Harness SDK and `RagProvider` / `SkillProvider` hooks."""
 
 from __future__ import annotations
 
@@ -14,20 +14,14 @@ from agent_runtime import (
     AuthScope,
     ExecutionContext,
     Message,
-    PgRagRepository,
-    PgSkillsRepository,
-    RAGChunk,
-    RagExtension,
-    RagRetrievalService,
-    RetrievalResult,
+    RagHit,
+    RagResult,
     RiskLevel,
-    SkillsExtension,
+    SkillMeta,
     SSEEvent,
     ToolCall,
-    load_extension,
     tool,
 )
-from agent_runtime.extensions.skills.extension import validate_resource_name
 from agent_runtime.framework.context.memory import ContextBudget, assemble_before_model
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.tools.gateway import compute_op_key
@@ -36,137 +30,107 @@ from agent_runtime.infra.plg.hub import ObservabilityHub
 try:
     from tests._pg_harness import EchoTestModel, get_test_store, reset_test_db
 except ImportError:
-    from _pg_harness import get_test_store, reset_test_db
+    from _pg_harness import EchoTestModel, get_test_store, reset_test_db
+
+
+class _InMemoryRagProvider:
+    """Test customer RAG provider owning both corpus and business ACL."""
+
+    def __init__(self) -> None:
+        self.seen_queries: List[str] = []
+        self.docs = [
+            ("报销制度", "住宿标准", "https://wiki/travel", "一线城市住宿报销标准上限 650 元/晚。", {"employee", "exec"}),
+            ("绝密薪酬方案", "高管奖金", "https://wiki/secret", "高管年度奖金系数 3.5x。", {"exec"}),
+        ]
+
+    async def retrieve(self, *, scope, query, top_k=4, ctx=None) -> RagResult:
+        self.seen_queries.append(query)
+        roles = set(scope.roles)
+        hits = [
+            RagHit(title=t, section=s, source_url=u, content=c)
+            for t, s, u, c, allowed in self.docs
+            if (roles & allowed) and (any(w in (t + s + c) for w in query.split()) or query in (t + s + c) or any(ch in (t + s + c) for ch in ("住宿", "奖金") if ch in query))
+        ]
+        if not hits:
+            return RagResult(status="no_hit")
+        return RagResult(status="ok", hits=tuple(hits[:top_k]))
+
+
+class _InMemorySkillProvider:
+    """Test customer Skill provider owning both catalog/content and business ACL."""
+
+    def __init__(self) -> None:
+        self.items = []
+
+    def add(self, slug: str, description: str, content: str, roles, *, tags=(), resources=None):
+        self.items.append(
+            {
+                "meta": SkillMeta(
+                    slug=slug,
+                    description=description,
+                    tags=tuple(tags),
+                    resources=tuple(sorted((resources or {}).keys())),
+                ),
+                "roles": set(roles),
+                "content": content,
+                "resources": dict(resources or {}),
+            }
+        )
+
+    def _visible(self, scope: AuthScope):
+        r = set(scope.roles)
+        return [it for it in self.items if not it["roles"] or (r & it["roles"])]
+
+    def list_skills(self, scope: AuthScope, query: str = ""):
+        q = (query or "").strip().lower()
+        vis = self._visible(scope)
+        if not q:
+            return [it["meta"] for it in vis]
+        return [
+            it["meta"]
+            for it in vis
+            if q in f"{it['meta'].slug} {it['meta'].description} {' '.join(it['meta'].tags)}".lower()
+            or ("差旅" in q and "差旅" in it["meta"].description)
+        ]
+
+    def get_skill(self, scope: AuthScope, slug: str, resource: Optional[str] = None) -> Optional[str]:
+        for it in self._visible(scope):
+            if it["meta"].slug == slug:
+                if resource:
+                    return it["resources"].get(resource)
+                return it["content"]
+        return None
 
 
 class TestAgentRuntimeSDK(unittest.TestCase):
     def setUp(self):
         reset_test_db()
 
-    def test_03_rag_seven_stage_pipeline_acl_diversifier_and_fallback(self):
+    def test_03_rag_provider_tool_and_auto_inject_with_customer_acl(self):
         async def _run():
-            store = get_test_store()
-            rag_repo = PgRagRepository(store)
-            rag_repo.bootstrap_schema()
-            rag = RagRetrievalService(rag_repo, min_rerank_score=0.35)
-            # Multi-chunk document to verify adjacent child expansion & per-doc diversification (max 2)
-            for idx, body in enumerate(
-                [
-                    "前序背景：2026 差旅报销适用全员。",
-                    "一线城市住宿报销标准上限 650 元/晚。",
-                    "后续条款：超标超过 10% 需发起专项审批。",
-                ],
-                1,
-            ):
-                rag.index_chunk(
-                    RAGChunk(
-                        chunk_id=f"p_pub_{idx}",
-                        parent_id="p_pub",
-                        doc_title="报销制度",
-                        section_path="住宿标准",
-                        doc_url="https://wiki/travel",
-                        content=body,
-                        parent_text="全量父文档：一线城市住宿报销标准上限 650 元/晚，超标超过 10% 需专项审批。",
-                        acl_roles=("employee",),
-                    )
-                )
-            rag.index_chunk(
-                RAGChunk(
-                    chunk_id="p_sec_1",
-                    parent_id="p_sec",
-                    doc_title="绝密薪酬方案",
-                    section_path="高管奖金",
-                    doc_url="https://wiki/secret",
-                    content="高管年度奖金系数 3.5x。",
-                    parent_text="高管年度奖金系数 3.5x。",
-                    acl_roles=("exec",),
-                )
-            )
-
-            emp_scope = AuthScope(user_id="u1", roles=("employee",))
-            exec_scope = AuthScope(user_id="u2", roles=("exec",))
-
-            # ACL hard boundary: employee cannot retrieve exec-only chunk
-            r_emp = await rag.retrieve(scope=emp_scope, query="高管年度奖金系数是多少")
-            self.assertEqual(r_emp.hits, [])
-            self.assertIn(r_emp.status, ("no_hit", "low_confidence"))
-
-            # Child-level diagnostic retrieve_chunks() exposes 4 distinct stage scores & max 2 per doc
-            diag = rag.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=4)
-            self.assertGreaterEqual(len(diag), 1)
-            self.assertLessEqual(len(diag), 2)
-            self.assertGreater(diag[0].rrf_score, 0.0)
-            self.assertGreater(diag[0].rerank_score, 0.0)
-
-            # Parent-level retrieve_evidence() returns full parent content without raw score leakage
-            evidences, _ = rag.retrieve_evidence(emp_scope, "一线城市住宿报销标准", top_n=4)
-            self.assertEqual(len(evidences), 1)
-            self.assertEqual(evidences[0].parent_id, "p_pub")
-            self.assertIn("全量父文档", evidences[0].content)
-            self.assertTrue(len(evidences[0].matched_child_ids) >= 1)
-
-            # Exec retrieves exec-only doc with [1] citation
-            r_exec = await rag.retrieve(scope=exec_scope, query="高管年度奖金系数")
-            self.assertEqual(r_exec.status, "ok")
-            self.assertIn("[1]", r_exec.formatted_context)
-
-            # Failing RerankClient gracefully falls back to RRF order without crashing
-            class BrokenReranker:
-                def rerank(self, query, documents):
-                    raise RuntimeError("rerank sidecar timeout")
-
-            rag_fb = RagRetrievalService(rag_repo, rerank_client=BrokenReranker(), min_rerank_score=0.0)
-            fb_chunks = rag_fb.retrieve_chunks(emp_scope, "一线城市住宿报销标准", top_n=2)
-            self.assertGreaterEqual(len(fb_chunks), 1)
-            self.assertEqual(fb_chunks[0].rerank_score, 0.0)
-
-            # Unrelated query returns no_hit / low_confidence refusal
-            r_miss = await rag.retrieve(scope=emp_scope, query="火星飞船燃料价格")
-            self.assertEqual(r_miss.hits, [])
-            self.assertIn(r_miss.status, ("no_hit", "low_confidence"))
-
-        asyncio.run(_run())
-
-    def test_04_custom_rag_strategy_and_auto_inject_mode(self):
-        async def _run():
-            seen_queries: List[str] = []
-
-            class CustomESRetriever:
-                async def retrieve(self, *, scope, query, top_k=4, ctx=None):
-                    seen_queries.append(query)
-                    hit = RAGChunk(
-                        chunk_id="es_1",
-                        parent_id="p_es",
-                        doc_title="外部 ES 制度",
-                        section_path="总则",
-                        doc_url="es://policy/1",
-                        content="自定义 RAG 策略返回内容",
-                        parent_text="自定义 RAG 策略返回内容",
-                        acl_roles=scope.roles,
-                        score=0.95,
-                    )
-                    return RetrievalResult(status="ok", hits=[hit])
-
+            rag_provider = _InMemoryRagProvider()
             app = AgentRuntimeApp(
                 model=EchoTestModel(),
                 store=get_test_store(),
-                extensions=[RagExtension(strategy=CustomESRetriever(), mode="both")],
+                rag_provider=rag_provider,
+                rag_mode="both",
             )
-            res = await app.run_turn("外部 ES 制度说了什么", thread_id="th_custom_rag")
-            self.assertTrue(res["final_answer"])
-            self.assertIn("外部 ES 制度说了什么", seen_queries)
+            emp = AuthScope(user_id="u1", roles=("employee",))
+            exec_user = AuthScope(user_id="u2", roles=("exec",))
 
-            ctx = ExecutionContext(
-                trace_id=uid("tr"),
-                thread_id="th_custom_rag",
-                request_id=uid("req"),
-                auth_scope=AuthScope("u1", ("user",)),
-            )
-            out = await app.gateway.execute_one(
-                ToolCall("tc_r1", "search_knowledge", {"query": "总则"}), ctx
-            )
-            self.assertTrue(out.ok)
-            self.assertIn("自定义 RAG 策略返回内容", out.content)
+            # Auto-inject invokes provider on turn
+            res = await app.run_turn("住宿标准是什么", thread_id="th_rag_1", scope=emp)
+            self.assertTrue(res["final_answer"])
+            self.assertIn("住宿标准是什么", rag_provider.seen_queries)
+
+            # Customer ACL: employee gets [NO_HIT] for exec-only doc; exec gets grounded [1] citation
+            ctx_emp = ExecutionContext(uid("tr"), "th_rag_1", emp, uid("req"))
+            ctx_exec = ExecutionContext(uid("tr"), "th_rag_2", exec_user, uid("req"))
+            out_emp = await app.gateway.execute_one(ToolCall("tc_r1", "search_knowledge", {"query": "高管奖金"}), ctx_emp)
+            out_exec = await app.gateway.execute_one(ToolCall("tc_r2", "search_knowledge", {"query": "高管奖金"}), ctx_exec)
+            self.assertIn("[NO_HIT]", out_emp.content)
+            self.assertIn("[1]", out_exec.content)
+            self.assertIn("3.5x", out_exec.content)
 
         asyncio.run(_run())
 
@@ -280,57 +244,110 @@ class TestAgentRuntimeSDK(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_10_cloud_native_skills_versioning_acl_and_security(self):
+    def test_10_skill_provider_progressive_disclosure_acl_and_prefix_cache(self):
         async def _run():
-            with self.assertRaises(ValueError):
-                validate_resource_name("scripts/exploit.py")
-            with self.assertRaises(ValueError):
-                validate_resource_name("../secret.md")
-
             store = get_test_store()
-            app = AgentRuntimeApp(store=store, extensions=[SkillsExtension()])
-            app.bootstrap_extensions()
-            skills_repo = PgSkillsRepository(store)
+            captured_prompts: List[List[Message]] = []
+
+            class TwoStepSkillModel:
+                async def generate(self, *, messages, tool_specs, ctx):
+                    captured_prompts.append(list(messages))
+                    if len(captured_prompts) == 1:
+                        return Message(
+                            role="assistant",
+                            content="",
+                            tool_calls=[
+                                ToolCall(
+                                    id="tc_sk_read",
+                                    name="get_skill",
+                                    args={"slug": "expense-audit-report"},
+                                )
+                            ],
+                        )
+                    return Message(role="assistant", content="已按 SOP 完成分析。")
+
+            provider = _InMemorySkillProvider()
+            app = AgentRuntimeApp(
+                model=TwoStepSkillModel(),
+                store=store,
+                skill_provider=provider,
+                skill_inline_limit=2,
+            )
             emp = AuthScope("u_emp", ("employee",))
-            skills_repo.publish_skill(
-                scope=emp, slug="staff-guide", description="Staff guide", content="Guide", acl_roles=["employee"]
-            )
-            exec_only = AuthScope("u_exec", ("exec",))
+            exec_scope = AuthScope("u_exec", ("exec",))
 
-            skills_repo.publish_skill(
-                scope=exec_only,
-                slug="board-briefing",
-                description="高管董事会汇报 SOP",
-                content="# 绝密汇报模板",
-                acl_roles=["exec"],
+            ctx_emp = ExecutionContext(uid("tr"), "th_sk_empty", emp, uid("req"))
+            ctx_exec = ExecutionContext(uid("tr"), "th_sk_exec", exec_scope, uid("req"))
+            empty_res = await app.gateway.execute_one(ToolCall("tc_e0", "list_skills", {"query": "差旅"}), ctx_emp)
+            self.assertIn("暂无可用 Skill", empty_res.content)
+
+            provider.add(
+                slug="expense-audit-report",
+                description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
+                content="# 差旅超标 SOP",
+                roles=["employee"],
+                tags=["finance", "report"],
+                resources={"references/tpl.md": "## 模板"},
+            )
+            provider.add(
+                slug="exec-layoff-plan",
+                description="高管保密组织调整方案",
+                content="# 绝密",
+                roles=["exec"],
                 tags=["exec"],
-                resources={"references/tpl.md": "## 议题"},
             )
 
-            ctx_emp = ExecutionContext(trace_id=uid("tr"), thread_id="th_sk1", request_id=uid("req"), auth_scope=emp)
-            ctx_exec = ExecutionContext(trace_id=uid("tr"), thread_id="th_sk2", request_id=uid("req"), auth_scope=exec_only)
+            # Query hit + customer ACL isolation
+            hit = await app.gateway.execute_one(ToolCall("tc_q1", "list_skills", {"query": "差旅分析"}), ctx_emp)
+            self.assertIn("expense-audit-report", hit.content)
+            self.assertNotIn("exec-layoff-plan", hit.content)
 
-            ls_emp = await app.gateway.execute_one(ToolCall("tc_s1", "list_skills", {}), ctx_emp)
-            self.assertIn("staff-guide", ls_emp.content)
-            self.assertNotIn("board-briefing", ls_emp.content)
-
-            denied = await app.gateway.execute_one(
-                ToolCall("tc_s2", "get_skill", {"slug": "board-briefing"}), ctx_emp
-            )
+            denied = await app.gateway.execute_one(ToolCall("tc_d1", "get_skill", {"slug": "exec-layoff-plan"}), ctx_emp)
             self.assertFalse(denied.ok)
 
-            ok_main = await app.gateway.execute_one(
-                ToolCall("tc_s3", "get_skill", {"slug": "board-briefing"}), ctx_exec
-            )
-            self.assertTrue(ok_main.ok)
-            self.assertIn("绝密汇报模板", ok_main.content)
-
             ok_res = await app.gateway.execute_one(
-                ToolCall("tc_s4", "get_skill", {"slug": "board-briefing", "resource": "references/tpl.md"}),
-                ctx_exec,
+                ToolCall("tc_r1", "get_skill", {"slug": "expense-audit-report", "resource": "references/tpl.md"}),
+                ctx_emp,
             )
             self.assertTrue(ok_res.ok)
-            self.assertIn("## 议题", ok_res.content)
+            self.assertIn("## 模板", ok_res.content)
+
+            # Unmatched query returns helpful fallback catalog instead of false "暂无可用 Skill"
+            miss = await app.gateway.execute_one(ToolCall("tc_q2", "list_skills", {"query": "量子物理"}), ctx_emp)
+            self.assertIn("未精确匹配", miss.content)
+            self.assertIn("expense-audit-report", miss.content)
+            self.assertNotIn("exec-layoff-plan", miss.content)
+
+            # Two-step turn: Layer-1 [AVAILABLE_SKILLS] injected with strict ACL + identical Prefix Cache across steps
+            res = await app.run_turn("帮我做一份差旅分析报告", thread_id="th_sk_cache", scope=emp)
+            self.assertEqual(res["final_answer"], "已按 SOP 完成分析。")
+            self.assertEqual(len(captured_prompts), 2)
+            step1_msgs, step2_msgs = captured_prompts
+            self.assertIn("[AVAILABLE_SKILLS]", step1_msgs[1].content)
+            self.assertIn("expense-audit-report", step1_msgs[1].content)
+            self.assertNotIn("exec-layoff-plan", step1_msgs[1].content)
+            self.assertEqual(step1_msgs[0].content, step2_msgs[0].content)
+            self.assertEqual(step1_msgs[1].content, step2_msgs[1].content)
+            persisted = store.list_messages("th_sk_cache")
+            self.assertFalse(any("[AVAILABLE_SKILLS]" in (m.content or "") for m in persisted))
+
+            # Scope without `get_skill` in allowed_tools (e.g. read-only subagent) skips catalog injection
+            sub_scope = AuthScope("u_emp", ("employee",), allowed_tools=("read",))
+            sub_ctx = ExecutionContext(uid("tr"), "th_sk_sub", sub_scope, uid("req"))
+            self.assertEqual(await app.middlewares.run_extra_context("查差旅", sub_ctx), [])
+
+            # Exceeding inline_limit degrades cleanly to summary hint
+            provider.add("skill-b", "B", "B", ["employee"])
+            provider.add("skill-c", "C", "C", ["employee"])
+            big_extras = await app.middlewares.run_extra_context("查差旅", ctx_emp)
+            self.assertEqual(len(big_extras), 1)
+            self.assertIn("共有 3 个可用技能", big_extras[0])
+            self.assertNotIn("expense-audit-report", big_extras[0])
+
+            # Exec sees exec skill
+            ok_exec = await app.gateway.execute_one(ToolCall("tc_e1", "get_skill", {"slug": "exec-layoff-plan"}), ctx_exec)
+            self.assertTrue(ok_exec.ok)
+            self.assertIn("# 绝密", ok_exec.content)
 
         asyncio.run(_run())
 
@@ -364,9 +381,6 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             self.assertIn("before_model", events)
             self.assertIn("after_turn", events)
 
-            ext = load_extension("agent_runtime.extensions.skills.extension:SkillsExtension")
-            self.assertEqual(ext.name, "skills")
-
             ev = SSEEvent("token", {"text": "hi"}, run_id="run_abc", seq=7)
             wire = ev.to_sse_wire()
             self.assertIn("id: 7\n", wire)
@@ -378,95 +392,6 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             self.assertEqual(env["seq"], 7)
             self.assertEqual(env["type"], "token")
             self.assertEqual(env["payload"], {"text": "hi"})
-
-        asyncio.run(_run())
-
-    def test_13_skill_bilingual_search_progressive_disclosure_acl_and_prefix_cache(self):
-        async def _run():
-            store = get_test_store()
-            captured_prompts: List[List[Message]] = []
-
-            class TwoStepSkillModel:
-                async def generate(self, *, messages, tool_specs, ctx):
-                    captured_prompts.append(list(messages))
-                    if len(captured_prompts) == 1:
-                        return Message(
-                            role="assistant",
-                            content="",
-                            tool_calls=[
-                                ToolCall(
-                                    id="tc_sk_read",
-                                    name="get_skill",
-                                    args={"slug": "expense-audit-report"},
-                                )
-                            ],
-                        )
-                    return Message(role="assistant", content="已按 SOP 完成分析。")
-
-            app = AgentRuntimeApp(
-                model=TwoStepSkillModel(),
-                store=store,
-                extensions=[SkillsExtension(inline_limit=2)],
-            )
-            app.bootstrap_extensions()
-            skills_repo = PgSkillsRepository(store)
-            emp = AuthScope("u_emp", ("employee",))
-            exec_scope = AuthScope("u_exec", ("exec",))
-
-            ctx_emp = ExecutionContext(uid("tr"), "th_sk_empty", emp, uid("req"))
-            empty_res = await app.gateway.execute_one(ToolCall("tc_e0", "list_skills", {"query": "差旅"}), ctx_emp)
-            self.assertIn("暂无可用 Skill", empty_res.content)
-
-            skills_repo.publish_skill(
-                scope=emp,
-                slug="expense-audit-report",
-                description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
-                content="# 差旅超标 SOP",
-                acl_roles=["employee"],
-                tags=["finance", "report"],
-            )
-            skills_repo.publish_skill(
-                scope=exec_scope,
-                slug="exec-layoff-plan",
-                description="高管保密组织调整方案",
-                content="# 绝密",
-                acl_roles=["exec"],
-                tags=["exec"],
-            )
-
-            hit = await app.gateway.execute_one(ToolCall("tc_q1", "list_skills", {"query": "差旅分析"}), ctx_emp)
-            self.assertIn("expense-audit-report", hit.content)
-            self.assertNotIn("exec-layoff-plan", hit.content)
-
-            miss = await app.gateway.execute_one(ToolCall("tc_q2", "list_skills", {"query": "量子物理"}), ctx_emp)
-            self.assertNotIn("暂无可用 Skill", miss.content)
-            self.assertIn("未精确匹配", miss.content)
-            self.assertIn("expense-audit-report", miss.content)
-            self.assertNotIn("exec-layoff-plan", miss.content)
-
-            res = await app.run_turn("帮我做一份差旅分析报告", thread_id="th_sk_cache", scope=emp)
-            self.assertEqual(res["final_answer"], "已按 SOP 完成分析。")
-            self.assertEqual(len(captured_prompts), 2)
-            step1_msgs, step2_msgs = captured_prompts
-            self.assertIn("[AVAILABLE_SKILLS]", step1_msgs[1].content)
-            self.assertIn("expense-audit-report", step1_msgs[1].content)
-            self.assertNotIn("exec-layoff-plan", step1_msgs[1].content)
-            self.assertEqual(step1_msgs[0].content, step2_msgs[0].content)
-            self.assertEqual(step1_msgs[1].content, step2_msgs[1].content)
-            persisted = store.list_messages("th_sk_cache")
-            self.assertFalse(any("[AVAILABLE_SKILLS]" in (m.content or "") for m in persisted))
-
-            sub_scope = AuthScope("u_emp", ("employee",), allowed_tools=("read",))
-            sub_ctx = ExecutionContext(uid("tr"), "th_sk_sub", sub_scope, uid("req"))
-            sub_extras = await app.middlewares.run_extra_context("查差旅", sub_ctx)
-            self.assertEqual(sub_extras, [])
-
-            skills_repo.publish_skill(scope=emp, slug="skill-b", description="B", content="B", acl_roles=["employee"])
-            skills_repo.publish_skill(scope=emp, slug="skill-c", description="C", content="C", acl_roles=["employee"])
-            big_extras = await app.middlewares.run_extra_context("查差旅", ctx_emp)
-            self.assertEqual(len(big_extras), 1)
-            self.assertIn("共有 3 个可用平台技能", big_extras[0])
-            self.assertNotIn("expense-audit-report", big_extras[0])
 
         asyncio.run(_run())
 

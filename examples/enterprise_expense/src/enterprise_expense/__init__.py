@@ -1,29 +1,15 @@
-"""Official sample customer extension pack: Enterprise Travel & Expense Analyst."""
+"""Official sample customer delivery pack: Enterprise Travel & Expense Analyst."""
 
 from __future__ import annotations
 
 from importlib.resources import files
 from typing import Any, Dict, List, Optional, Sequence
 
+from .providers import DEFAULT_EXPENSE_SKILL_MD, ExpenseRagProvider, ExpenseSkillProvider
 from .tools import create_expense_tools
-from agent_runtime.extensions.rag.repo import PgRagRepository
-from agent_runtime.extensions.skills.repo import PgSkillsRepository
 from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
 from agent_runtime.framework.tools.subagent import SubAgentProfile
-
-DEFAULT_EXPENSE_SKILL_MD = """# 差旅超标分析与报告 SOP
-
-当用户要求核查部门差旅超标、生成分析报告或发起超标审批时，请严格按以下步骤执行：
-
-1. **数据核查**：调用 `bi_query`（或委派只读子代理 `call_bi_analyst`）查询对应大区和季度的超标笔数、金额、分月明细及费用构成。
-2. **制度核验**：调用 `search_knowledge` 查询最新差旅住宿标准与超标审批红线，并在结论中以 `[1]` 标注制度出处。
-3. **可视化呈现**：
-   - 使用标准 Markdown 表格呈现关键汇总指标；
-   - 使用 `chart` 代码块输出 ECharts 柱状图（分月趋势）或环形饼图（费用构成）。
-4. **文档沉淀（按需）**：若用户需要归档报告，调用内置 `write` 工具写入如 `reports/expense_summary.md`。
-5. **高危审批（严格按需）**：仅在用户明确要求「发起/提交审批」时调用 `submit_approval` 触发人工确认；若用户仅要求分析数据或撰写报告，严禁主动调用 `submit_approval`，仅在报告末尾说明是否满足超标红线并询问用户是否需要发起审批。
-"""
 
 
 class EnterpriseExpensePlugin(AgentPlugin):
@@ -41,6 +27,8 @@ class EnterpriseExpensePlugin(AgentPlugin):
 
     def __init__(self, *, approval_writes: Optional[List[Dict[str, Any]]] = None) -> None:
         self.approval_writes = approval_writes if approval_writes is not None else []
+        self._rag_provider = ExpenseRagProvider()
+        self._skill_provider = ExpenseSkillProvider()
 
     def default_identity(self) -> AuthScope:
         return AuthScope(user_id="u_alice", roles=("employee", "exec"))
@@ -52,7 +40,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
             plugin_name=self.name,
             welcome_title="今天查点什么，或者一起做哪件事？",
             welcome_description=(
-                "统一核心 SDK + 生产级 PG/OSS/PLG 底座：支持 ECharts 交互图表、云原生文件读写、RAG 混合检索、PG+OSS 技能库、只读子 Agent 与高危审批恢复。"
+                "通用 Agent Harness SDK + 生产级 PG/OSS/PLG 底座：支持 ECharts 交互图表、云原生文件读写、外接知识检索与技能 SOP、只读子 Agent 与高危审批恢复。"
             ),
             quick_prompts=(
                 QuickPromptSpec(
@@ -67,7 +55,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
                 ),
                 QuickPromptSpec(
                     title="按技能 SOP 分析并写入报告文件",
-                    hint="通过 list_skills/get_skill 读取平台 SOP，并用内置 write 工具沉淀报告到 OSS",
+                    hint="通过 list_skills/get_skill 读取业务 SOP，并用内置 write 工具沉淀报告到 OSS",
                     prompt="先查一下平台里有没有差旅分析相关的 Skill，按 SOP 查华东区 Q3 数据并把报告写到 reports/q3.md",
                 ),
                 QuickPromptSpec(
@@ -92,38 +80,22 @@ class EnterpriseExpensePlugin(AgentPlugin):
             ),
         )
 
+    def rag_provider(self) -> ExpenseRagProvider:
+        return self._rag_provider
+
+    def skill_provider(self) -> ExpenseSkillProvider:
+        return self._skill_provider
+
     def bootstrap_store(self, store: Any) -> None:
         ddl = files(__package__).joinpath("schema.sql").read_text(encoding="utf-8")
         with store.transaction() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(hashtext('enterprise_expense.schema'))")
             cur.execute(ddl)
-        scope = AuthScope("seed", ("employee", "exec"))
-        if store.rows("SELECT to_regclass('rag_parents') AS tbl")[0]["tbl"]:
-            rag_repo = PgRagRepository(store)
-            rag_repo.index_document(
-                scope,
-                "2026 差旅与费用报销制度",
-                "一线城市差旅住宿标准上限 650 元/晚；季度部门累计超标超过 10% 必须发起专项审批。",
-                ["employee", "finance"],
-                parent="travel_2026",
-                section="住宿标准与超标审批红线",
-            )
-            rag_repo.index_document(
-                scope,
-                "高管薪酬方案（绝密）",
-                "高管年度奖金系数为 3.5x，仅限 exec 角色查看。",
-                ["exec"],
-                parent="exec_comp",
-                section="奖金池",
-            )
-        if store.rows("SELECT to_regclass('agent_skills') AS tbl")[0]["tbl"]:
-            skills_repo = PgSkillsRepository(store)
-            if not skills_repo.list_skills(scope, query="expense-audit-report", include_disabled=True, bypass_acl=True):
-                skills_repo.publish_skill(
-                    scope=scope,
-                    slug="expense-audit-report",
-                    description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
-                    content=DEFAULT_EXPENSE_SKILL_MD,
-                    acl_roles=["employee", "finance", "exec"],
-                    tags=["finance", "report", "sop"],
-                )
+
+
+__all__ = [
+    "DEFAULT_EXPENSE_SKILL_MD",
+    "EnterpriseExpensePlugin",
+    "ExpenseRagProvider",
+    "ExpenseSkillProvider",
+]

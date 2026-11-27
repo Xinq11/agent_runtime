@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,7 +22,7 @@ class AbortRequest(BaseModel):
 class ApprovalResumeRequest(BaseModel):
     approved: bool = Field(..., description="true=同意执行，false=拒绝执行")
     thread_id: Optional[str] = Field(default=None, description="可选校验 thread_id")
-    approver_id: Optional[str] = Field(default=None, description="审批人 ID")
+    approver_id: Optional[str] = Field(default=None, description="审批人 ID（兼容字段，服务端始终取已验证调用主体）")
     reason: str = Field(default="", description="审批备注")
 
 
@@ -36,29 +36,6 @@ class ModelConfigUpdateRequest(BaseModel):
     base_url: Optional[str] = None
     model: Optional[str] = None
     mode: Optional[str] = Field(default=None, description="当前支持 deepseek（预留多模型扩展）")
-
-
-class SkillUploadRequest(BaseModel):
-    slug: str = Field(..., description="租户内唯一 Skill 标识（小写字母/数字/-/_）")
-    description: str = Field(..., description="一句话技能简介（用于列表检索与模型发现）")
-    content: str = Field(..., description="SKILL.md 声明式 Markdown 正文")
-    acl_roles: Optional[List[str]] = Field(default=None, description="允许访问该 Skill 的角色列表")
-    tags: List[str] = Field(default_factory=list, description="可选标签")
-    resources: Dict[str, str] = Field(
-        default_factory=dict,
-        description="可选声明式文本附属文件映射（如 {'references/template.md': '...'}），禁止可执行代码文件",
-    )
-
-
-class KnowledgeUploadRequest(BaseModel):
-    title: str
-    content: str
-    section: str = ""
-    acl_roles: Optional[List[str]] = None
-
-
-class StatusUpdateRequest(BaseModel):
-    status: Literal["active", "disabled"] = Field(..., description="active=生效，disabled=下架")
 
 
 class MessageFeedbackRequest(BaseModel):

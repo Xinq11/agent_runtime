@@ -1,9 +1,8 @@
-"""Shared FastAPI request identity & fail-closed authorization helpers."""
+"""Shared FastAPI request identity & fail-closed point authorization helpers."""
 
 from __future__ import annotations
 
 import inspect
-from typing import Optional
 
 from fastapi import HTTPException, Request
 
@@ -11,14 +10,11 @@ from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.security import (
     AccessControlError,
     AccessDecision,
-    AccessFilter,
     AuthenticationError,
     AuthorizationError,
     HeaderIdentityResolver,
     ResourceRef,
     enforce_check,
-    enforce_filter,
-    enforce_filter_sync,
 )
 
 
@@ -107,29 +103,3 @@ def require_access(
         raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(503, f"access_controller_error:{type(exc).__name__}") from exc
-
-
-async def resolve_filter_async(
-    req: Request,
-    scope: AuthScope,
-    action: str,
-    resource_kind: str,
-) -> AccessFilter:
-    ac = req.app.state.runtime.access_controller
-    try:
-        return await enforce_filter(ac, scope, action, resource_kind)
-    except AccessControlError as exc:
-        raise HTTPException(503, str(exc)) from exc
-
-
-def resolve_filter(
-    req: Request,
-    scope: AuthScope,
-    action: str,
-    resource_kind: str,
-) -> AccessFilter:
-    ac = req.app.state.runtime.access_controller
-    try:
-        return enforce_filter_sync(ac, scope, action, resource_kind)
-    except AccessControlError as exc:
-        raise HTTPException(503, str(exc)) from exc

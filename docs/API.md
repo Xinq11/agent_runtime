@@ -13,15 +13,15 @@
   | Header | 说明 | 示例 |
   |---|---|---|
   | `X-User-Id` | 操作人用户 ID（存在此 Header 时按网关头解析身份，否则回退默认身份；所有会话、`run_id`、`trace_id`、`ref_id` 均按此归属鉴权） | `u_alice` |
-  | `X-User-Roles` | 逗号分隔角色列表（配合可拔插 `AccessController` 进行工具、审批及可选 RAG / Skill 过滤） | `employee,exec` |
+  | `X-User-Roles` | 逗号分隔角色列表（配合可拔插 `AccessController` 进行工具/审批鉴权，并透传给客户 `RagProvider` / `SkillProvider`） | `employee,exec` |
   | `X-Gateway-Signature` | 可选；开启 `AGENT_IDENTITY_RESOLVER=signed_header`（配置 `AGENT_GATEWAY_HMAC_SECRET`）时必传，对 `["v1", user_id, roles]` 验签，缺失或失败返 `401` | `...` |
 - **标准错误码**：
   - `401`：身份凭证缺失、过期或签名校验失败；
-  - `403`：权限不足（如非管理员访问管理面、禁止自批或审批角色不符）；
-  - `404`：会话 / Run / Trace / 审批单 / 工件 / Skill / 知识文档不存在或非创建者越权访问；
+  - `403`：权限不足（如非平台运维修改模型配置、禁止自批或审批角色不符）；
+  - `404`：会话 / Run / Trace / 审批单 / 工件不存在或非创建者越权访问；
   - `409`：同一会话已有运行中/待审批 Run、或审批单状态冲突/已取消；
-  - `413`：文档或 Skill 超过 2 MiB 体积上限；
-  - `422`：请求体校验失败（如空消息、非法 slug、Skill 上传不支持的文件类型或可执行脚本）；
+  - `413`：会话附件超过 10 MiB 体积上限；
+  - `422`：请求体校验失败（如空消息、不支持的附件类型或非法路径）；
   - `503`：外部/自定义权限控制器异常（fail-closed 拒绝服务）。
 
 ---
@@ -48,12 +48,12 @@
 
 ### 2.2 框架与插件元信息（供自定义前端动态适配）
 - `GET /api/v1/meta`
-- 返回协议版本、已启用扩展、SSE 事件类型、工具、当前用户可见的 Skills 及工作台文案。以下响应示例来自启用了费用插件的部署。
+- 返回协议版本、已启用客户插件、SSE 事件类型、工具、当前用户可见的 Skills（仅当挂载了 `SkillProvider` 时非空）及工作台文案。以下响应示例来自启用了费用插件的部署。
 ```json
 {
   "sdk_version": "1.0.0",
   "protocol_version": "1.0",
-  "extensions": ["rag", "skills", "enterprise_expense"],
+  "extensions": ["enterprise_expense"],
   "sse_events": ["meta", "token", "tool_status", "subagent_status", "approval_required", "done", "cancelled", "error"],
   "app_name": "Agent Runtime",
   "subtitle": "Workspace",
@@ -150,41 +150,14 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 
 ---
 
-## 4. Skills 技能库管理接口（可选 `SkillsExtension` 挂载）
+## 4. 观测指标与自定义业务路由
 
-> 仅在 `AGENT_EXTENSIONS` 启用 `SkillsExtension` 时挂载。
-
-- `GET /api/v1/skills?query={q}` → 列出当前角色可见的全部生效 Skill 元信息。
-- `GET /api/v1/skills/{slug}?resource={path}&include_disabled={bool}` → 从 OSS 读取 `SKILL.md` 正文或指定声明式文本附件。`include_disabled=true` 需通过 `skill:manage` 鉴权（`rbac` 模式下非管理员返回 `403`）。
-- `POST /api/v1/skills/upload` → 热发布新版本 Skill（需 `skill:manage` 权限；先写不可变 OSS 版本对象，再在 PG 原子切指针；**禁止上传 `.py`/`.sh`/`.exe` 等可执行脚本**），同时支持两种提交格式：
-  1. `multipart/form-data`（文件上传）：字段 `file`（仅允许 `.md` / `.markdown` / `.txt` / `.json` / `.yaml` / `.yml` 且 UTF-8 编码）、`slug`（可选，默认取文件名）、`description`、`acl_roles`（可选，缺省落空数组公开）。
-  2. `application/json`（结构化发布）：
-```json
-{
-  "slug": "weekly-report-sop",
-  "description": "研发团队周报汇总与风险提炼标准流程",
-  "content": "# 周报汇总 SOP\n1. ...",
-  "acl_roles": ["employee"],
-  "tags": ["ops", "report"],
-  "resources": {
-    "references/template.md": "## 本周完成\n- ..."
-  }
-}
-```
-- `PATCH /api/v1/skills/{slug}/status` → 切换 Skill 生效/下架状态，请求体：`{ "status": "active" | "disabled" }`。
-- `DELETE /api/v1/skills/{slug}` → 下线/禁用指定 Skill（与 `PATCH .../status` 并存，语义等价于置为 `disabled`）。
+- `GET /metrics` → 标准 Prometheus Exposition Format 指标端点（平台观测由 Prometheus / Loki / Grafana 提供，SDK 底座不内置管理后台）。
+- **知识库 / Skills / 业务管理接口**：SDK 底座只提供执行循环、会话与 `SkillProvider` / `RagProvider` 接入协议，不内置任何知识库上传或 Skill 管理 HTTP 路由；客户如需挂载自有业务接口，可通过 `AgentPlugin.routers()` 声明自定义 FastAPI `APIRouter`，或由独立业务服务直接维护。
 
 ---
 
-## 5. 知识库与观测指标接口
-
-- `POST /api/v1/knowledge/upload`（仅启用 `RagExtension` 时挂载）→ 支持 `application/json`（`{title, content, section, acl_roles}`）或 `multipart/form-data`（`file`, `title?`, `section?`, `acl_roles?`）上传，原文落 MinIO OSS，切块向量化后入 PG `pgvector`。
-- `PATCH /api/v1/knowledge/{parent_id}/status`（仅启用 `RagExtension` 时挂载）→ 切换知识库文档生效/下架状态，请求体：`{ "status": "active" | "disabled" }`。
-- `GET /metrics` → 标准 Prometheus Exposition Format 指标端点（平台观测由 Prometheus / Loki / Grafana 提供，底座不内置管理后台）。
-
----
-
-## 6. 最小前端接入示例（TypeScript / Fetch）
+## 5. 最小前端接入示例（TypeScript / Fetch）
 
 > 以下示例中的 `X-*` 身份头仅用于本地演示或直连内部可信网关场景；企业门户接入时应通过登录态 Token / Cookie 由前置网关鉴权后向后端注入可信主体。
 

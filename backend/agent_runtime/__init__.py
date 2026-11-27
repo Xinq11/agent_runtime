@@ -1,8 +1,8 @@
-"""`agent_runtime` — Unified Internal General Agent SDK.
+"""`agent_runtime` — Pure Internal General Agent Harness SDK.
 
-Core SDK requires ZERO pgvector, RAG, Skills, or Ops tables/routes.
-Optional official extensions (`RagExtension`, `SkillsExtension`) are lazily exported here
-for convenience without creating any reverse dependency from core `framework/` to `extensions/`.
+Provides execution loop, context compaction, tool gateway, declarative sub-agents,
+approval pause/resume, cloud workspace files, observability, and thin `SkillProvider`
+/ `RagProvider` hooks. Storage, retrieval engines, and business ACL live in customer plugins.
 """
 
 from __future__ import annotations
@@ -30,12 +30,16 @@ from agent_runtime.framework.core.protocols import (
     AppMetadata,
     LLMProvider,
     QuickPromptSpec,
+    RagHit,
+    RagProvider,
+    RagResult,
+    SkillMeta,
+    SkillProvider,
 )
 from agent_runtime.framework.core.security import (
     AccessControlError,
     AccessController,
     AccessDecision,
-    AccessFilter,
     AuthenticationError,
     AuthorizationError,
     HeaderIdentityResolver,
@@ -55,7 +59,6 @@ __all__ = [
     "AccessControlError",
     "AccessController",
     "AccessDecision",
-    "AccessFilter",
     "AgentMiddleware",
     "AgentPlugin",
     "AgentRuntimeApp",
@@ -64,8 +67,6 @@ __all__ = [
     "AuthScope",
     "AuthenticationError",
     "AuthorizationError",
-    "ChunkSearchResult",
-    "EmbeddingClient",
     "ExecutionContext",
     "HeaderIdentityResolver",
     "IdentityResolver",
@@ -73,24 +74,17 @@ __all__ = [
     "Message",
     "MiddlewareChain",
     "NoopAccessController",
-    "ParentEvidenceResult",
     "PgOssStore",
-    "PgRagRepository",
-    "PgSkillsRepository",
     "QuickPromptSpec",
-    "RAGChunk",
-    "RAGStrategy",
-    "RagExtension",
-    "RagRetrievalService",
+    "RagHit",
+    "RagProvider",
+    "RagResult",
     "RbacAccessController",
-    "RerankClient",
-    "RerankItem",
     "ResourceRef",
-    "RetrievalResult",
     "RiskLevel",
     "RunRecord",
-    "SkillSummary",
-    "SkillsExtension",
+    "SkillMeta",
+    "SkillProvider",
     "SpanRecord",
     "SSEEvent",
     "StaticIdentityResolver",
@@ -99,13 +93,9 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "WorkspaceFileRecord",
-    "diversify_candidates",
-    "final_rank_fuse",
     "load_access_controller",
     "load_extension",
     "load_identity_resolver",
-    "rerank_candidates",
-    "rrf_fuse",
     "tool",
 ]
 
@@ -127,47 +117,6 @@ def __getattr__(name: str) -> Any:
         from agent_runtime.framework.tools.subagent import SubAgentProfile as _profile
 
         return _profile
-    if name == "RagRetrievalService":
-        from agent_runtime.extensions.rag.retrieval import RagRetrievalService as _rag
-
-        return _rag
-    if name == "PgRagRepository":
-        from agent_runtime.extensions.rag.repo import PgRagRepository as _rag_repo
-
-        return _rag_repo
-    if name in ("rrf_fuse", "diversify_candidates", "rerank_candidates", "final_rank_fuse"):
-        from agent_runtime.extensions.rag import ranking as _rank
-
-        return getattr(_rank, name)
-    if name in (
-        "RAGChunk",
-        "RAGStrategy",
-        "RetrievalResult",
-        "ChunkSearchResult",
-        "ParentEvidenceResult",
-        "EmbeddingClient",
-        "RerankClient",
-        "RerankItem",
-    ):
-        from agent_runtime.extensions.rag import models as _rm
-
-        return getattr(_rm, name)
-    if name == "RagExtension":
-        from agent_runtime.extensions.rag.extension import RagExtension as _ext
-
-        return _ext
-    if name == "SkillsExtension":
-        from agent_runtime.extensions.skills.extension import SkillsExtension as _skills
-
-        return _skills
-    if name == "PgSkillsRepository":
-        from agent_runtime.extensions.skills.repo import PgSkillsRepository as _skills_repo
-
-        return _skills_repo
-    if name == "SkillSummary":
-        from agent_runtime.extensions.skills.models import SkillSummary as _skill_summary
-
-        return _skill_summary
     if name == "PgOssStore":
         from agent_runtime.infra.pg.postgres import PgOssStore as _pg
 

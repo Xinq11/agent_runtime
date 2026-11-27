@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-runtime"
 version = "1.0.0"
-description = "Internal plug-and-play general Agent Runtime SDK (LangGraph 1.x + PG/pgvector + MinIO OSS + PLG + HTTP/SSE v1)"
+description = "Internal plug-and-play general Agent Harness SDK (LangGraph 1.x + PG + MinIO OSS + PLG + HTTP/SSE v1)"
 requires-python = ">=3.9"
 dependencies = [
     "psycopg[binary,pool]>=3.2,<4",
@@ -34,7 +34,3 @@ docs = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["agent_runtime*"]
-
-[tool.setuptools.package-data]
-"agent_runtime.extensions.rag" = ["*.sql"]
-"agent_runtime.extensions.skills" = ["*.sql"]

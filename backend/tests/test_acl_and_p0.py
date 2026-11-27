@@ -1,4 +1,4 @@
-"""P0 security regression tests & pluggable ACL contract tests."""
+"""P0 security regression tests & minimal point-check AuthN/AuthZ contract tests."""
 
 from __future__ import annotations
 
@@ -11,21 +11,16 @@ from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry
 
 from agent_runtime import (
+    AccessDecision,
     AgentRuntimeApp,
     ApprovalDecision,
+    AuthenticationError,
     AuthScope,
     ExecutionContext,
     HeaderIdentityResolver,
     Message,
-    NoopAccessController,
-    PgRagRepository,
-    PgSkillsRepository,
-    RAGChunk,
-    RagExtension,
-    RagRetrievalService,
     RbacAccessController,
     RiskLevel,
-    SkillsExtension,
     ToolCall,
     tool,
 )
@@ -50,9 +45,6 @@ class BrokenAccessController:
     """Simulates a failing remote policy engine (OPA/IAM timeout) to verify fail-closed."""
 
     def check(self, scope, action, resource):
-        raise RuntimeError("policy_engine_timeout")
-
-    def filter_for(self, scope, action, resource_kind):
         raise RuntimeError("policy_engine_timeout")
 
     def policy_rev(self, scope) -> int:
@@ -116,155 +108,25 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_p0_empty_roles_semantics_for_rag_and_skills(self):
-        async def _run():
-            store = get_test_store()
-            rag_repo = PgRagRepository(store)
-            rag_repo.bootstrap_schema()
-            skills_repo = PgSkillsRepository(store)
-            skills_repo.bootstrap_schema()
-
-            rag_rbac = RagRetrievalService(
-                rag_repo, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
-            )
-            rag_noop = RagRetrievalService(
-                rag_repo, min_rerank_score=0.35, access_controller=NoopAccessController()
-            )
-            rag_rbac.index_chunk(
-                RAGChunk(
-                    chunk_id="pub_1",
-                    parent_id="p_pub",
-                    doc_title="公开手册",
-                    section_path="总则",
-                    doc_url="kb://pub",
-                    content="公司门禁卡补办流程说明",
-                    parent_text="公司门禁卡补办流程说明",
-                    acl_roles=(),
-                )
-            )
-            rag_rbac.index_chunk(
-                RAGChunk(
-                    chunk_id="sec_1",
-                    parent_id="p_sec",
-                    doc_title="高管机密",
-                    section_path="薪酬",
-                    doc_url="kb://sec",
-                    content="高管期权激励方案细则",
-                    parent_text="高管期权激励方案细则",
-                    acl_roles=("exec",),
-                )
-            )
-
-            admin = AuthScope("u_admin", ("admin",))
-            skills_repo.publish_skill(
-                scope=admin,
-                slug="public-guide",
-                description="全员公开流程",
-                content="# 公开内容",
-                acl_roles=[],
-            )
-            skills_repo.publish_skill(
-                scope=admin,
-                slug="exec-secret",
-                description="高管专属流程",
-                content="# 机密内容",
-                acl_roles=["exec"],
-            )
-
-            no_role_scope = AuthScope("u_guest", ())
-
-            # Under RBAC: empty caller roles sees ONLY public docs/skills, never exec-only!
-            pub_hit = await rag_rbac.retrieve(scope=no_role_scope, query="门禁卡补办流程")
-            self.assertEqual(pub_hit.status, "ok")
-            sec_hit = await rag_rbac.retrieve(scope=no_role_scope, query="高管期权激励方案")
-            self.assertEqual(sec_hit.hits, [])
-
-            rbac_flt = RbacAccessController(admin_roles=("admin",)).filter_for(
-                no_role_scope, "skill:read", "skill"
-            )
-            visible_slugs = [s.slug for s in skills_repo.list_skills(no_role_scope, access_filter=rbac_flt)]
-            self.assertEqual(visible_slugs, ["public-guide"])
-
-            # Under Noop: unrestricted retrieval sees exec-only doc
-            noop_hit = await rag_noop.retrieve(scope=no_role_scope, query="高管期权激励方案")
-            self.assertEqual(noop_hit.status, "ok")
-            self.assertIn("p_sec", [h.parent_id for h in noop_hit.hits])
-
-        asyncio.run(_run())
-
-    def test_p0_http_include_disabled_ops_and_state_acl_gating(self):
+    def test_p0_http_model_config_and_state_gating(self):
         store = get_test_store()
         obs = _TestTelemetry(store)
         rbac = RbacAccessController(admin_roles=("admin",))
         model = EchoTestModel()
         model.config = ModelSettings(api_key="sk-test", mode="deepseek")
-        runtime = AgentRuntimeApp(
-            model=model,
-            store=store,
-            obs=obs,
-            extensions=[RagExtension(), SkillsExtension()],
-            access_controller=rbac,
-        )
-        runtime.bootstrap_extensions()
-        rag_repo = PgRagRepository(store)
-        skills_repo = PgSkillsRepository(store)
-        admin_scope = AuthScope("u_admin", ("admin",))
-        skills_repo.publish_skill(
-            scope=admin_scope,
-            slug="secret-sop",
-            description="高管机密 SOP",
-            content="# 绝密流程",
-            acl_roles=["exec"],
-        )
-        skills_repo.set_skill_status(admin_scope, "secret-sop", "disabled")
-        doc = rag_repo.index_document(admin_scope, "高管密件", "仅高管可见内容", ["exec"])
-        rag_repo.index_document(admin_scope, "全员公告", "全员公开内容", [])
+        runtime = AgentRuntimeApp(model=model, store=store, obs=obs, access_controller=rbac)
 
         emp_headers = {"X-User-Id": "u_emp", "X-User-Roles": "employee"}
         admin_headers = {"X-User-Id": "u_admin", "X-User-Roles": "admin"}
+        plat_headers = {"X-User-Id": "u_plat", "X-User-Roles": "platform_admin"}
         client = TestClient(_make_http_app(runtime))
 
-        # Non-admin MUST NOT bypass ACL using ?include_disabled=true
-        r_bypass = client.get("/api/v1/skills/secret-sop?include_disabled=true", headers=emp_headers)
-        self.assertEqual(r_bypass.status_code, 403)
         self.assertEqual(
             client.post("/api/v1/config/model", headers=emp_headers, json={"mode": "deepseek"}).status_code, 403
         )
         self.assertEqual(
-            client.patch(
-                f"/api/v1/knowledge/{doc['parent_id']}/status",
-                headers=emp_headers,
-                json={"status": "disabled"},
-            ).status_code,
-            403,
+            client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "deepseek"}).status_code, 403
         )
-        self.assertEqual(
-            client.patch(
-                "/api/v1/skills/secret-sop/status", headers=emp_headers, json={"status": "active"}
-            ).status_code,
-            403,
-        )
-
-        # Core /state no longer exposes or queries RAG knowledge_chunks
-        r_state = client.get("/api/v1/state", headers=emp_headers)
-        self.assertEqual(r_state.status_code, 200)
-        self.assertNotIn("knowledge_chunks", r_state.json())
-
-        # Admin succeeds on disabled preview, while still unable to mutate shared process model config
-        r_admin_sk = client.get("/api/v1/skills/secret-sop?include_disabled=true", headers=admin_headers)
-        self.assertEqual(r_admin_sk.status_code, 200)
-        self.assertIn("绝密流程", r_admin_sk.json()["content"])
-
-        self.assertEqual(
-            client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "deepseek"}).status_code,
-            403,
-        )
-
-        # Platform admin CAN update model config
-        plat_headers = {
-            "X-User-Id": "u_plat",
-            "X-User-Roles": "platform_admin",
-        }
         self.assertEqual(
             client.post(
                 "/api/v1/config/model", headers=plat_headers, json={"mode": "deepseek", "model": "deepseek-chat"}
@@ -275,13 +137,18 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             client.post("/api/v1/config/model", headers=plat_headers, json={"mode": "mock"}).status_code,
             422,
         )
+
+        r_state = client.get("/api/v1/state", headers=emp_headers)
+        self.assertEqual(r_state.status_code, 200)
+        self.assertNotIn("knowledge_chunks", r_state.json())
+
         unconfigured = OpenAICompatibleProvider(None, obs, settings=ModelSettings(api_key=""))
         with self.assertRaises(ModelNotConfiguredError):
             asyncio.run(
                 unconfigured.generate(
                     messages=[Message("user", "ping")],
                     tool_specs=[],
-                    ctx=ExecutionContext(uid("tr"), uid("th"), admin_scope, uid("req")),
+                    ctx=ExecutionContext(uid("tr"), uid("th"), AuthScope("u_admin", ("admin",)), uid("req")),
                 )
             )
 
@@ -321,7 +188,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         resolver = HeaderIdentityResolver(hmac_secret=secret)
         client = TestClient(_make_http_app(runtime, resolver=resolver))
 
-        # Unsigned / tampered request -> 401
         self.assertEqual(
             client.get(
                 "/api/v1/meta",
@@ -330,12 +196,10 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             401,
         )
 
-        # Start paused turn as employee u_alice
         emp_scope = AuthScope("u_alice", ("employee",), authenticated=True)
         paused = asyncio.run(runtime.run_turn("发放 900 元", thread_id="th_pay", scope=emp_scope))
         review_id = paused["__interrupt__"][0]["review_id"]
 
-        # Self-approval as u_alice (even spoofing body.approver_id="mgr_bob") -> 403!
         alice_hdr = HeaderIdentityResolver.sign_headers(
             secret=secret, user_id="u_alice", roles=("employee", "manager")
         )
@@ -347,7 +211,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_self.status_code, 403)
         self.assertEqual(writes, [])
 
-        # Authorized manager u_boss approves while spoofing body.approver_id -> recorded as u_boss!
         boss_hdr = HeaderIdentityResolver.sign_headers(
             secret=secret, user_id="u_boss", roles=("manager",)
         )
@@ -392,7 +255,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             paused = await app.run_turn("转账", thread_id="th_rev", scope=scope)
             review_id = paused["__interrupt__"][0]["review_id"]
 
-            # Bump policy_rev while paused -> resume MUST NOT execute wire_transfer!
             rbac.bump_policy_rev()
             res = await app.resume_approval(
                 thread_id="th_rev",
@@ -402,12 +264,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             self.assertEqual(writes, [])
             self.assertTrue(res.get("final_answer"))
 
-            # Broken controller -> fail-closed everywhere (never falls back to Noop)
             broken = BrokenAccessController()
-            rag_broken = RagRetrievalService(store, access_controller=broken)
-            rag_res = await rag_broken.retrieve(scope=scope, query="任何内容")
-            self.assertEqual(rag_res.status, "acl_error")
-
             app_broken = AgentRuntimeApp(store=store, obs=obs, access_controller=broken)
             ctx = ExecutionContext(uid("tr"), "th_brk", scope, uid("req"))
             tool_res = await app_broken.gateway.execute_one(ToolCall("tc_b", "read", {"path": "."}), ctx)
@@ -442,61 +299,11 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         asyncio.run(_run())
 
-    def test_p0_mixed_acl_parent_unsupported_filter_signature_boundaries_and_sdk_approver(self):
-        from agent_runtime import (
-            AccessControlError,
-            AccessDecision,
-            AccessFilter,
-            AuthenticationError,
-        )
-        from agent_runtime.extensions._acl_sql import compile_acl_sql
-
+    def test_p0_signature_boundaries_sdk_approver_and_artifact_gate(self):
         async def _run():
             store = get_test_store()
-            rag_repo = PgRagRepository(store)
-            rag_repo.bootstrap_schema()
-            rag = RagRetrievalService(
-                rag_repo, min_rerank_score=0.35, access_controller=RbacAccessController(admin_roles=("admin",))
-            )
-            full_parent = "公开章节：普通差旅每天补助 180 元。\n绝密章节：CEO 特别津贴 99999 元。"
-            rag.index_chunk(
-                RAGChunk(
-                    chunk_id="mix_1",
-                    parent_id="p_mix",
-                    doc_title="混合制度",
-                    section_path="补助",
-                    doc_url="kb://mix",
-                    content="公开章节：普通差旅每天补助 180 元。",
-                    parent_text=full_parent,
-                    acl_roles=(),
-                )
-            )
-            rag.index_chunk(
-                RAGChunk(
-                    chunk_id="mix_2",
-                    parent_id="p_mix",
-                    doc_title="混合制度",
-                    section_path="高管",
-                    doc_url="kb://mix",
-                    content="绝密章节：CEO 特别津贴 99999 元。",
-                    parent_text=full_parent,
-                    acl_roles=("exec",),
-                )
-            )
             emp = AuthScope("u_emp", ("employee",))
-            res_emp = await rag.retrieve(scope=emp, query="普通差旅每天补助")
-            self.assertEqual(res_emp.status, "ok")
-            self.assertIn("180", res_emp.formatted_context)
-            self.assertNotIn("99999", res_emp.formatted_context)
-            self.assertNotIn("CEO 特别津贴", res_emp.formatted_context)
 
-            # Unsupported AccessFilter predicates MUST fail closed (never silently widen)
-            with self.assertRaises(AccessControlError):
-                compile_acl_sql(AccessFilter(owner_id="u_other"), scope=emp)
-            with self.assertRaises(AccessControlError):
-                compile_acl_sql(AccessFilter(any_depts=("d_fin",)), scope=emp)
-
-            # Signed gateway header encoding is unambiguous & rejects control/delimiter abuse
             secret = "strict-hmac-secret"
             resolver = HeaderIdentityResolver(hmac_secret=secret)
             hdr1 = HeaderIdentityResolver.sign_headers(
@@ -506,15 +313,10 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             with self.assertRaises(AuthenticationError):
                 resolver.resolve(tampered)
             with self.assertRaises(AuthenticationError):
-                HeaderIdentityResolver.sign_headers(
-                    secret=secret, user_id="u1", roles=("a,b",)
-                )
+                HeaderIdentityResolver.sign_headers(secret=secret, user_id="u1", roles=("a,b",))
             with self.assertRaises(AuthenticationError):
-                HeaderIdentityResolver.sign_headers(
-                    secret=secret, user_id="u1\n", roles=("employee",)
-                )
+                HeaderIdentityResolver.sign_headers(secret=secret, user_id="u1\n", roles=("employee",))
 
-            # SDK resume_approval stamps authoritative caller.user_id (ignoring spoofed decision.approver_id)
             @tool(risk_level=RiskLevel.HIGH_RISK)
             async def approve_me(x: int) -> str:
                 return f"ok:{x}"

@@ -1,11 +1,11 @@
-"""Security exceptions, AuthN/AuthZ protocols, data models, and fail-closed enforcement helpers."""
+"""Minimal security exceptions, AuthN/AuthZ point-check protocols, and fail-closed enforcement."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
 import inspect
-from typing import Any, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from agent_runtime.framework.core.contracts import AuthScope
 
@@ -25,14 +25,14 @@ class AuthorizationError(PermissionError):
 
 
 class AccessControlError(RuntimeError):
-    """Raised on fail-closed access controller failure (timeout, backend error, invalid filter)."""
+    """Raised on fail-closed access controller failure (timeout, backend error, invalid decision)."""
 
 
 @dataclass(frozen=True)
 class ResourceRef:
     """Structured target reference passed to `AccessController.check`."""
 
-    kind: str  # "thread" | "run" | "approval" | "tool" | "rag_doc" | "skill" | "artifact" | "ops" | "system"
+    kind: str  # "approval" | "tool" | "artifact" | "system"
     id: str = "*"
     owner_id: Optional[str] = None
     attrs: Mapping[str, Any] = field(default_factory=dict)
@@ -48,27 +48,6 @@ class AccessDecision:
     policy_rev: int = 1
 
 
-@dataclass(frozen=True)
-class AccessFilter:
-    """Structured whitelist predicate pushed down to extension stores or external retrieval engines.
-
-    Plugins never emit raw SQL strings; storage adapters compile only whitelisted fields.
-    """
-
-    unrestricted: bool = False
-    any_roles: Tuple[str, ...] = ()
-    any_depts: Tuple[str, ...] = ()
-    owner_id: Optional[str] = None
-    include_public: bool = True
-    include_disabled: bool = False
-    deny_all: bool = False
-    policy_rev: int = 1
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "any_roles", tuple(self.any_roles or ()))
-        object.__setattr__(self, "any_depts", tuple(self.any_depts or ()))
-
-
 @runtime_checkable
 class IdentityResolver(Protocol):
     """AuthN protocol: resolves an incoming HTTP request or host context into an `AuthScope`."""
@@ -78,11 +57,9 @@ class IdentityResolver(Protocol):
 
 @runtime_checkable
 class AccessController(Protocol):
-    """AuthZ protocol: point action checks, pushable data filters, and policy revision."""
+    """Minimal AuthZ point-check protocol for tools, approvals, artifacts, and model updates."""
 
     def check(self, scope: AuthScope, action: str, resource: ResourceRef) -> Any: ...
-
-    def filter_for(self, scope: AuthScope, action: str, resource_kind: str) -> Any: ...
 
     def policy_rev(self, scope: AuthScope) -> int: ...
 
@@ -132,45 +109,6 @@ async def enforce_check(
         status = 404 if decision.code == "not_found" else 403
         raise AuthorizationError(decision.reason or "permission_denied", code=decision.code, status_code=status)
     return decision
-
-
-async def enforce_filter(
-    controller: AccessController,
-    scope: AuthScope,
-    action: str,
-    resource_kind: str,
-) -> AccessFilter:
-    """Fail-closed data filter builder."""
-    try:
-        flt = await _maybe_await(controller.filter_for(scope, action, resource_kind))
-    except AccessControlError:
-        raise
-    except Exception as exc:
-        raise AccessControlError(f"access_filter_error:{type(exc).__name__}") from exc
-    if not isinstance(flt, AccessFilter):
-        raise AccessControlError("invalid_access_filter")
-    return flt
-
-
-def enforce_filter_sync(
-    controller: AccessController,
-    scope: AuthScope,
-    action: str,
-    resource_kind: str,
-) -> AccessFilter:
-    """Synchronous variant for sync call paths; rejects awaitable controllers fail-closed."""
-    try:
-        flt = controller.filter_for(scope, action, resource_kind)
-    except AccessControlError:
-        raise
-    except Exception as exc:
-        raise AccessControlError(f"access_filter_error:{type(exc).__name__}") from exc
-    if inspect.isawaitable(flt):
-        flt.close()  # type: ignore[union-attr]
-        raise AccessControlError("async_access_filter_in_sync_path")
-    if not isinstance(flt, AccessFilter):
-        raise AccessControlError("invalid_access_filter")
-    return flt
 
 
 def get_policy_rev(controller: Optional[AccessController], scope: AuthScope) -> int:

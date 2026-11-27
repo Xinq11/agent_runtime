@@ -1,13 +1,13 @@
-"""Public core extension protocols for the `agent_runtime` SDK.
+"""Public core extension protocols for the `agent_runtime` Harness SDK.
 
-Downstream teams implement these stable protocols (or subclass `AgentPlugin` /
-`AgentMiddleware`) without modifying framework internals.
-Zero RAG, Skills, or FastAPI hard dependencies live in this module.
+Downstream customer apps implement these minimal protocols (`SkillProvider`, `RagProvider`,
+`LLMProvider`, `AgentMiddleware`, `AgentPlugin`) while owning their own storage, retrieval
+engine, and business-level authorization rules.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 from agent_runtime.framework.core.contracts import (
@@ -37,7 +37,7 @@ class AppMetadata:
     plugin_name: str = "core"
     welcome_title: str = "今天想处理哪项任务？"
     welcome_description: str = (
-        "通用 Agent Runtime 底座：支持流式对话与随时中止、云原生文件读写、上下文预算压缩、子 Agent 委派、高危审批恢复与全链路 Trace 观测。"
+        "通用 Agent Harness SDK 底座：支持流式对话与随时中止、云原生文件读写、上下文预算压缩、子 Agent 委派、高危审批恢复与全链路 Trace 观测。"
     )
     quick_prompts: Tuple[QuickPromptSpec, ...] = ()
 
@@ -53,6 +53,72 @@ class AppMetadata:
                 for q in self.quick_prompts
             ],
         }
+
+
+@dataclass(frozen=True)
+class SkillMeta:
+    """Lightweight Skill catalog entry returned by a customer `SkillProvider`."""
+
+    slug: str
+    description: str = ""
+    tags: Tuple[str, ...] = ()
+    resources: Tuple[str, ...] = ()
+
+
+@runtime_checkable
+class SkillProvider(Protocol):
+    """Customer-implemented hook for listing authorized Skills and reading Skill bodies.
+
+    Storage (DB / Git / OSS / Wiki) and business ACL live entirely inside the customer's
+    implementation; the SDK wires `list_skills` / `get_skill` tools and Layer-1 progressive
+    disclosure automatically.
+    """
+
+    def list_skills(self, scope: AuthScope, query: str = "") -> Any: ...
+
+    def get_skill(self, scope: AuthScope, slug: str, resource: Optional[str] = None) -> Any: ...
+
+
+@dataclass(frozen=True)
+class RagHit:
+    """Single grounded retrieval hit returned by a customer `RagProvider`."""
+
+    title: str
+    content: str
+    section: str = ""
+    source_url: str = ""
+
+
+@dataclass(frozen=True)
+class RagResult:
+    """Standardized RAG output separating grounded hits, low-confidence, no-hit, and errors."""
+
+    status: str = "ok"  # ok | no_hit | low_confidence | error
+    hits: Tuple[RagHit, ...] = ()
+    formatted_context: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hits", tuple(self.hits or ()))
+
+
+@runtime_checkable
+class RagProvider(Protocol):
+    """Customer-implemented hook for RAG retrieval (Milvus / ES / Dify / pgvector / enterprise KB).
+
+    Retrieval pipeline, vector storage, and document-level ACL live entirely inside the
+    customer's implementation; the SDK wires `search_knowledge` (and optional budget-bounded
+    auto-injection) with grounded citation formatting automatically.
+    """
+
+    def retrieve(
+        self,
+        *,
+        scope: AuthScope,
+        query: str,
+        top_k: int = 4,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> Any: ...
 
 
 @runtime_checkable
@@ -110,11 +176,11 @@ class AgentMiddleware:
 
 
 class AgentPlugin:
-    """Base class for modular extensions & customer delivery packs.
+    """Base class for modular customer delivery packs.
 
-    Plugins contribute tools, declarative read-only sub-agents (`subagents()`),
-    middlewares, prompt segments, optional HTTP routers (`routers()`),
-    storage bootstrapping, and UI metadata without touching core internals.
+    Plugins contribute business tools, declarative read-only sub-agents (`subagents()`),
+    optional `SkillProvider` / `RagProvider` hooks, middlewares, prompt segments,
+    optional HTTP routers (`routers()`), storage bootstrapping, and UI metadata.
     """
 
     name: str = "custom"
@@ -137,6 +203,14 @@ class AgentPlugin:
     def subagents(self) -> Sequence[Any]:
         """Return `SubAgentProfile` declarations auto-wired by `AgentRuntimeApp`."""
         return ()
+
+    def skill_provider(self) -> Optional[SkillProvider]:
+        """Optionally return a customer `SkillProvider` wired into `list_skills`/`get_skill`."""
+        return None
+
+    def rag_provider(self) -> Optional[RagProvider]:
+        """Optionally return a customer `RagProvider` wired into `search_knowledge`."""
+        return None
 
     def middlewares(self) -> Sequence[AgentMiddleware]:
         return ()

@@ -1,23 +1,21 @@
 """Acceptance test suite locking down every invariant in `ARCHITECTURE_REVIEW.md`:
 
-1. AST reverse-dependency guard: core `framework/**`, `infra/**`, and core `api/*` NEVER import `extensions.*`.
-2. Pure SDK zero-RAG/Skills/vector/Ops acceptance: fresh DB with NO `vector` extension and NO RAG/Skills tables
-   runs declarative `AgentPlugin.subagents()`, `HIGH_RISK` pause/approve/reject/cancel, duplicate-approval
-   idempotency, and continuing conversation on the same thread after cancel.
+1. Pure SDK zero-RAG/Skills/vector/Ops check: SDK package ships ZERO built-in RAG/Skills tables or admin UI.
+2. Fresh DB with NO `vector` extension and NO RAG/Skills tables runs declarative `AgentPlugin.subagents()`,
+   `HIGH_RISK` pause/approve/reject/cancel, duplicate-approval idempotency, and continuing on the same thread.
 3. Cross-user ownership isolation across BOTH `default` and `noop` access controllers for `thread_id`,
    `run_id`, `trace_id`, `ref_id`, and `approval:decide`.
-4. Customer A (official RAG/Skills extensions) vs Customer B (custom external knowledge/skill tools)
-   sharing the exact same SDK version with strict visibility isolation.
+4. Customer A vs Customer B plugging independent `RagProvider` / `SkillProvider` implementations on the
+   exact same SDK version with customer-owned business ACL.
 5. Sub-agent immediate cancellation response.
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 import unittest
 
 from fastapi import APIRouter, FastAPI
@@ -36,12 +34,11 @@ from agent_runtime import (
     ExecutionContext,
     Message,
     NoopAccessController,
-    PgRagRepository,
-    PgSkillsRepository,
-    RagExtension,
+    RagHit,
+    RagResult,
     RbacAccessController,
     RiskLevel,
-    SkillsExtension,
+    SkillMeta,
     SubAgentProfile,
     ToolCall,
     tool,
@@ -86,29 +83,15 @@ class TestArchitectureAcceptance(unittest.TestCase):
     def setUp(self) -> None:
         reset_test_db()
 
-    def test_01_ast_core_has_zero_reverse_dependency_on_extensions(self):
+    def test_01_sdk_contains_no_builtin_rag_skills_storage_or_admin_routes(self):
         pkg_root = Path(__file__).resolve().parents[1] / "agent_runtime"
-        core_paths = (
-            list((pkg_root / "framework").rglob("*.py"))
-            + list((pkg_root / "infra").rglob("*.py"))
-            + [
-                pkg_root / "api" / name
-                for name in ("main.py", "chat_stream.py", "threads.py", "approvals.py", "state.py", "system.py", "deps.py", "schemas.py")
-            ]
-        )
-        violations: List[str] = []
-        for path in core_paths:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        if alias.name.startswith("agent_runtime.extensions"):
-                            violations.append(f"{path}:{node.lineno} imports {alias.name}")
-                elif isinstance(node, ast.ImportFrom):
-                    mod = node.module or ""
-                    if mod.startswith("agent_runtime.extensions"):
-                        violations.append(f"{path}:{node.lineno} imports from {mod}")
-        self.assertEqual(violations, [], f"Core reverse dependency detected: {violations}")
+        self.assertFalse((pkg_root / "extensions").exists())
+        self.assertFalse((pkg_root / "api" / "ops.py").exists())
+        self.assertFalse((pkg_root / "api" / "skills.py").exists())
+
+        pure_http = create_app(extensions=[])
+        paths = set(pure_http.openapi()["paths"].keys())
+        self.assertFalse(any("/skills" in p or "/knowledge" in p or "/ops" in p for p in paths))
 
     def test_02_pure_sdk_zero_rag_skills_tables_no_vector_no_ops(self):
         core_db = "agent_runtime_core_only_test"
@@ -132,16 +115,10 @@ class TestArchitectureAcceptance(unittest.TestCase):
         try:
             core_store.bootstrap()
 
-            # Assert ZERO vector extension and ZERO RAG/Skills tables exist in this fresh core-only DB
             ext_rows = core_store.rows("SELECT extname FROM pg_extension WHERE extname='vector'")
             self.assertEqual(ext_rows, [])
             for tbl in ("rag_parents", "rag_chunks", "agent_skills", "agent_skill_versions"):
                 self.assertIsNone(core_store.rows("SELECT to_regclass(%s) AS t", (tbl,))[0]["t"])
-
-            # Pure SDK FastAPI app mounts ZERO RAG/Skills/Ops routes by default
-            pure_http = create_app(extensions=[])
-            paths = set(pure_http.openapi()["paths"].keys())
-            self.assertFalse(any("/skills" in p or "/knowledge" in p or "/ops" in p for p in paths))
 
             writes: List[str] = []
 
@@ -208,7 +185,7 @@ class TestArchitectureAcceptance(unittest.TestCase):
                 app.bootstrap_extensions()
                 alice = AuthScope("u_alice", ("employee",))
 
-                # 1. Subagent delegation + HIGH_RISK pause -> approve -> resume (1 write); duplicate approve fails & no 2nd write
+                # 1. Subagent + HIGH_RISK pause -> approve -> resume (1 write); duplicate approve blocked
                 p1 = await app.run_turn("RUN_FLOW:ORD-1", thread_id="th_core_1", scope=alice)
                 self.assertIn("__interrupt__", p1)
                 self.assertEqual(writes, [])
@@ -228,7 +205,7 @@ class TestArchitectureAcceptance(unittest.TestCase):
                     )
                 self.assertEqual(writes, ["ORD-1"])
 
-                # 2. HIGH_RISK pause -> reject -> skips execution (0 new writes)
+                # 2. HIGH_RISK pause -> reject -> skips execution
                 p2 = await app.run_turn("RUN_FLOW:ORD-2", thread_id="th_core_2", scope=alice)
                 rid2 = p2["__interrupt__"][0]["review_id"]
                 done2 = await app.resume_approval(
@@ -239,7 +216,7 @@ class TestArchitectureAcceptance(unittest.TestCase):
                 self.assertIn("approval_rejected", done2["final_answer"])
                 self.assertEqual(writes, ["ORD-1"])
 
-                # 3. HIGH_RISK pause -> cancel -> stale approve blocked AND same thread continues cleanly!
+                # 3. HIGH_RISK pause -> cancel -> stale approve blocked AND same thread continues cleanly
                 p3 = await app.run_turn("RUN_FLOW:ORD-3", thread_id="th_core_3", scope=alice)
                 rid3 = p3["__interrupt__"][0]["review_id"]
                 await app.abort_run(scope=alice, run_id=p3["run_id"])
@@ -250,7 +227,6 @@ class TestArchitectureAcceptance(unittest.TestCase):
                         scope=alice,
                     )
                 self.assertEqual(writes, ["ORD-1"])
-                # Continuing conversation on the EXACT SAME thread MUST work (no checkpoint deadlock!)
                 continued = await app.run_turn("取消后继续聊聊", thread_id="th_core_3", scope=alice)
                 self.assertEqual(continued["final_answer"], "继续对话成功:取消后继续聊聊")
 
@@ -313,7 +289,6 @@ class TestArchitectureAcceptance(unittest.TestCase):
             bob_h = {"X-User-Id": "u_bob", "X-User-Roles": "employee"}
             alice_h = {"X-User-Id": "u_alice", "X-User-Roles": "employee"}
 
-            # Bob cannot read or mutate ANY of Alice's resources even when knowing every ID
             self.assertEqual(client.get(f"/api/v1/threads/{tid}/messages", headers=bob_h).status_code, 404, mode_name)
             self.assertEqual(client.get(f"/api/v1/state?thread_id={tid}", headers=bob_h).status_code, 404, mode_name)
             self.assertEqual(client.get(f"/api/v1/state?trace_id={trace_id}", headers=bob_h).status_code, 404, mode_name)
@@ -329,7 +304,6 @@ class TestArchitectureAcceptance(unittest.TestCase):
             self.assertEqual(client.get(f"/api/v1/outputs/{ref_id}", headers=bob_h).status_code, 404, mode_name)
             self.assertEqual(client.get(f"/api/v1/outputs/{ref_id}", headers=alice_h).status_code, 200, mode_name)
 
-            # SDK-level cross-user checks also reject Bob
             with self.assertRaises(AuthorizationError):
                 asyncio.run(
                     runtime.resume_approval(
@@ -342,7 +316,6 @@ class TestArchitectureAcceptance(unittest.TestCase):
             self.assertIsNone(page)
             self.assertEqual(err, "output_not_found")
 
-            # Alice CAN read her own trace by trace_id alone and approve her own run
             st_a = client.get(f"/api/v1/state?trace_id={trace_id}", headers=alice_h)
             self.assertEqual(st_a.status_code, 200)
             self.assertEqual(st_a.json()["trace_id"], trace_id)
@@ -355,39 +328,50 @@ class TestArchitectureAcceptance(unittest.TestCase):
             )
             self.assertEqual(ok_a.status_code, 200)
 
-    def test_04_customer_a_official_extensions_vs_customer_b_custom_platform(self):
+    def test_04_two_customers_plug_independent_rag_and_skill_providers_on_same_sdk(self):
         async def _run():
             store = get_test_store()
-            rbac = RbacAccessController(admin_roles=("admin",))
-
-            # Customer A: uses official RagExtension + SkillsExtension
-            app_a = AgentRuntimeApp(
-                store=store,
-                extensions=[RagExtension(), SkillsExtension()],
-                access_controller=rbac,
-            )
-            app_a.bootstrap_extensions()
-            admin = AuthScope("u_admin", ("admin",))
             emp = AuthScope("u_emp", ("employee",))
             exec_user = AuthScope("u_exec", ("exec",))
 
-            PgRagRepository(store).index_document(admin, "董事会议题", "仅高管可见的收购方案详情", ["exec"])
-            PgSkillsRepository(store).publish_skill(
-                scope=admin, slug="exec-mna-sop", description="高管并购 SOP", content="# M&A", acl_roles=["exec"]
-            )
+            # Customer A: plugs RagProvider + SkillProvider via AgentPlugin hooks
+            class CustomerARag:
+                async def retrieve(self, *, scope, query, top_k=4, ctx=None):
+                    if "exec" in scope.roles and "收购" in query:
+                        return RagResult("ok", (RagHit("董事会议题", "仅高管可见的收购方案详情", "机密", "kb://mna"),))
+                    return RagResult("no_hit")
 
+            class CustomerASkills:
+                def list_skills(self, scope, query=""):
+                    if "exec" in scope.roles:
+                        return [SkillMeta("exec-mna-sop", "高管并购 SOP", ("exec",))]
+                    return []
+
+                def get_skill(self, scope, slug, resource=None):
+                    return "# M&A" if ("exec" in scope.roles and slug == "exec-mna-sop") else None
+
+            class CustomerAPlugin(AgentPlugin):
+                name = "customer_a"
+
+                def rag_provider(self):
+                    return CustomerARag()
+
+                def skill_provider(self):
+                    return CustomerASkills()
+
+            app_a = AgentRuntimeApp(store=store, extensions=[CustomerAPlugin()])
             ctx_a_emp = ExecutionContext(uid("tr"), "th_a1", emp, uid("req"))
             ctx_a_exec = ExecutionContext(uid("tr"), "th_a2", exec_user, uid("req"))
             r_a_emp = await app_a.gateway.execute_one(ToolCall("c1", "search_knowledge", {"query": "收购方案"}), ctx_a_emp)
             r_a_exec = await app_a.gateway.execute_one(ToolCall("c2", "search_knowledge", {"query": "收购方案"}), ctx_a_exec)
-            self.assertNotIn("收购方案详情", r_a_emp.content)
+            self.assertIn("[NO_HIT]", r_a_emp.content)
             self.assertIn("收购方案详情", r_a_exec.content)
             sk_a_emp = await app_a.gateway.execute_one(ToolCall("c3", "list_skills", {}), ctx_a_emp)
             sk_a_exec = await app_a.gateway.execute_one(ToolCall("c4", "list_skills", {}), ctx_a_exec)
             self.assertNotIn("exec-mna-sop", sk_a_emp.content)
             self.assertIn("exec-mna-sop", sk_a_exec.content)
 
-            # Customer B: ZERO official RAG/Skills extensions, plugs own knowledge/skill platform
+            # Customer B: connects its own knowledge system directly via custom tool (no RagProvider/SkillProvider)
             corp_docs = [
                 {"title": "员工手册", "body": "年假 15 天", "roles": {"employee", "exec"}},
                 {"title": "财务底稿", "body": "毛利率 68%", "roles": {"exec"}},

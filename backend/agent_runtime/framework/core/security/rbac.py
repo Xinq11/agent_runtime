@@ -1,4 +1,4 @@
-"""Built-in `AccessController` implementations (`Noop`, `Rbac`) and environment loader."""
+"""Minimal built-in `AccessController` implementations (`Noop`, `Rbac`) and environment loader."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.security.models import (
     AccessController,
     AccessDecision,
-    AccessFilter,
     ResourceRef,
     import_symbol,
 )
@@ -28,29 +27,18 @@ class NoopAccessController:
             )
         return AccessDecision(True, policy_rev=self._policy_rev)
 
-    def filter_for(self, scope: AuthScope, action: str, resource_kind: str) -> AccessFilter:
-        return AccessFilter(
-            unrestricted=True,
-            include_public=True,
-            include_disabled=action.endswith(":manage"),
-            policy_rev=self._policy_rev,
-        )
-
     def policy_rev(self, scope: AuthScope) -> int:
         return self._policy_rev
 
 
 class RbacAccessController:
-    """Built-in role-based access controller for local default and enterprise RBAC deployments.
+    """Lightweight role-based point access controller for approvals, tools, and model settings.
 
     - `admin_roles=None` (default mode): only the thread creator may decide/resume approvals
-      unless explicit `approver_roles` are configured; extension stores still enforce `acl_roles`.
-    - `admin_roles=("admin", ...)` (RBAC mode): admin routes, platform telemetry/model writes,
-      disabled previews, and optional per-tool / approver roles are strictly gated.
+      unless explicit `approver_roles` are configured.
+    - `admin_roles=("admin", ...)` (RBAC mode): gates `system:update_model`, per-tool roles,
+      and cross-user approval rules (`approver_roles`, `forbid_self_approval`).
     """
-
-    _ADMIN_ACTIONS = frozenset({"kb:manage", "skill:manage"})
-    _PLATFORM_ADMIN_ACTIONS = frozenset({"system:update_model"})
 
     def __init__(
         self,
@@ -78,13 +66,10 @@ class RbacAccessController:
             return True
         return bool(set(scope.roles) & set(self.platform_admin_roles))
 
-    def _is_admin(self, scope: AuthScope) -> bool:
-        if self.admin_roles is None:
-            return True
-        return self._is_platform_admin(scope) or bool(set(scope.roles) & set(self.admin_roles))
-
     def _has_explicit_admin_role(self, scope: AuthScope) -> bool:
-        return self.admin_roles is not None and self._is_admin(scope)
+        if self.admin_roles is None:
+            return False
+        return self._is_platform_admin(scope) or bool(set(scope.roles) & set(self.admin_roles))
 
     def bump_policy_rev(self) -> int:
         self._policy_rev += 1
@@ -94,16 +79,11 @@ class RbacAccessController:
         return self._policy_rev
 
     def check(self, scope: AuthScope, action: str, resource: ResourceRef) -> AccessDecision:
-        if action in self._PLATFORM_ADMIN_ACTIONS:
+        if action == "system:update_model":
             if not self._is_platform_admin(scope):
                 return AccessDecision(
                     False, "platform_admin_role_required", code="forbidden", policy_rev=self._policy_rev
                 )
-            return AccessDecision(True, policy_rev=self._policy_rev)
-
-        if action in self._ADMIN_ACTIONS:
-            if not self._is_admin(scope):
-                return AccessDecision(False, "admin_role_required", code="forbidden", policy_rev=self._policy_rev)
             return AccessDecision(True, policy_rev=self._policy_rev)
 
         if action == "approval:decide":
@@ -132,24 +112,6 @@ class RbacAccessController:
             return AccessDecision(True, policy_rev=self._policy_rev)
 
         return AccessDecision(True, policy_rev=self._policy_rev)
-
-    def filter_for(self, scope: AuthScope, action: str, resource_kind: str) -> AccessFilter:
-        if action in self._ADMIN_ACTIONS:
-            if not self._is_admin(scope):
-                return AccessFilter(deny_all=True, policy_rev=self._policy_rev)
-            return AccessFilter(
-                unrestricted=True,
-                include_public=True,
-                include_disabled=True,
-                policy_rev=self._policy_rev,
-            )
-        return AccessFilter(
-            unrestricted=False,
-            any_roles=scope.roles,
-            include_public=True,
-            include_disabled=False,
-            policy_rev=self._policy_rev,
-        )
 
 
 def load_access_controller(spec: Optional[str] = None) -> AccessController:

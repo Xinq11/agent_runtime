@@ -7,8 +7,7 @@ from typing import Any, Dict, List, Optional
 import unittest
 
 from agent_runtime import (
-    AgentMiddleware, AgentRuntimeApp, ApprovalDecision, AuthScope, ExecutionContext,
-    RagExtension, SkillsExtension, ToolCall,
+    AgentMiddleware, AgentRuntimeApp, ApprovalDecision, AuthScope, ExecutionContext, ToolCall,
 )
 from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
@@ -95,8 +94,6 @@ def build_full_app(
         model=EchoTestModel(router=_expense_test_router),
         store=get_test_store(),
         extensions=[
-            RagExtension(),
-            SkillsExtension(),
             EnterpriseExpensePlugin(approval_writes=approval_writes),
         ],
         budget=budget,

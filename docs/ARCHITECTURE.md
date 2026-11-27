@@ -10,23 +10,22 @@
 
 ![SDK 和 HTTP 入口共用 AgentRuntimeApp，客户扩展接入执行循环与工具网关](assets/architecture-overview.png)
 
-### 四层职责与依赖约定
+### 三层职责与依赖约定
 
 | 层 | 负责什么 | 从哪里读代码 |
 | --- | --- | --- |
 | 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流（不内置管理后台，管理面由客户应用自建） | [api/main.py](../backend/agent_runtime/api/main.py) · [chat_stream.py](../backend/agent_runtime/api/chat_stream.py) |
-| 内核 (`framework/`) | 装配模型与扩展，构建执行图，管理上下文预算、Run 状态机、安全契约与工具网关（零 RAG/Skills/pgvector 依赖） | [agent/app.py](../backend/agent_runtime/framework/agent/app.py) · [core/workflow.py](../backend/agent_runtime/framework/core/workflow.py) |
-| 扩展 (`extensions/`) | 内置标准可选扩展（RAG 7 阶段检索、版本化 Skills），各自独立拥有 `schema.sql`、仓储与管理路由 | [RAG](../backend/agent_runtime/extensions/rag/) · [Skills](../backend/agent_runtime/extensions/skills/) |
+| 内核 (`framework/`) | 装配模型与客户插件，构建执行图，管理上下文预算、Run 状态机、安全契约、工具网关，以及 `SkillProvider` / `RagProvider` 薄 Harness 适配 | [agent/app.py](../backend/agent_runtime/framework/agent/app.py) · [core/workflow.py](../backend/agent_runtime/framework/core/workflow.py) · [tools/skills.py](../backend/agent_runtime/framework/tools/skills.py) · [tools/rag.py](../backend/agent_runtime/framework/tools/rag.py) |
 | 基础设施 (`infra/`) | 适配核心 PostgreSQL、MinIO 对象存储、OpenAI 兼容 LLM 服务与 PLG 观测 | [PG](../backend/agent_runtime/infra/pg/) · [OSS](../backend/agent_runtime/infra/oss/) · [LLM](../backend/agent_runtime/infra/llm/) · [PLG](../backend/agent_runtime/infra/plg/) |
 
 **依赖方向与客户隔离原则：**
-- 依赖方向严格单向 `api -> extensions -> framework <- infra`（由 AST 验收测试守护）：内核 `framework/`、`infra/` 与核心 `api/` 严禁反向引用任何 `extensions.*`，纯 SDK 安装启动不要求 `pgvector`，也不创建 RAG/Skills 表。
-- [费用示例](../examples/enterprise_expense/) 作为独立 Python 包依赖 SDK。插件通过 `register_tools()` 声明业务工具、通过 `subagents()` 声明 `SubAgentProfile`（由 SDK 自动装配模型与网关），并在 `bootstrap_store()` 创建 OA 表。
+- 依赖方向严格单向 `api -> framework <- infra`（由 AST 验收测试守护）：SDK 内核不内置任何 RAG/Skills 存储实现，不依赖 `pgvector`，也不创建 RAG/Skills 表或文档级 SQL ACL 逻辑。
+- [费用示例](../examples/enterprise_expense/) 作为独立 Python 包依赖 SDK。插件通过 `register_tools()` 声明业务工具、通过 `subagents()` 声明 `SubAgentProfile`、通过 `skill_provider()` / `rag_provider()` 接入自有 SOP 与知识检索（含客户自定义权限过滤），并在 `bootstrap_store()` 创建 OA 表。
 - 扩展按需提供 `routers()` 与 `bootstrap_store()`；核心 `deploy/sql/` 只包含执行底座表（并内置幂等迁移 `006_drop_tenant_id.sql`，带冲突预检，安全保留历史审批与 OSS 路径）。
 
 ### 启动装配 vs 每次执行
 
-1. **启动装配（一次）**：`AgentRuntimeApp` 构造 → 注册不可变内置工具（`read` / `write` / `read_tool_output`）→ 加载自定义工具、`subagents` 与 `extensions`（自动装配 `ext.register_tools()`、`ext.subagents()`、`ext.middlewares()`；HTTP 层按需挂载 `ext.routers()`）→ **冻结 `ToolRegistry`**（运行期禁止篡改工具表）→ 执行幂等 `bootstrap_extensions()`。
+1. **启动装配（一次）**：`AgentRuntimeApp` 构造 → 注册不可变内置工具（`read` / `write` / `read_tool_output`）→ 加载自定义工具、`subagents`、`skill_provider` / `rag_provider` 与 `extensions`（自动发现 `ext.skill_provider()` / `ext.rag_provider()` 并注册 `list_skills` / `get_skill` / `search_knowledge` 与受控中间件；自动装配 `ext.register_tools()`、`ext.subagents()`、`ext.middlewares()`；HTTP 层按需挂载 `ext.routers()`）→ **冻结 `ToolRegistry`**（运行期禁止篡改工具表）→ 执行幂等 `bootstrap_extensions()`。
 2. **每次执行（按请求）**：SDK 与 HTTP 共用 `prepare_turn_run` / `execute_run_state` / `abort_run` / `resume_approval` → 校验创建者会话归属 → 登记持久化 `agent_runs`（每次 Run 独立占用以 `run_id` 为键的 LangGraph 检查点，取消待审批 Run 后原会话立即可继续新对话）→ 流式推送 SSE v1 事件并按步落库。
 
 > **同进程运行边界**：客户 Python 插件与后端运行在同一进程内，应按业务代码同等级评审、打包与发布，更新后重启服务生效。
@@ -55,7 +54,7 @@
 | 这次对话写入了哪些消息与摘要？ | PG：`agent_threads`、`session_messages`、`session_summaries` | `thread_id` |
 | 当前在执行、等审批还是已取消？ | PG 业务状态：`agent_runs`、`tool_approvals`；LangGraph 断点：`checkpoints*` | `run_id` / `review_id` / `thread_id` |
 | 同一个写动作是否执行过？ | PG：`tool_runs`（记录 `running`/`done`/`reconcile`、回执与结果引用） | `op_key` |
-| 原始大输出、工作区（及可选扩展）原文在哪？ | 核心 PG 存 `tool_outputs`、`workspace_files`；可选扩展自持 `rag_*`、`agent_skills*`；MinIO 存不可变原文 | `outputs/`、`workspaces/`、`knowledge/`、`skills/` |
+| 原始大输出、工作区原文在哪？ | 核心 PG 存 `tool_outputs`、`workspace_files`；MinIO 存不可变原文 | `outputs/`、`workspaces/` |
 | 哪一步拖慢了响应？ | Prometheus（首 token / 工具状态）、Loki（结构化日志）、PG `agent_spans`（步骤耗时）、Grafana 看板 | `trace_id` |
 
 **检查点与连接生命周期**：
@@ -80,32 +79,33 @@
 
 | 扩展协议 | 定位与适用场景 | 源码入口 |
 | --- | --- | --- |
-| `AgentPlugin` | 统一的能力包与客户业务打包入口（声明系统提示词、工具、子 Agent、受控中间件与前端元信息），支持 `extensions=[...]` 与 `AGENT_EXTENSIONS` 挂载 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) |
+| `AgentPlugin` | 统一的能力包与客户业务打包入口（声明系统提示词、工具、子 Agent、`skill_provider`、`rag_provider`、受控中间件、可选路由与前端元信息），支持 `extensions=[...]` 与 `AGENT_EXTENSIONS` 挂载 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) |
+| `SkillProvider` | 极薄的 Skill 加载口子：`list_skills(scope, query)` 与 `get_skill(scope, slug, resource)`（同步/异步均可）。SDK 自动装配 Layer-1 目录注入（Prefix Cache 稳定）与按需正文读取工具，完全不干预存储与权限实现 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) · [tools/skills.py](../backend/agent_runtime/framework/tools/skills.py) |
+| `RagProvider` | 极薄的知识检索口子：`retrieve(scope, query, top_k, ctx)`（同步/异步均可）。SDK 自动装配 `search_knowledge` 工具（可选预算受控自动注入）与 `[1]` 编号引文规范，完全不干预向量库/检索引擎与文档级权限实现 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) · [tools/rag.py](../backend/agent_runtime/framework/tools/rag.py) |
 | `AgentMiddleware` | 受控生命周期切面（`extra_context` 纳入内核预算、`transform_user_input`、`on_before_model` 只读快照、`after_model`、`wrap_tool`、`after_turn`），不可破坏上下文裁剪与工具配对 | [core/middleware.py](../backend/agent_runtime/framework/core/middleware.py) |
 | `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider，当前接入 DeepSeek，预留多 API 扩展） | [infra/llm/provider.py](../backend/agent_runtime/infra/llm/provider.py) |
-| `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](../backend/agent_runtime/extensions/rag/extension.py) |
 
 | 新客户需求 | 推荐接入方式 |
 | --- | --- |
 | 接入新业务系统（ERP / 工单 / OA） | 用 `@tool` 封装客户接口并标注 `RiskLevel`，通过独立客户包注册，由网关统一处理校验、超时、审批与幂等 |
-| 更换知识库检索 | 保留内置 7 阶段 RAG 并替换 `EmbeddingClient` / `RerankClient`，或传入自定义 `RagExtension(strategy=...)` |
-| 交付业务 SOP | 通过 `SkillsExtension` 发布版本化声明式文档与文本附件（拒绝可执行脚本），Agent 按需检索读取 |
+| 接入客户知识库 / 向量检索 | 实现 `RagProvider` 对接 Milvus / ES / Dify / 客户内部检索服务，并在 `retrieve()` 内使用 `scope` 执行客户自有文档权限过滤 |
+| 接入业务 SOP / Skills | 实现 `SkillProvider` 对接本地目录、Git、数据库或客户门户，并在 `list_skills()` / `get_skill()` 内使用 `scope` 执行客户自有权限过滤 |
 | 接入现有门户前端 | 对接 [HTTP / SSE v1 契约](API.md)，与参考 Studio 共用同一后端与运行状态 |
 
 ---
 
-## 6. 安全边界与可拔插 ACL 架构（现状与演进）
+## 6. 安全边界与可拔插 ACL 架构
 
-> 核心安全契约见 [security/](../backend/agent_runtime/framework/core/security/)，扩展专用 SQL ACL 编译器已下沉至 [extensions/_acl_sql.py](../backend/agent_runtime/extensions/_acl_sql.py)。
+> 核心安全契约见 [security/](../backend/agent_runtime/framework/core/security/)。SDK 只负责 Harness 层点查鉴权（会话、审批、工具、工件与模型配置）；知识库文档级与 Skill 级数据权限完全下放给客户自己的 `RagProvider` / `SkillProvider` 实现，避免把五花八门的 RBAC/ABAC/部门树/行级 SQL 过滤拖进 SDK 内核。
 
 ### 6.1 可拔插双协议与单部署边界
 
-业务路由、LangGraph 节点、工具网关及可选扩展统一调用两个最小协议，内核已移除 `tenant_id`，每个客户独立部署只需提供可信的 `user_id`：
+业务路由、LangGraph 节点与工具网关统一调用两个最小协议，内核已移除 `tenant_id`，每个客户独立部署只需提供可信的 `user_id`：
 
 | 协议 | 职责与最小签名 | 内置实现与环境变量 |
 | --- | --- | --- |
 | `IdentityResolver`（认证 AuthN） | `resolve(context) -> AuthScope` | `StaticIdentityResolver`（`default`）、`HeaderIdentityResolver`（`header` / `signed_header`，对 `["v1", user_id, roles]` 做 HMAC 验签，忽略遗留 `X-Tenant-Id`）或自定义 `module:Symbol`（`AGENT_IDENTITY_RESOLVER`） |
-| `AccessController`（授权 AuthZ） | `check(scope, action, resource) -> AccessDecision`<br>`filter_for(scope, action, kind) -> AccessFilter`<br>`policy_rev(scope) -> int` | `RbacAccessController(admin_roles=None)`（`default`）、`NoopAccessController`（`noop`）、`RbacAccessController(admin_roles=..., platform_admin_roles=...)`（`rbac`，可配 `AGENT_APPROVER_ROLES` / `AGENT_FORBID_SELF_APPROVAL`）或自定义 `module:Symbol`（`AGENT_ACCESS_CONTROLLER`） |
+| `AccessController`（授权 AuthZ） | `check(scope, action, resource) -> AccessDecision`<br>`policy_rev(scope) -> int` | `RbacAccessController(admin_roles=None)`（`default`）、`NoopAccessController`（`noop`）、`RbacAccessController(admin_roles=..., platform_admin_roles=...)`（`rbac`，可配 `AGENT_APPROVER_ROLES` / `AGENT_FORBID_SELF_APPROVAL`）或自定义 `module:Symbol`（`AGENT_ACCESS_CONTROLLER`） |
 
 **四项永不关闭的内核安全不变量**（即使在 `default` 或 `noop` 模式下也始终生效）：
 1. **创建者硬归属隔离**：`thread_id`、`run_id`、`trace_id`、`ref_id` 与工作区文件统一在核心仓储和 `RunService` 按 `actor_id == scope.user_id` 强制拦截（不匹配一律 `404`）。
@@ -114,23 +114,18 @@
 4. **子 Agent 权限单调收窄与及时取消**：`AuthScope.allowed_tools` 区分 `None`（不限）与 `()`（零权限），父子工具求交为空时目录与执行双拒绝；子 Agent 每步入口实时响应 `check_cancelled()`。
 
 **已落地的核心策略规则**：
-- **Fail-Closed**：任意 `AccessController` 抛异常或返回非法对象时一律 fail-closed（HTTP 返回 `503`，工具返回 `acl_error`，RAG 返回 `status="acl_error"`）。
-- **扩展行级 ACL 下推与混合父文防泄漏**：`extensions/_acl_sql.py` 将白名单 `AccessFilter` 编译为参数化 SQL 下推至可选 RAG 与 Skills 仓储（遇到未支持的 `owner_id`/`any_depts` 谓词直接 fail-closed 拒绝）；空角色主体仅命中 `acl_roles = '{}'` 的公开资源，混合权限父文档自动跳过未授权切片。
+- **Fail-Closed**：任意 `AccessController` 抛异常或返回非法对象时一律 fail-closed（HTTP 返回 `503`，工具返回 `acl_error`）。
+- **数据层权限完全客户自治**：SDK 将已验签的 `scope: AuthScope`（含 `user_id`、`roles`、`attrs`）透传给 `RagProvider.retrieve()` 与 `SkillProvider.list_skills()` / `get_skill()`，由客户按自身权限模型（RBAC、ABAC、OPA、部门树或调用下游带鉴权的检索接口）自行裁决。
 - **动态 `policy_rev` 失效保护**：`workflow.run_context` 每次节点进入实时读取 `access_controller.policy_rev(scope)`，暂停期间策略版本递增后，恢复消费自动因 `approval_mismatch` 拒绝执行。
 
-### 6.2 全链路受控资源矩阵与后续演进
+### 6.2 全链路受控资源矩阵
 
-| 资源域 | 覆盖动作 | 当前状态 |
+| 资源域 | 覆盖动作 | 归属与执行方式 |
 | --- | --- | --- |
-| HTTP / SDK 入口 | 主体解析与验签 | 已支持 `default` / `header` / `signed_header`（`["v1", user_id, roles]` HMAC 验签失败返 `401`）及自定义解析器 |
-| Thread / Run / Trace | 创建、列表、历史、状态快照、中止、删除 | 已在 PG 查询与 `RunService` 强制 `actor_id == scope.user_id` 归属（含仅传 `trace_id` 访问 `/state`） |
+| HTTP / SDK 入口 | 主体解析与验签 | SDK 内置 `default` / `header` / `signed_header`（`["v1", user_id, roles]` HMAC 验签失败返 `401`）及自定义解析器 |
+| Thread / Run / Trace | 创建、列表、历史、状态快照、中止、删除 | SDK 在 PG 查询与 `RunService` 强制 `actor_id == scope.user_id` 归属（含仅传 `trace_id` 访问 `/state`） |
 | Approval | 审批决定、恢复消费 | SDK 与 HTTP 均按 `caller.user_id` 署名，默认仅创建者可批，支持 `approver_roles`、`forbid_self_approval` 与 `policy_rev` 复核 |
 | Tool | `/meta`、主图与子 Agent 可见目录及网关执行 | 目录过滤与执行强拦双一致，主循环与子 Agent 共用 `model_step.py` 单步调用助手 |
-| RAG（可选扩展） | 检索、邻块、父文、上传与上下架 | 自持 `extensions/rag/schema.sql`、仓储与管理路由；统一通过 `AccessFilter` 下推 SQL |
-| Skills（可选扩展） | 列表、正文、附件、上传、上下架 | 自持 `extensions/skills/schema.sql`、仓储与管理路由；管理与下架预览统一走 `skill:manage` |
-| Artifact / Workspace | HTTP 与 `read_tool_output` 分页续读、文件读写 | 统一校验 `resource_owner == scope.user_id`、`artifact:read` 与 TTL |
-| 模型配置 | `/config/model` | 需 `system:update_model`（`rbac` 模式下限定 `platform_admin`） |
-
-**后续演进路线（Phase 2–3 规划）**：
-- **Phase 2（企业部门与增量同步）**：扩展部门/项目组映射表（`EXISTS` 关联大组授权）与文档级 ACL 增量同步。
-- **Phase 3（外部策略中心集成）**：提供 OPA / Casbin / 企业 IAM 适配器，支持无法下推时的“有界候选召回 → 批量鉴权 → 读取重排”（显式不承诺凑满 `top_k`）、多副本共享策略版本源与结构化决策审计日志。
+| Artifact / Workspace | HTTP 与 `read_tool_output` 分页续读、文件读写 | SDK 统一校验 `resource_owner == scope.user_id`、`artifact:read` 与 TTL |
+| 模型配置 | `/config/model` | SDK 校验 `system:update_model`（`rbac` 模式下限定 `platform_admin`） |
+| 知识库与 Skills（客户自治） | 检索、目录、正文与附件读取 | 客户在 `RagProvider` / `SkillProvider` 内基于透传的 `scope` 自行鉴权；SDK 仅负责工具封装、引文格式与上下文预算 |

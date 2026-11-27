@@ -1,4 +1,4 @@
-"""Unified `AgentRuntimeApp` SDK assembler — core kernel + pluggable extensions + frozen registry."""
+"""Unified `AgentRuntimeApp` SDK assembler — core kernel + pluggable providers/plugins + frozen registry."""
 
 from __future__ import annotations
 
@@ -17,7 +17,13 @@ from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import ApprovalDecision, AuthScope, ExecutionContext, RunRecord
 from agent_runtime.framework.core.middleware import MiddlewareChain
-from agent_runtime.framework.core.protocols import AgentMiddleware, AgentPlugin, AppMetadata
+from agent_runtime.framework.core.protocols import (
+    AgentMiddleware,
+    AgentPlugin,
+    AppMetadata,
+    RagProvider,
+    SkillProvider,
+)
 from agent_runtime.framework.core.runs import RunNotFoundError, RunService, RunStateError
 from agent_runtime.framework.core.security import (
     AccessController,
@@ -36,12 +42,14 @@ from agent_runtime.framework.core.workflow import (
 from agent_runtime.framework.tools.builtins import register_immutable_builtin_tools
 from agent_runtime.framework.tools.events import EventGateway
 from agent_runtime.framework.tools.gateway import ToolGateway
+from agent_runtime.framework.tools.rag import RagAutoInjectMiddleware, register_rag_tool
 from agent_runtime.framework.tools.registry import ToolRegistry, ToolSpec
+from agent_runtime.framework.tools.skills import SkillCatalogMiddleware, register_skill_tools
 from agent_runtime.framework.tools.subagent import SubAgentProfile, register_subagent_tool
 
 
 def load_extension(spec: str) -> AgentPlugin:
-    """Dynamically load an extension or customer plugin by `module.path:Symbol`."""
+    """Dynamically load a customer plugin by `module.path:Symbol`."""
     if ":" not in spec:
         raise ValueError(f"Invalid extension spec '{spec}'; expected 'module.path:Symbol'")
     mod_name, attr_name = spec.split(":", 1)
@@ -63,6 +71,12 @@ class AgentRuntimeApp:
         extensions: Sequence[AgentPlugin] = (),
         tools: Sequence[ToolSpec] = (),
         subagents: Sequence[SubAgentProfile] = (),
+        skill_provider: Optional[SkillProvider] = None,
+        rag_provider: Optional[RagProvider] = None,
+        rag_mode: str = "tool",  # "tool" | "auto_inject" | "both"
+        rag_top_k: int = 4,
+        skill_inline_limit: int = 20,
+        skill_max_inline_chars: int = 1600,
         middlewares: Sequence[AgentMiddleware] = (),
         system_prompt: Optional[str] = None,
         budget: Optional[ContextBudget] = None,
@@ -73,6 +87,8 @@ class AgentRuntimeApp:
         on_event: Optional[Any] = None,
         access_controller: Optional[AccessController] = None,
     ) -> None:
+        if rag_mode not in ("tool", "auto_inject", "both"):
+            raise ValueError(f"Invalid rag_mode '{rag_mode}'; expected 'tool' | 'auto_inject' | 'both'")
         if store is None:
             from agent_runtime.infra.pg.postgres import PgOssStore
 
@@ -108,7 +124,28 @@ class AgentRuntimeApp:
             seen_names.add(ext.name)
         self.extensions: List[AgentPlugin] = list(extensions)
 
+        skill_providers = [p for p in (skill_provider, *(e.skill_provider() for e in self.extensions)) if p is not None]
+        if len(skill_providers) > 1:
+            raise ValueError("Multiple SkillProvider instances configured; supply at most one")
+        self.skill_provider: Optional[SkillProvider] = skill_providers[0] if skill_providers else None
+
+        rag_providers = [p for p in (rag_provider, *(e.rag_provider() for e in self.extensions)) if p is not None]
+        if len(rag_providers) > 1:
+            raise ValueError("Multiple RagProvider instances configured; supply at most one")
+        self.rag_provider: Optional[RagProvider] = rag_providers[0] if rag_providers else None
+
         self.middlewares = MiddlewareChain(middlewares)
+        if self.skill_provider is not None:
+            self.middlewares.add(
+                SkillCatalogMiddleware(
+                    self.skill_provider,
+                    access_controller=self.access_controller,
+                    inline_limit=skill_inline_limit,
+                    max_inline_chars=skill_max_inline_chars,
+                )
+            )
+        if self.rag_provider is not None and rag_mode in ("auto_inject", "both"):
+            self.middlewares.add(RagAutoInjectMiddleware(self.rag_provider, top_k=rag_top_k))
         for ext in self.extensions:
             for mw in ext.middlewares():
                 self.middlewares.add(mw)
@@ -128,6 +165,11 @@ class AgentRuntimeApp:
             middlewares=self.middlewares,
             access_controller=self.access_controller,
         )
+
+        if self.skill_provider is not None:
+            register_skill_tools(self.registry, self.skill_provider, inline_limit=skill_inline_limit)
+        if self.rag_provider is not None and rag_mode in ("tool", "both"):
+            register_rag_tool(self.registry, self.rag_provider, top_k=rag_top_k)
 
         for spec in tools:
             self.registry.register(spec)
@@ -203,7 +245,7 @@ class AgentRuntimeApp:
         return out
 
     def bootstrap_extensions(self) -> None:
-        """Invoke idempotent extension bootstrap hooks (extension schemas, seeds, etc.)."""
+        """Invoke idempotent plugin bootstrap hooks (customer tables, seeds, etc.)."""
         for ext in self.extensions:
             ext.bootstrap_store(self.store)
 
@@ -340,11 +382,7 @@ class AgentRuntimeApp:
         decision: ApprovalDecision,
         scope: Optional[AuthScope] = None,
     ) -> Dict[str, Any]:
-        """Single unified approval-resume path for both Python SDK and HTTP API.
-
-        Checks ticket existence and caller authorization first, verifies the paused run's
-        per-run checkpoint state, and consumes the decision atomically.
-        """
+        """Single unified approval-resume path for both Python SDK and HTTP API."""
         caller = scope or self.default_identity()
         ticket = await asyncio.to_thread(self.store.get_approval_ticket, decision.review_id)
         if ticket is None or ticket.thread_id != thread_id:
@@ -379,10 +417,7 @@ class AgentRuntimeApp:
             if rec.status != "paused":
                 raise RunStateError("该运行已取消或不再处于暂停状态，无法恢复")
 
-        # Always stamp authoritative approver_id from verified caller scope in both SDK and HTTP paths
         authoritative_decision = replace(decision, approver_id=caller.user_id)
-
-        # Record decision BEFORE transitioning run to `running`; then atomically claim resume
         self.store.record_approval_decision(authoritative_decision)
         if run_id:
             self.run_service.mark_resumed(run_id)

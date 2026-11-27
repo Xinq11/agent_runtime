@@ -11,15 +11,14 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from agent_runtime import __version__ as SDK_VERSION
 from agent_runtime.api.deps import (
-    caller_scope,
     caller_scope_async,
     require_access_async,
-    resolve_filter,
 )
 from agent_runtime.api.schemas import ModelConfigUpdateRequest
 from agent_runtime.framework.core.config import DEFAULT_BASE
 from agent_runtime.framework.core.contracts import PROTOCOL_VERSION
-from agent_runtime.framework.core.security import AccessDecision, ResourceRef
+from agent_runtime.framework.core.security import AccessControlError, AuthorizationError, ResourceRef, enforce_check
+from agent_runtime.framework.tools.skills import _call_provider
 
 router = APIRouter(tags=["System & Metadata"])
 
@@ -40,39 +39,36 @@ def health(req: Request):
     }
 
 
-@router.get("/meta", summary="获取框架协议版本、已启用扩展、工具清单与 UI 元信息")
-def app_meta(req: Request):
+@router.get("/meta", summary="获取框架协议版本、已启用插件、工具清单与 UI 元信息")
+async def app_meta(req: Request):
     runtime = req.app.state.runtime
-    scope = caller_scope(req)
+    scope = await caller_scope_async(req)
     skills = []
-    skills_ext = runtime.get_extension("skills")
-    if skills_ext is not None and hasattr(skills_ext, "list_visible_skills"):
-        sk_flt = resolve_filter(req, scope, "skill:read", "skill")
+    if runtime.skill_provider is not None:
+        items = await _call_provider(runtime.skill_provider.list_skills, scope, "")
         skills = [
             {
                 "slug": s.slug,
-                "version": s.version_num,
                 "description": s.description,
                 "tags": list(s.tags),
                 "resources": list(s.resources),
             }
-            for s in skills_ext.list_visible_skills(scope, access_filter=sk_flt)
+            for s in items
         ]
     visible_tools = []
     ac = runtime.access_controller
     for s in runtime.registry.visible_specs(scope):
         try:
-            decision = ac.check(
+            await enforce_check(
+                ac,
                 scope,
                 "tool:list",
                 ResourceRef("tool", id=s.name, attrs={"risk_level": s.risk_level.value}),
             )
-        except Exception as exc:
-            raise HTTPException(503, f"access_controller_error:{type(exc).__name__}") from exc
-        if not isinstance(decision, AccessDecision):
-            raise HTTPException(503, "invalid_access_decision")
-        if not decision.allowed:
+        except AuthorizationError:
             continue
+        except AccessControlError as exc:
+            raise HTTPException(503, str(exc)) from exc
         visible_tools.append(
             {
                 "name": s.name,
