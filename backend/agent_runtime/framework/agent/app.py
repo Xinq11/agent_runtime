@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, replace
 import importlib
+import os
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -64,9 +65,9 @@ class AgentRuntimeApp:
         middlewares: Sequence[AgentMiddleware] = (),
         system_prompt: Optional[str] = None,
         budget: Optional[ContextBudget] = None,
-        max_result_tokens: int = 220,
+        max_result_tokens: int = 450,
         loop_limit: int = 3,
-        max_steps: int = 8,
+        max_steps: Optional[int] = None,
         emit_tool_events: bool = True,
         on_event: Optional[Any] = None,
         access_controller: Optional[AccessController] = None,
@@ -80,9 +81,9 @@ class AgentRuntimeApp:
 
             obs = ObservabilityHub(store)
         if model is None:
-            from agent_runtime.infra.llm.mock import MockScriptedLLM
+            from agent_runtime.infra.llm.provider import OpenAICompatibleProvider
 
-            model = MockScriptedLLM(obs=obs)
+            model = OpenAICompatibleProvider(None, obs)
 
         self.store = store
         self.obs = obs
@@ -93,6 +94,11 @@ class AgentRuntimeApp:
         )
         self.run_service = RunService(self.store)
         self.budget = budget or ContextBudget()
+        self.max_steps = (
+            max(1, int(max_steps))
+            if max_steps is not None
+            else max(1, int(os.getenv("AGENT_MAX_STEPS", "15")))
+        )
 
         seen_names: set[str] = set()
         for ext in extensions:
@@ -173,7 +179,7 @@ class AgentRuntimeApp:
             system_prompt=self.system_prompt,
             middlewares=self.middlewares,
             budget=self.budget,
-            max_steps=max_steps,
+            max_steps=self.max_steps,
             on_event=on_event,
             cancel_checker=self.run_service.is_cancelled,
             access_controller=self.access_controller,
@@ -214,7 +220,14 @@ class AgentRuntimeApp:
             "counts": {},
             "start_ms": t0,
         }
-        result = await invoke_phase(self.graph, self.store, state, graph_config(thread_id), trace_id, t0)
+        result = await invoke_phase(
+            self.graph,
+            self.store,
+            state,
+            graph_config(thread_id, max_steps=self.max_steps),
+            trace_id,
+            t0,
+        )
         if result.get("__interrupt__"):
             result["__interrupt__"] = extract_interrupt_tickets(result["__interrupt__"])
             self.run_service.mark_paused(run_id, scope.tenant_id)
@@ -299,7 +312,7 @@ class AgentRuntimeApp:
         tickets never leave the run stranded in `running`.
         """
         caller = scope or self.default_identity()
-        cfg = graph_config(thread_id)
+        cfg = graph_config(thread_id, max_steps=self.max_steps)
         snapshot = await self.graph.aget_state(cfg)
         pending_map = {v["review_id"]: v for v in pending_tickets(snapshot)}
         ticket_meta = pending_map.get(decision.review_id)

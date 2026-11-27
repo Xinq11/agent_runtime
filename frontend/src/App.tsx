@@ -4,20 +4,33 @@ import { Sidebar } from "./features/chat/Sidebar";
 import { useChatSession } from "./features/chat/useChatSession";
 import { OpsPlatform } from "./features/ops/OpsPlatform";
 import { SettingsModal } from "./features/settings/SettingsModal";
-import { TraceDrawer } from "./features/trace/TraceDrawer";
+import { InspectorTab, TraceDrawer } from "./features/trace/TraceDrawer";
 
 export default function App() {
   const [route, setRoute] = useState<"chat" | "ops">(() =>
     window.location.pathname.startsWith("/ops") ? "ops" : "chat"
   );
-  const [dark, setDark] = useState(false);
-  const [traceOpen, setTraceOpen] = useState(true);
+  const [dark, setDark] = useState(() => {
+    try {
+      return window.localStorage.getItem("agent_runtime_theme") !== "light";
+    } catch {
+      return true;
+    }
+  });
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("trace");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const session = useChatSession(route);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    const theme = dark ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      window.localStorage.setItem("agent_runtime_theme", theme);
+    } catch {
+      // ignore storage errors
+    }
   }, [dark]);
 
   useEffect(() => {
@@ -36,15 +49,17 @@ export default function App() {
     setRoute(next);
   };
 
+  const handleOpenInspector = (tab: InspectorTab) => {
+    setInspectorTab(tab);
+    setInspectorOpen(true);
+  };
+
   if (route === "ops") {
     return (
       <OpsPlatform
         dark={dark}
         onToggleTheme={() => setDark((d) => !d)}
-        onBackToChat={(jumpThreadId) => {
-          navigate("chat");
-          if (jumpThreadId) session.selectThread(jumpThreadId);
-        }}
+        onBackToChat={() => navigate("chat")}
       />
     );
   }
@@ -73,20 +88,28 @@ export default function App() {
         loading={session.loading}
         focusNonce={session.composerFocusNonce}
         modelConfig={session.modelConfig}
-        traceOpen={traceOpen}
-        onToggleTrace={() => setTraceOpen((v) => !v)}
+        inspectorOpen={inspectorOpen}
+        onOpenInspector={handleOpenInspector}
         onSend={session.sendMessage}
         onAbort={session.abortRun}
         onApprovalDecision={session.decideApproval}
+        onSetFeedback={session.setFeedback}
         onInspectTrace={(trId) => {
           session.setSelectedTraceId(trId);
-          setTraceOpen(true);
+          setInspectorTab("trace");
+          setInspectorOpen(true);
           session.refreshAll(session.activeThreadId, trId, false);
         }}
       />
 
       <TraceDrawer
-        open={traceOpen}
+        open={inspectorOpen}
+        activeTab={inspectorTab}
+        onChangeTab={setInspectorTab}
+        onClose={() => setInspectorOpen(false)}
+        threadId={session.activeThreadId}
+        threadTitle={session.activeThreadTitle}
+        isDraftThread={session.isDraftThread}
         state={session.stateSnap}
         onRefresh={() =>
           session.refreshAll(session.activeThreadId, session.selectedTraceId, session.isDraftThread)
@@ -95,7 +118,6 @@ export default function App() {
           session.setSelectedTraceId(trId);
           session.refreshAll(session.activeThreadId, trId, false);
         }}
-        onOpenOpsPlatform={() => navigate("ops")}
       />
 
       <SettingsModal

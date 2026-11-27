@@ -111,7 +111,7 @@ class ExecutionContext:
     run_id: str = ""
     op_key: Optional[str] = None
     agent_name: str = "main_agent"
-    model_name: str = "mock-pro"
+    model_name: str = "deepseek-chat"
     depth: int = 0
     max_depth: int = 1
     parent_span_id: Optional[str] = None

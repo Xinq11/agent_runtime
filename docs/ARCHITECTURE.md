@@ -21,8 +21,8 @@
 
 **依赖方向与客户隔离原则：**
 - 目标依赖方向为 `api -> extensions -> framework <- infra`：内核只依赖稳定契约与协议，基础设施适配内核契约，客户业务表、提示词与外部系统连接器封装在独立客户包内（不写入平台 `deploy/sql/` 或 `framework/`）。
-- [费用示例](../examples/enterprise_expense/) 作为独立 Python 包依赖 SDK。启用后，插件注册业务工具与离线 Mock 脚本，在启动时创建 OA 表并初始化演示资料。旧库升级时，平台 SQL 将已有 OA 表的会话外键改为级联删除，保留历史记录。
-- PG 建索引与标准 RAG 扩展共用分词和向量编码。`AgentRuntimeApp` 延迟加载默认 PG、PLG 和 Mock 适配器。
+- [费用示例](../examples/enterprise_expense/) 作为独立 Python 包依赖 SDK。启用后，插件注册业务工具与子 Agent，在启动时创建 OA 表并初始化演示资料。旧库升级时，平台 SQL 将已有 OA 表的会话外键改为级联删除，保留历史记录。
+- PG 建索引与标准 RAG 扩展共用分词和向量编码。`AgentRuntimeApp` 延迟加载默认 PG、PLG 与 OpenAI 兼容 LLM 适配器（当前接入 DeepSeek，后续可扩展其他 API）。
 
 ### 启动装配 vs 每次执行
 
@@ -60,7 +60,7 @@
 
 **检查点与连接生命周期**：
 - FastAPI `lifespan` 启动时打开 `psycopg_pool.ConnectionPool`（`PgOssStore`）、初始化 `AsyncPostgresSaver`、装配 `OpenAICompatibleProvider` 与后台日志推送协程，关闭时优雅刷盘并释放连接池。[启动与关闭](../backend/agent_runtime/api/main.py) · [PG 仓储](../backend/agent_runtime/infra/pg/postgres.py)
-- 直接嵌入 Python SDK 时，默认检查点为进程内 `InMemorySaver`；需要跨进程或跨重启恢复审批时，应显式传入持久化 checkpointer（如 `AsyncPostgresSaver`）。Mock 模型仅替代推理服务，PostgreSQL 与 MinIO 仍全程参与执行。
+- 直接嵌入 Python SDK 时，默认检查点为进程内 `InMemorySaver`；需要跨进程或跨重启恢复审批时，应显式传入持久化 checkpointer（如 `AsyncPostgresSaver`）。
 
 ---
 
@@ -82,7 +82,7 @@
 | --- | --- | --- |
 | `AgentPlugin` | 统一的能力包与客户业务打包入口（声明系统提示词、工具、子 Agent、受控中间件与前端元信息），支持 `extensions=[...]` 与 `AGENT_EXTENSIONS` 挂载 | [core/protocols.py](../backend/agent_runtime/framework/core/protocols.py) |
 | `AgentMiddleware` | 受控生命周期切面（`extra_context` 纳入内核预算、`transform_user_input`、`on_before_model` 只读快照、`after_model`、`wrap_tool`、`after_turn`），不可破坏上下文裁剪与工具配对 | [core/middleware.py](../backend/agent_runtime/framework/core/middleware.py) |
-| `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider 与脚本 Mock） | [infra/llm/provider.py](../backend/agent_runtime/infra/llm/provider.py) |
+| `LLMProvider` | 替换模型后端（默认 OpenAI 兼容流式 Provider，当前接入 DeepSeek，预留多 API 扩展） | [infra/llm/provider.py](../backend/agent_runtime/infra/llm/provider.py) |
 | `RAGStrategy` | 替换整条检索管线（默认内置 7 阶段混合检索，可无缝换接 Milvus / ES / 客户知识服务） | [extensions/rag/extension.py](../backend/agent_runtime/extensions/rag/extension.py) |
 
 | 新客户需求 | 推荐接入方式 |

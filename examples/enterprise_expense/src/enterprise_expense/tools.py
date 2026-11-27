@@ -14,7 +14,7 @@ def create_expense_tools(store: Any, *, approval_writes: Optional[List[Dict[str,
 
     @tool(risk_level=RiskLevel.READ)
     async def bi_query(region: str, quarter: str, verbose: bool = False) -> str:
-        """按大区及季度查询差旅超标数据"""
+        """按大区及季度查询差旅超标数据；默认 verbose=False 已返回完整汇总、分月明细与费用构成，仅在用户明确要求逐条原始流水明细时再传 verbose=True。"""
         if verbose:
             return "\n".join(
                 f"ROW#{i:03} | {region} {quarter} | E{i:04} | 超标 ¥{1200 + i * 37}" for i in range(1, 95)
@@ -29,7 +29,7 @@ def create_expense_tools(store: Any, *, approval_writes: Optional[List[Dict[str,
     async def submit_approval(
         title: str, amount: float, region: str, ctx: ExecutionContext
     ) -> Dict[str, Any]:
-        """向 OA 提交超标专项审批"""
+        """向 OA 提交超标专项审批（高危写操作：仅在用户明确要求发起/提交审批时调用；若用户仅要求分析数据或撰写报告，严禁擅自调用，只可在结论中给出审批建议）。"""
         key = ctx.op_key or canonical_hash(
             [ctx.thread_id, ctx.auth_scope.user_id, ctx.request_id, "submit_approval"]
         )

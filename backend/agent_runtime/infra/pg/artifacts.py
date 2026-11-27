@@ -47,7 +47,7 @@ class PgArtifactsMixin:
             expires,
         )
 
-    def read_tool_output_page(self, ctx, ref_id, offset=0, limit=1200) -> Tuple[Optional[str], Optional[str]]:
+    def read_tool_output_page(self, ctx, ref_id, offset=0, limit=4000) -> Tuple[Optional[str], Optional[str]]:
         if type(offset) is not int or offset < 0 or type(limit) is not int or limit < 1:
             return None, "invalid_page"
         rows = self.rows(
@@ -57,9 +57,26 @@ class PgArtifactsMixin:
         )
         if not rows or not rows[0]["oss_key"]:
             return None, "output_not_found"
-        if offset >= rows[0]["total_chars"]:
-            return "", None
-        return self.oss.get_text(rows[0]["oss_key"])[offset : offset + min(limit, 1200)], None
+        total_chars = int(rows[0]["total_chars"] or 0)
+        if offset >= total_chars:
+            return (
+                f"[tool_output ref_id={ref_id} chars={total_chars}..{total_chars}/{total_chars} has_more=false EOF]",
+                None,
+            )
+        full_text = self.oss.get_text(rows[0]["oss_key"])
+        actual_total = len(full_text)
+        if offset >= actual_total:
+            return (
+                f"[tool_output ref_id={ref_id} chars={actual_total}..{actual_total}/{actual_total} has_more=false EOF]",
+                None,
+            )
+        end = min(offset + min(limit, 8000), actual_total)
+        chunk = full_text[offset:end]
+        if end < actual_total:
+            header = f"[tool_output ref_id={ref_id} chars={offset}..{end}/{actual_total} has_more=true next_offset={end}]"
+        else:
+            header = f"[tool_output ref_id={ref_id} chars={offset}..{end}/{actual_total} has_more=false]"
+        return f"{header}\n{chunk}", None
 
     def write_workspace_file(
         self,

@@ -76,11 +76,11 @@ class ModelSettings:
     api_key: str
     base_url: str = DEFAULT_BASE
     model: str = DEFAULT_MODEL
-    mode: str = "auto"
+    mode: str = "deepseek"
 
     @property
     def effective(self) -> str:
-        return "deepseek" if self.api_key and self.mode != "mock" else "mock"
+        return self.mode or "deepseek"
 
     def public(self) -> dict:
         return {

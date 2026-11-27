@@ -16,6 +16,7 @@ from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink,
 from agent_runtime.framework.core.contracts import SSEEvent
 from agent_runtime.framework.core.runs import RunConflictError, RunNotFoundError
 from agent_runtime.framework.core.workflow import graph_config, pending_tickets
+from agent_runtime.infra.llm.provider import ModelNotConfiguredError
 
 log = logging.getLogger("agent-runtime.chat")
 router = APIRouter(tags=["Conversation & Runs"])
@@ -76,7 +77,7 @@ async def chat_sse(req: Request, body: ChatRequest):
     except RunConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
 
-    cfg = graph_config(tid)
+    cfg = graph_config(tid, max_steps=getattr(runtime, "max_steps", None))
     queue: asyncio.Queue = asyncio.Queue(256)
     stream_meta = {"run_id": run_rec.run_id, "seq": 0, "closed": False}
 
@@ -92,6 +93,23 @@ async def chat_sse(req: Request, body: ChatRequest):
                     SSEEvent(
                         "error",
                         {"error": "请先处理或中止当前对话的待审批操作", "trace_id": trace, "run_id": run_rec.run_id},
+                    )
+                )
+                return
+
+            model_cfg = getattr(req.app.state.model, "config", None)
+            if model_cfg is not None and not getattr(model_cfg, "api_key", ""):
+                run_service.mark_finished(
+                    run_rec.run_id, scope.tenant_id, status="failed", error_detail="ModelNotConfiguredError"
+                )
+                await publish_sse(
+                    SSEEvent(
+                        "error",
+                        {
+                            "error": "未配置 DeepSeek API Key，请先在 .env 设置 DEEPSEEK_API_KEY 或点击左下角设置填写密钥。",
+                            "trace_id": trace,
+                            "run_id": run_rec.run_id,
+                        },
                     )
                 )
                 return
@@ -154,7 +172,12 @@ async def chat_sse(req: Request, body: ChatRequest):
                 run_rec.run_id, scope.tenant_id, status="failed", error_detail=type(exc).__name__
             )
             obs.log_event("turn_error", trace, tid, run_id=run_rec.run_id, error=type(exc).__name__)
-            detail = exc.detail if isinstance(exc, HTTPException) else "执行失败，请检查模型配置和服务日志"
+            if isinstance(exc, HTTPException):
+                detail = exc.detail
+            elif isinstance(exc, ModelNotConfiguredError):
+                detail = str(exc)
+            else:
+                detail = "执行失败，请检查 DeepSeek 模型配置和服务日志"
             await publish_sse(SSEEvent("error", {"error": detail, "trace_id": trace, "run_id": run_rec.run_id}))
         finally:
             run_service.detach_task(run_rec.run_id)

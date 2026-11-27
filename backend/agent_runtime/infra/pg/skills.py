@@ -10,6 +10,52 @@ from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import AuthScope, SkillSummary
 from agent_runtime.framework.core.security import AccessFilter
 from agent_runtime.infra.pg.acl_sql import compile_acl_sql, default_access_filter
+from agent_runtime.infra.search_text import terms
+
+
+def filter_skills_by_query(items: List[SkillSummary], query: str) -> List[SkillSummary]:
+    """Rank skills using bilingual tokenizer overlap (exact substring + bigram/word matches)."""
+    q = (query or "").strip().lower()
+    if not q:
+        return list(items)
+
+    q_tokens = set(terms(q))
+    q_multi = {t for t in q_tokens if len(t) >= 2}
+    q_single = {t for t in q_tokens if len(t) == 1}
+
+    scored: List[Tuple[float, SkillSummary]] = []
+    for summary in items:
+        slug_l = summary.slug.lower()
+        tags_l = [t.lower() for t in summary.tags]
+        haystack = f"{slug_l} {summary.description.lower()} {' '.join(tags_l)}"
+        h_tokens = set(terms(haystack))
+
+        score = 0.0
+        exact_hit = q in haystack
+        if exact_hit:
+            score += 10.0
+            if q in slug_l or any(q in tg for tg in tags_l):
+                score += 5.0
+
+        multi_hits = q_multi & h_tokens
+        single_hits = q_single & h_tokens
+        if multi_hits:
+            score += 3.0 * len(multi_hits)
+            score += 0.25 * len(single_hits)
+        elif exact_hit:
+            score += 0.25 * len(single_hits)
+        elif not q_multi and single_hits:
+            # Pure single-char query (e.g. "报")
+            score += float(len(single_hits))
+        elif q_single and (len(single_hits) / len(q_single)) >= 0.6 and len(single_hits) >= 2:
+            # Fallback when every char in a short non-contiguous Chinese phrase matches
+            score += 0.5 * len(single_hits)
+
+        if score > 0:
+            scored.append((score, summary))
+
+    scored.sort(key=lambda pair: (-pair[0], pair[1].status != "active", pair[1].slug))
+    return [s for _, s in scored]
 
 
 class PgSkillsMixin:
@@ -122,14 +168,8 @@ class PgSkillsMixin:
                 ORDER BY (s.status = 'active') DESC, s.slug""",
             acl_params,
         )
-        q = query.strip().lower()
-        out: List[SkillSummary] = []
-        for r in rows:
-            summary = self._row_to_skill(r)
-            if q and q not in f"{summary.slug} {summary.description} {' '.join(summary.tags)}".lower():
-                continue
-            out.append(summary)
-        return out
+        summaries = [self._row_to_skill(r) for r in rows]
+        return filter_skills_by_query(summaries, query)
 
     def get_skill_content(
         self,

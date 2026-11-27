@@ -41,7 +41,7 @@ export async function updateModelConfig(payload: {
   api_key?: string;
   base_url?: string;
   model?: string;
-  mode?: "deepseek" | "mock";
+  mode?: "deepseek";
 }): Promise<ModelConfig> {
   const res = await fetch(`${API_BASE}/config/model`, {
     method: "POST",
@@ -82,6 +82,46 @@ export async function fetchThreadMessages(
   if (!res.ok) return [];
   const data = await res.json();
   return data.messages || [];
+}
+
+export async function submitMessageFeedback(
+  threadId: string,
+  payload: {
+    trace_id: string;
+    rating: "up" | "down";
+    reason?: string;
+    msg_id?: number;
+    answer_excerpt?: string;
+  }
+): Promise<{ ok: boolean; feedback: Record<string, unknown> }> {
+  const res = await fetch(`${API_BASE}/threads/${encodeURIComponent(threadId)}/feedback`, {
+    method: "POST",
+    headers: defaultHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || "提交反馈失败");
+  }
+  return res.json();
+}
+
+export async function cancelMessageFeedback(
+  threadId: string,
+  traceId: string
+): Promise<{ ok: boolean; deleted: boolean }> {
+  const res = await fetch(
+    `${API_BASE}/threads/${encodeURIComponent(threadId)}/feedback/${encodeURIComponent(traceId)}`,
+    {
+      method: "DELETE",
+      headers: defaultHeaders(),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || "取消反馈失败");
+  }
+  return res.json();
 }
 
 export async function fetchRuntimeState(

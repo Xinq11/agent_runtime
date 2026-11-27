@@ -32,7 +32,7 @@ from agent_runtime.framework.tools.gateway import compute_op_key
 from agent_runtime.infra.plg.hub import ObservabilityHub
 
 try:
-    from tests._pg_harness import get_test_store, reset_test_db
+    from tests._pg_harness import EchoTestModel, get_test_store, reset_test_db
 except ImportError:
     from _pg_harness import get_test_store, reset_test_db
 
@@ -147,6 +147,7 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                     return RetrievalResult(status="ok", hits=[hit])
 
             app = AgentRuntimeApp(
+                model=EchoTestModel(),
                 store=get_test_store(),
                 extensions=[RagExtension(strategy=CustomESRetriever(), mode="both")],
             )
@@ -355,7 +356,11 @@ class TestAgentRuntimeSDK(unittest.TestCase):
                 def middlewares(self):
                     return (AuditMW(),)
 
-            app = AgentRuntimeApp(store=get_test_store(), extensions=[CustomFinancePlugin()])
+            app = AgentRuntimeApp(
+                model=EchoTestModel(),
+                store=get_test_store(),
+                extensions=[CustomFinancePlugin()],
+            )
             res = await app.run_turn("你好", thread_id="th_plugin")
             self.assertEqual(res["final_answer"], "已收到消息：你好")
             self.assertIn("before_model", events)
@@ -377,6 +382,101 @@ class TestAgentRuntimeSDK(unittest.TestCase):
             self.assertEqual(env["seq"], 7)
             self.assertEqual(env["type"], "token")
             self.assertEqual(env["payload"], {"text": "hi"})
+
+        asyncio.run(_run())
+
+    def test_13_skill_bilingual_search_progressive_disclosure_acl_and_prefix_cache(self):
+        async def _run():
+            store = get_test_store()
+            captured_prompts: List[List[Message]] = []
+
+            class TwoStepSkillModel:
+                async def generate(self, *, messages, tool_specs, ctx):
+                    captured_prompts.append(list(messages))
+                    if len(captured_prompts) == 1:
+                        return Message(
+                            role="assistant",
+                            content="",
+                            tool_calls=[
+                                ToolCall(
+                                    id="tc_sk_read",
+                                    name="get_skill",
+                                    args={"slug": "expense-audit-report"},
+                                )
+                            ],
+                        )
+                    return Message(role="assistant", content="已按 SOP 完成分析。")
+
+            app = AgentRuntimeApp(
+                model=TwoStepSkillModel(),
+                store=store,
+                extensions=[SkillsExtension(inline_limit=2)],
+            )
+            emp = AuthScope("t_acme", "u_emp", ("employee",))
+            exec_scope = AuthScope("t_acme", "u_exec", ("exec",))
+
+            # 0 skills -> truly empty message
+            ctx_emp = ExecutionContext(uid("tr"), "th_sk_empty", emp, uid("req"))
+            empty_res = await app.gateway.execute_one(ToolCall("tc_e0", "list_skills", {"query": "差旅"}), ctx_emp)
+            self.assertIn("暂无可用 Skill", empty_res.content)
+
+            store.publish_skill(
+                scope=emp,
+                slug="expense-audit-report",
+                description="差旅超标分析、制度核验、ECharts 图表输出与工作区报告归档 SOP。",
+                content="# 差旅超标 SOP",
+                acl_roles=["employee"],
+                tags=["finance", "report"],
+            )
+            store.publish_skill(
+                scope=exec_scope,
+                slug="exec-layoff-plan",
+                description="高管保密组织调整方案",
+                content="# 绝密",
+                acl_roles=["exec"],
+                tags=["exec"],
+            )
+
+            # 1. Non-contiguous Chinese query "差旅分析" hits "差旅超标分析" via bigram tokenizer
+            hit = await app.gateway.execute_one(ToolCall("tc_q1", "list_skills", {"query": "差旅分析"}), ctx_emp)
+            self.assertIn("expense-audit-report", hit.content)
+            self.assertNotIn("exec-layoff-plan", hit.content)
+
+            # 2. Unmatched query does NOT falsely claim no available skills; returns fallback catalog
+            miss = await app.gateway.execute_one(ToolCall("tc_q2", "list_skills", {"query": "量子物理"}), ctx_emp)
+            self.assertNotIn("暂无可用 Skill", miss.content)
+            self.assertIn("未精确匹配", miss.content)
+            self.assertIn("expense-audit-report", miss.content)
+            self.assertNotIn("exec-layoff-plan", miss.content)
+
+            # 3. Two-step turn: Layer-1 [AVAILABLE_SKILLS] injected with strict ACL + identical Prefix Cache across steps
+            res = await app.run_turn("帮我做一份差旅分析报告", thread_id="th_sk_cache", scope=emp)
+            self.assertEqual(res["final_answer"], "已按 SOP 完成分析。")
+            self.assertEqual(len(captured_prompts), 2)
+            step1_msgs, step2_msgs = captured_prompts
+            self.assertIn("[AVAILABLE_SKILLS]", step1_msgs[1].content)
+            self.assertIn("expense-audit-report", step1_msgs[1].content)
+            self.assertNotIn("exec-layoff-plan", step1_msgs[1].content)
+            # Prefix Cache invariant: system + catalog prefix is bit-for-bit identical on Step 1 & Step 2
+            self.assertEqual(step1_msgs[0].content, step2_msgs[0].content)
+            self.assertEqual(step1_msgs[1].content, step2_msgs[1].content)
+            # Transient only: catalog never persisted in session_messages
+            persisted = store.list_messages("th_sk_cache")
+            self.assertFalse(any("[AVAILABLE_SKILLS]" in (m.content or "") for m in persisted))
+
+            # 4. Scope without `get_skill` in allowed_tools (e.g. read-only BI subagent) skips catalog injection
+            sub_scope = AuthScope("t_acme", "u_emp", ("employee",), allowed_tools=("read",))
+            sub_ctx = ExecutionContext(uid("tr"), "th_sk_sub", sub_scope, uid("req"))
+            sub_extras = await app.middlewares.run_extra_context("查差旅", sub_ctx)
+            self.assertEqual(sub_extras, [])
+
+            # 5. Exceeding inline_limit degrades cleanly to summary hint instead of dumping full catalog
+            store.publish_skill(scope=emp, slug="skill-b", description="B", content="B", acl_roles=["employee"])
+            store.publish_skill(scope=emp, slug="skill-c", description="C", content="C", acl_roles=["employee"])
+            big_extras = await app.middlewares.run_extra_context("查差旅", ctx_emp)
+            self.assertEqual(len(big_extras), 1)
+            self.assertIn("共有 3 个可用平台技能", big_extras[0])
+            self.assertNotIn("expense-audit-report", big_extras[0])
 
         asyncio.run(_run())
 

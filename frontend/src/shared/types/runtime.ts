@@ -11,7 +11,7 @@ export const DEFAULT_IDENTITY: IdentityProfile = {
 };
 
 export interface ModelConfig {
-  mode: "deepseek" | "mock";
+  mode: "deepseek";
   model: string;
   base_url: string;
   has_api_key: boolean;
@@ -64,6 +64,9 @@ export interface ChatTurnItem {
   approval?: ApprovalTicket;
   approvalStatus?: "pending" | "approved" | "rejected" | "submitting";
   traceId?: string;
+  msgId?: number;
+  feedbackRating?: "up" | "down";
+  feedbackReason?: string;
   ts: number;
 }
 
@@ -155,7 +158,7 @@ export interface OpsOverview {
     ok: boolean;
     postgres: string;
     minio: string;
-    mode: "deepseek" | "mock";
+    mode: "deepseek";
     model: string;
     base_url: string;
     has_api_key: boolean;

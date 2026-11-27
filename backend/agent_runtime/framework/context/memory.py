@@ -207,11 +207,11 @@ async def compact_after_agent(
 
     new_summary = ""
     used_llm = False
-    # Use real LLM compaction when a live non-mock model_client is supplied
+    # Use LLM compaction when a live configured model_client is supplied
     if model_client is not None:
         cfg = getattr(model_client, "config", None)
-        is_live = cfg is not None and getattr(cfg, "effective", "mock") != "mock"
-        if is_live:
+        can_call_llm = cfg is not None and bool(getattr(cfg, "api_key", ""))
+        if can_call_llm:
             compact_prompt = (
                 "你是上下文记忆压缩器。请将「已有历史摘要」与「新增待折叠对话」合并压缩成一份高密度、结构化的中文记忆摘要，"
                 "供后续对话作为系统记忆使用。要求：\n"
@@ -248,7 +248,7 @@ async def compact_after_agent(
                 used_llm = False
 
     if not new_summary:
-        # Deterministic fallback when running offline in Mock / unit-test mode
+        # Deterministic fallback if LLM compaction fails or no API key is attached (e.g. unit tests)
         lines: List[str] = []
         if old_summary.strip():
             lines.append(old_summary.strip())

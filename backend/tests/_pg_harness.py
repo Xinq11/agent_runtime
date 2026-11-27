@@ -9,8 +9,25 @@ from typing import Optional
 import psycopg
 from psycopg import conninfo, sql
 
+from agent_runtime.framework.core.contracts import ExecutionContext, Message
 from agent_runtime.infra.oss.minio import MinioObjectStore
 from agent_runtime.infra.pg.postgres import DEFAULT_PG_DSN, PgOssStore
+
+
+class EchoTestModel:
+    """Test-only deterministic model double (never shipped in production runtime)."""
+
+    def __init__(self, router=None) -> None:
+        self.router = router
+
+    async def generate(self, *, messages, tool_specs, ctx: ExecutionContext) -> Message:
+        user_msgs = [m.content for m in messages if m.role == "user"]
+        last_user = user_msgs[-1] if user_msgs else ""
+        if self.router is not None:
+            tool_msgs = [m for m in messages if m.role == "tool"]
+            tool_names = {getattr(t, "name", "") for t in tool_specs}
+            return self.router(ctx, last_user, tool_msgs, tool_names)
+        return Message(role="assistant", content=f"已收到消息：{last_user}")
 
 TEST_DB_NAME = os.getenv("AGENT_TEST_DB", "agent_runtime_test")
 TEST_BUCKET = os.getenv("AGENT_TEST_BUCKET", "agent-artifacts-test")
@@ -92,9 +109,9 @@ def reset_test_db() -> PgOssStore:
         if actual_db != db_name or actual_db in _PROTECTED_DBS:
             raise RuntimeError(f"Refusing TRUNCATE on unexpected database '{actual_db}' (expected '{db_name}')")
         cur.execute(
-            """TRUNCATE agent_threads, session_messages, session_summaries, tool_approvals,
-                        tool_outputs, tool_runs, rag_parents, rag_chunks, agent_spans,
-                        runtime_traces, agent_runs, workspace_files,
+            """TRUNCATE agent_threads, session_messages, session_summaries, message_feedback,
+                        tool_approvals, tool_outputs, tool_runs, rag_parents, rag_chunks,
+                        agent_spans, runtime_traces, agent_runs, workspace_files,
                         agent_skills, agent_skill_versions
                RESTART IDENTITY CASCADE"""
         )

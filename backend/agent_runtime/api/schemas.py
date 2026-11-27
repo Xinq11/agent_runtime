@@ -35,7 +35,7 @@ class ModelConfigUpdateRequest(BaseModel):
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
-    mode: Optional[str] = Field(default=None, description="auto | deepseek | mock")
+    mode: Optional[str] = Field(default=None, description="当前支持 deepseek（预留多模型扩展）")
 
 
 class SkillUploadRequest(BaseModel):
@@ -59,3 +59,11 @@ class KnowledgeUploadRequest(BaseModel):
 
 class StatusUpdateRequest(BaseModel):
     status: Literal["active", "disabled"] = Field(..., description="active=生效，disabled=下架")
+
+
+class MessageFeedbackRequest(BaseModel):
+    trace_id: str = Field(..., min_length=1, max_length=128, description="对应助手回复的 trace_id")
+    rating: Literal["up", "down"] = Field(default="down", description="反馈类型：up=点赞，down=点踩")
+    reason: str = Field(default="", max_length=500, description="可选反馈原因")
+    msg_id: Optional[int] = Field(default=None, description="可选关联的 session_messages.msg_id")
+    answer_excerpt: str = Field(default="", max_length=400, description="可选回复摘要快照")

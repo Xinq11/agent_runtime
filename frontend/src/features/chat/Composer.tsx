@@ -56,7 +56,7 @@ export const Composer: React.FC<ComposerProps> = ({
         />
         <div className="flex items-center justify-between pt-1.5 px-1">
           <span className="text-[11.5px] font-mono" style={{ color: "var(--ink-muted)" }}>
-            {modelConfig.mode === "deepseek" ? modelConfig.model : "mock-runtime"} ·
+            {modelConfig.has_api_key ? modelConfig.model : "未配置 DeepSeek API Key"} ·
             支持 Markdown 表格与交互图表
           </span>
           {loading ? (

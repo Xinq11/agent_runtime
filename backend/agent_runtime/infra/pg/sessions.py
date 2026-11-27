@@ -6,6 +6,7 @@ from dataclasses import asdict
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import AuthScope, Message, ToolCall
 
 
@@ -173,6 +174,7 @@ class PgSessionsMixin:
             cur.execute("DELETE FROM tool_approvals WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM agent_runs WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
             cur.execute("DELETE FROM workspace_files WHERE tenant_id=%s AND thread_id=%s", (scope.tenant_id, thread_id))
+            cur.execute("DELETE FROM message_feedback WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM runtime_traces WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM session_summaries WHERE thread_id=%s", (thread_id,))
             cur.execute("DELETE FROM session_messages WHERE thread_id=%s", (thread_id,))
@@ -185,3 +187,97 @@ class PgSessionsMixin:
                 (thread_id, scope.tenant_id, scope.user_id),
             )
             return True
+
+    def save_message_feedback(
+        self,
+        scope: AuthScope,
+        *,
+        thread_id: str,
+        trace_id: str,
+        rating: str = "down",
+        reason: str = "",
+        msg_id: Optional[int] = None,
+        answer_excerpt: str = "",
+    ) -> Dict[str, Any]:
+        """Persist or update a user's feedback (e.g. dislike) on an assistant reply."""
+        self.own_thread(scope, thread_id)
+        clean_reason = (reason or "").strip()[:500]
+        clean_excerpt = (answer_excerpt or "").strip()[:400]
+        with self.transaction() as cur:
+            resolved_msg_id = msg_id
+            if resolved_msg_id is None:
+                cur.execute(
+                    """SELECT msg_id, content FROM session_messages
+                       WHERE thread_id=%s AND role='assistant' AND metadata->>'trace_id'=%s
+                       ORDER BY msg_id DESC LIMIT 1""",
+                    (thread_id, trace_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    resolved_msg_id = row[0]
+                    if not clean_excerpt and row[1]:
+                        clean_excerpt = str(row[1]).strip()[:400]
+            else:
+                cur.execute(
+                    "SELECT msg_id, content FROM session_messages WHERE thread_id=%s AND msg_id=%s",
+                    (thread_id, resolved_msg_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    resolved_msg_id = None
+                elif not clean_excerpt and row[1]:
+                    clean_excerpt = str(row[1]).strip()[:400]
+
+            fid = uid("fb")
+            cur.execute(
+                """INSERT INTO message_feedback
+                   (feedback_id, tenant_id, thread_id, actor_id, trace_id, msg_id, rating, reason, answer_excerpt)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (tenant_id, thread_id, actor_id, trace_id) DO UPDATE
+                   SET rating=EXCLUDED.rating,
+                       reason=EXCLUDED.reason,
+                       msg_id=COALESCE(EXCLUDED.msg_id, message_feedback.msg_id),
+                       answer_excerpt=CASE
+                           WHEN EXCLUDED.answer_excerpt <> '' THEN EXCLUDED.answer_excerpt
+                           ELSE message_feedback.answer_excerpt
+                       END,
+                       updated_at=now()
+                   RETURNING feedback_id, tenant_id, thread_id, actor_id, trace_id, msg_id,
+                             rating, reason, answer_excerpt, created_at, updated_at""",
+                (
+                    fid,
+                    scope.tenant_id,
+                    thread_id,
+                    scope.user_id,
+                    trace_id,
+                    resolved_msg_id,
+                    rating,
+                    clean_reason,
+                    clean_excerpt,
+                ),
+            )
+            cols = [d.name for d in cur.description]
+            return dict(zip(cols, cur.fetchone()))
+
+    def delete_message_feedback(self, scope: AuthScope, *, thread_id: str, trace_id: str) -> bool:
+        """Remove a user's feedback on a specific assistant reply."""
+        self.own_thread(scope, thread_id)
+        with self.transaction() as cur:
+            cur.execute(
+                """DELETE FROM message_feedback
+                   WHERE tenant_id=%s AND thread_id=%s AND actor_id=%s AND trace_id=%s""",
+                (scope.tenant_id, thread_id, scope.user_id, trace_id),
+            )
+            return cur.rowcount > 0
+
+    def list_thread_feedback(self, scope: AuthScope, thread_id: str) -> List[Dict[str, Any]]:
+        """List all persisted feedback entries for the caller in this thread."""
+        self.own_thread(scope, thread_id)
+        return self.rows(
+            """SELECT feedback_id, thread_id, trace_id, msg_id, rating, reason,
+                      answer_excerpt, created_at, updated_at
+               FROM message_feedback
+               WHERE tenant_id=%s AND thread_id=%s AND actor_id=%s
+               ORDER BY created_at DESC""",
+            (scope.tenant_id, thread_id, scope.user_id),
+        )

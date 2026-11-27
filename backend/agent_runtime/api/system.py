@@ -124,8 +124,8 @@ async def update_model(req: Request, payload: ModelConfigUpdateRequest):
         and (base.scheme, base.netloc) != (urlsplit(DEFAULT_BASE).scheme, urlsplit(DEFAULT_BASE).netloc)
     ):
         raise HTTPException(422, "请使用受信任的模型服务端点（DeepSeek / OpenAI 或部署时配置的 DEEPSEEK_BASE_URL）")
-    if cfg.mode not in {"deepseek", "auto", "mock"} or not cfg.model:
-        raise HTTPException(422, "mode 或 model 无效")
+    if cfg.mode not in {"deepseek"} or not cfg.model:
+        raise HTTPException(422, "当前仅支持 deepseek 模式，请提供有效的 model 名称")
     if base.netloc != urlsplit(current.base_url).netloc and "api_key" not in body:
         cfg = replace(cfg, api_key="")
     req.app.state.model.config = replace(cfg, base_url=cfg.base_url.rstrip("/"))

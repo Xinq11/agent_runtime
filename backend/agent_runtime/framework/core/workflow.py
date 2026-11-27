@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, replace
+import inspect
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -24,12 +25,41 @@ from agent_runtime.framework.core.security import (
     enforce_check,
     get_policy_rev,
 )
+from agent_runtime.infra.llm.provider import strip_dsml_markup
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是通用智能助手。必要时先调用工具核实事实再作答，知识库结论标注来源 [1]。"
     "需要生成文档、报表或结构化文件时，可使用内置 write/read 工具读写工作区文件；"
     "涉及外部业务系统写入必须通过对应工具执行。"
 )
+_FINAL_STEP_CONVERGENCE_NOTICE = (
+    "\n\n[运行时提示：已达本轮工具调用步数上限，当前已禁止继续调用工具。"
+    "请严禁输出任何工具调用或 DSML 标记，直接基于以上已获取的数据汇总给出最终中文答复；"
+    "若部分分页数据未读完，请基于已有内容作答并如实注明覆盖范围。]"
+)
+
+
+def _supports_tool_choice(model: Any) -> bool:
+    gen = getattr(model, "generate", None)
+    if gen is None:
+        return False
+    try:
+        sig = inspect.signature(gen)
+    except (TypeError, ValueError):
+        return False
+    if "tool_choice" in sig.parameters:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+
+def _append_convergence_notice(messages: List[Message]) -> List[Message]:
+    """Attach transient final-step notice without inserting mid-conversation system/user turns."""
+    out = list(messages)
+    if out and out[-1].role == "tool":
+        out[-1] = replace(out[-1], content=(out[-1].content or "") + _FINAL_STEP_CONVERGENCE_NOTICE)
+    else:
+        out.append(Message(role="user", content=_FINAL_STEP_CONVERGENCE_NOTICE.strip()))
+    return out
 
 
 def run_context(
@@ -102,11 +132,16 @@ def build_agent_graph(
             history = await asyncio.to_thread(store.list_messages, ctx.thread_id, cursor)
             recent = list(history) + list(pending)
             latest_user_text = ""
-            if recent and recent[-1].role == "user":
-                transformed = await mw.run_transform_user_input(recent[-1].content or "", ctx)
-                if transformed != recent[-1].content:
-                    recent[-1] = replace(recent[-1], content=transformed)
-                latest_user_text = (recent[-1].content or "").strip()
+            last_user_idx = next(
+                (i for i in range(len(recent) - 1, -1, -1) if recent[i].role == "user"),
+                None,
+            )
+            if last_user_idx is not None:
+                raw_user = recent[last_user_idx].content or ""
+                transformed = await mw.run_transform_user_input(raw_user, ctx)
+                if transformed != raw_user:
+                    recent[last_user_idx] = replace(recent[last_user_idx], content=transformed)
+                latest_user_text = (recent[last_user_idx].content or "").strip()
             extra_contexts = (
                 await mw.run_extra_context(latest_user_text, ctx) if latest_user_text else []
             )
@@ -132,8 +167,8 @@ def build_agent_graph(
         _guard_cancel(ctx)
         step_num = state["step"] + 1
         model_cfg = getattr(model, "config", None)
-        mode_name = getattr(model_cfg, "effective", "mock") if model_cfg else "mock"
-        model_name = getattr(model_cfg, "model", "mock") if model_cfg else "mock"
+        mode_name = getattr(model_cfg, "effective", "deepseek") if model_cfg else "deepseek"
+        model_name = getattr(model_cfg, "model", "deepseek-chat") if model_cfg else "deepseek-chat"
 
         with obs.span(
             trace_id=ctx.trace_id,
@@ -141,7 +176,8 @@ def build_agent_graph(
             parent_span_id=ctx.parent_span_id,
             attributes={"mode": mode_name, "model": model_name, "step": step_num},
         ) as m_sp:
-            raw_specs = gateway.registry.visible_specs(ctx.auth_scope) if state["step"] < max_steps - 1 else []
+            is_final_step = state["step"] >= max_steps - 1
+            raw_specs = gateway.registry.visible_specs(ctx.auth_scope)
             if access_controller is not None and raw_specs:
                 specs = []
                 for sp in raw_specs:
@@ -162,15 +198,40 @@ def build_agent_graph(
                         continue
             else:
                 specs = raw_specs
-            msg = await model.generate(messages=inputs, tool_specs=specs, ctx=ctx)
+
+            if is_final_step:
+                call_inputs = _append_convergence_notice(inputs)
+                if _supports_tool_choice(model):
+                    # Preserve identical `tools` schema for KV Prefix Cache + disable tool decoding natively
+                    msg = await model.generate(
+                        messages=call_inputs,
+                        tool_specs=specs,
+                        ctx=ctx,
+                        tool_choice="none",
+                    )
+                else:
+                    msg = await model.generate(messages=call_inputs, tool_specs=[], ctx=ctx)
+            else:
+                msg = await model.generate(messages=inputs, tool_specs=specs, ctx=ctx)
+
             _guard_cancel(ctx)
             msg = await mw.run_after_model(msg, ctx)
-            if not specs and msg.tool_calls:
-                msg = Message("assistant", "已达到工具调用步数上限。")
+            cleaned = strip_dsml_markup(msg.content or "")
+            if cleaned != (msg.content or ""):
+                msg = replace(msg, content=cleaned)
+            if is_final_step:
+                if msg.tool_calls or not (msg.content or "").strip():
+                    fallback = (
+                        msg.content.strip()
+                        if (msg.content or "").strip()
+                        else "已达到本轮工具调用步数上限，请基于已有内容继续或缩小查询范围。"
+                    )
+                    msg = Message("assistant", fallback)
             m_sp.attributes.update(
                 {
                     "tool_calls": [c.name for c in msg.tool_calls],
                     "reply_chars": len(msg.content or ""),
+                    "final_step_guard": is_final_step,
                 }
             )
 
@@ -326,8 +387,9 @@ async def invoke_phase(graph: Any, store: Any, payload: Any, cfg: dict, trace: s
         await asyncio.to_thread(store.save_span, root)
 
 
-def graph_config(tid: str) -> dict:
-    return {"configurable": {"thread_id": tid}, "recursion_limit": 32}
+def graph_config(tid: str, *, max_steps: Optional[int] = None) -> dict:
+    steps = max(1, int(max_steps)) if max_steps is not None else 15
+    return {"configurable": {"thread_id": tid}, "recursion_limit": max(64, 2 * steps + 10)}
 
 
 def extract_interrupt_tickets(raw_interrupts: Any) -> list:

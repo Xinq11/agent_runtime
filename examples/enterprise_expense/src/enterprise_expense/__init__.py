@@ -5,7 +5,6 @@ from __future__ import annotations
 from importlib.resources import files
 from typing import Any, Dict, List, Optional
 
-from .mock_script import route_enterprise_expense_mock
 from .tools import create_expense_tools
 from agent_runtime.framework.core.contracts import AuthScope
 from agent_runtime.framework.core.protocols import AgentPlugin, AppMetadata, QuickPromptSpec
@@ -22,7 +21,7 @@ DEFAULT_EXPENSE_SKILL_MD = """# 差旅超标分析与报告 SOP
    - 使用标准 Markdown 表格呈现关键汇总指标；
    - 使用 `chart` 代码块输出 ECharts 柱状图（分月趋势）或环形饼图（费用构成）。
 4. **文档沉淀（按需）**：若用户需要归档报告，调用内置 `write` 工具写入如 `reports/expense_summary.md`。
-5. **高危审批**：仅在用户明确要求发起审批时调用 `submit_approval`，触发人工确认。
+5. **高危审批（严格按需）**：仅在用户明确要求「发起/提交审批」时调用 `submit_approval` 触发人工确认；若用户仅要求分析数据或撰写报告，严禁主动调用 `submit_approval`，仅在报告末尾说明是否满足超标红线并询问用户是否需要发起审批。
 """
 
 
@@ -79,9 +78,6 @@ class EnterpriseExpensePlugin(AgentPlugin):
         )
 
     def register_tools(self, *, registry, store, model, gateway, obs) -> None:
-        configure_mock = getattr(model, "set_default_mock_router", None)
-        if configure_mock is not None:
-            configure_mock(route_enterprise_expense_mock)
         for spec in create_expense_tools(store, approval_writes=self.approval_writes):
             registry.register(spec)
         register_subagent_tool(

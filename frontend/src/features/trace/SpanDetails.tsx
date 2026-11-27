@@ -55,8 +55,16 @@ export const SpanDetails: React.FC<SpanDetailsProps> = ({ activeSpan, shareLabel
         >
           <div className="flex items-center justify-between">
             <span className="font-semibold text-[12px]">本次事件流水与上下文状态</span>
-            <span className="font-mono text-[10.5px]" style={{ color: "var(--ink-muted)" }}>
-              压缩游标 #{state.summary.covered_up_to_msg_id}
+            <span
+              className="font-mono text-[10.5px]"
+              title={
+                state.summary.covered_up_to_msg_id > 0
+                  ? `covered_up_to_msg_id = ${state.summary.covered_up_to_msg_id}`
+                  : undefined
+              }
+              style={{ color: "var(--ink-muted)" }}
+            >
+              {state.summary.covered_up_to_msg_id > 0 ? "上下文已压缩" : "未触发压缩"}
             </span>
           </div>
           <div className="space-y-1 font-mono text-[10.8px]">

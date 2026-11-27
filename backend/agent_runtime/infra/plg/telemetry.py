@@ -39,7 +39,7 @@ class Telemetry(ObservabilityHub):
         if event == "llm_done":
             calls = fields.get("tool_calls") or []
             call_str = f"tool_calls={calls}" if calls else "final_text"
-            return "INFO", "agent.llm", f"LLM#{fields.get('step', 1)} ({fields.get('model', 'mock')}) completed -> {call_str}"
+            return "INFO", "agent.llm", f"LLM#{fields.get('step', 1)} ({fields.get('model', 'unknown')}) completed -> {call_str}"
         if event == "tool_status":
             st = str(fields.get("status", "ok"))
             lvl = "WARN" if st == "approval_required" else ("ERROR" if st not in ("ok", "running") else "INFO")

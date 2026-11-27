@@ -10,7 +10,8 @@ Follows the refactored `agent-multi-agent-collaboration.html` design:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import inspect
 from typing import Any, Dict, List, Tuple
 
 from agent_runtime.framework.core.contracts import ExecutionContext, Message, RiskLevel
@@ -23,7 +24,7 @@ class SubAgentProfile:
     description: str
     system_prompt: str
     allowed_tools: Tuple[str, ...]
-    model_name: str = "mock-fast"
+    model_name: str = "deepseek-chat"
     max_steps: int = 4
     timeout_sec: float = 12.0
 
@@ -103,15 +104,39 @@ async def run_readonly_subagent(
                         continue
             else:
                 visible_specs = raw_specs
-            resp = await model_client.generate(
-                messages=private_msgs,
-                tool_specs=visible_specs,
-                ctx=sub_ctx,
-            )
+            is_final_step = step_idx >= profile.max_steps - 1
+            call_msgs = list(private_msgs)
+            if is_final_step:
+                notice = "\n\n[运行时提示：子任务已达步数上限，请禁止再调用工具，直接汇总已有结论。]"
+                if call_msgs and call_msgs[-1].role == "tool":
+                    call_msgs[-1] = replace(call_msgs[-1], content=(call_msgs[-1].content or "") + notice)
+                else:
+                    call_msgs.append(Message(role="user", content=notice.strip()))
+                gen_sig = inspect.signature(model_client.generate)
+                supports_tc = "tool_choice" in gen_sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in gen_sig.parameters.values()
+                )
+                if supports_tc:
+                    resp = await model_client.generate(
+                        messages=call_msgs,
+                        tool_specs=visible_specs,
+                        ctx=sub_ctx,
+                        tool_choice="none",
+                    )
+                else:
+                    resp = await model_client.generate(messages=call_msgs, tool_specs=[], ctx=sub_ctx)
+            else:
+                resp = await model_client.generate(
+                    messages=call_msgs,
+                    tool_specs=visible_specs,
+                    ctx=sub_ctx,
+                )
             private_msgs.append(resp)
 
-            if not resp.tool_calls:
-                final_answer = resp.content
+            if not resp.tool_calls or is_final_step:
+                final_answer = (resp.content or "").strip() or (
+                    "[SUBAGENT_MAX_STEPS] 子任务已达步数上限，请基于已有部分结论汇报。"
+                )
                 break
 
             results = await tool_gateway.execute_batch(

@@ -96,9 +96,10 @@ class TestProductionRegressions(unittest.TestCase):
         class ManyTokensModel:
             def __init__(self) -> None:
                 self.config = SimpleNamespace(
-                    model="mock-stream",
-                    effective="mock",
-                    public=lambda: {"model": "mock-stream", "mode": "mock"},
+                    api_key="sk-test",
+                    model="deepseek-chat",
+                    effective="deepseek",
+                    public=lambda: {"model": "deepseek-chat", "mode": "deepseek", "has_api_key": True},
                 )
 
             async def generate(self, *, messages, tool_specs, ctx):
@@ -478,6 +479,112 @@ class TestProductionRegressions(unittest.TestCase):
             # And in-process `request_abort` flips `_cancel_flags` immediately without waiting for TTL
             app.run_service.request_abort(scope=scope, run_id=rec.run_id)
             self.assertTrue(app.run_service.is_cancelled(rec.run_id))
+
+        asyncio.run(_run())
+
+    def test_dsml_stream_guard_final_step_tool_choice_and_pagination_headers(self):
+        from agent_runtime.framework.core.workflow import graph_config
+        from agent_runtime.infra.llm.provider import DsmlStreamGuard, strip_dsml_markup
+
+        # 1. Streaming DSML guard handles split markers (full-width & ASCII) without breaking normal `<`
+        g1 = DsmlStreamGuard()
+        out_chunks = [
+            g1.feed("汇总结论：a < b 且正常输出。"),
+            g1.feed("\n<"),
+            g1.feed("｜DS"),
+            g1.feed("ML｜ calls> <｜DSML｜ invoke name=\"read_tool_output\">"),
+            g1.feed("</｜DSML｜ calls>"),
+            g1.flush(),
+        ]
+        self.assertTrue(g1.triggered)
+        self.assertEqual("".join(out_chunks).strip(), "汇总结论：a < b 且正常输出。")
+        self.assertEqual(strip_dsml_markup("ok <|DSML| invoke>bad"), "ok")
+
+        g2 = DsmlStreamGuard()
+        self.assertEqual(g2.feed("x <") + g2.flush(), "x <")
+        self.assertFalse(g2.triggered)
+
+        # 2. Final step keeps identical tool_specs + passes tool_choice="none" + appends notice on tool msg
+        seen_calls = []
+
+        class FinalStepInspectModel:
+            async def generate(self, *, messages, tool_specs, ctx, tool_choice=None):
+                seen_calls.append(
+                    {
+                        "messages": list(messages),
+                        "tool_names": [s.name for s in tool_specs],
+                        "tool_choice": tool_choice,
+                    }
+                )
+                if len(seen_calls) == 1:
+                    return Message(
+                        "assistant",
+                        "",
+                        [ToolCall("tc_big", "emit_big", {})],
+                    )
+                # Even if model still leaks DSML on final step, workflow strips it cleanly
+                return Message(
+                    "assistant",
+                    '基于前文预览先汇报结论。\n<｜DSML｜ calls><｜DSML｜ invoke name="read_tool_output">',
+                )
+
+        @tool(risk_level=RiskLevel.READ)
+        async def emit_big() -> str:
+            return "\n".join(f"LINE#{i:03d} payload_abcdef0123456789" for i in range(1, 260))
+
+        async def _run():
+            store = get_test_store()
+            app = AgentRuntimeApp(
+                model=FinalStepInspectModel(),
+                store=store,
+                tools=[emit_big],
+                max_steps=2,
+            )
+            self.assertEqual(app.max_steps, 2)
+            self.assertGreaterEqual(graph_config("th_dsml", max_steps=15)["recursion_limit"], 64)
+
+            scope = AuthScope("t_acme", "u_alice", ("employee",))
+            res = await app.run_turn("拉取大结果", thread_id="th_dsml", scope=scope)
+            self.assertEqual(len(seen_calls), 2)
+            # Identical tool list kept across Step 1 and Step 2 (Prefix Cache intact)
+            self.assertEqual(seen_calls[0]["tool_names"], seen_calls[1]["tool_names"])
+            self.assertIsNone(seen_calls[0]["tool_choice"])
+            self.assertEqual(seen_calls[1]["tool_choice"], "none")
+            # Notice mounted on last tool message (no extra mid-conversation system/user message)
+            step2_last = seen_calls[1]["messages"][-1]
+            self.assertEqual(step2_last.role, "tool")
+            self.assertIn("已达本轮工具调用步数上限", step2_last.content)
+            # Truncation hint includes exact range and next offset
+            self.assertIn("chars=0..", step2_last.content)
+            self.assertIn("limit=4000", step2_last.content)
+            # Leaked DSML stripped from final answer
+            self.assertEqual(res["final_answer"], "基于前文预览先汇报结论。")
+            self.assertNotIn("DSML", res["final_answer"])
+
+            # 3. Verify read_tool_output pagination headers (4000 default, 8000 cap, has_more/next_offset/EOF)
+            ref_id = store.rows("SELECT ref_id FROM tool_outputs WHERE thread_id=%s", ("th_dsml",))[0]["ref_id"]
+            ctx = ExecutionContext(uid("tr"), "th_dsml", scope, uid("req"))
+            page1 = await app.gateway.execute_one(
+                ToolCall("tc_p1", "read_tool_output", {"ref_id": ref_id, "offset": 0, "limit": 4000}),
+                ctx,
+            )
+            self.assertTrue(page1.ok)
+            self.assertIn("has_more=true next_offset=4000", page1.content)
+            self.assertGreater(len(page1.content), 3500)
+
+            page2 = await app.gateway.execute_one(
+                ToolCall("tc_p2", "read_tool_output", {"ref_id": ref_id, "offset": 4000, "limit": 8000}),
+                ctx,
+            )
+            self.assertTrue(page2.ok)
+            self.assertIn("has_more=false", page2.content)
+
+            page_eof = await app.gateway.execute_one(
+                ToolCall("tc_p3", "read_tool_output", {"ref_id": ref_id, "offset": 999999, "limit": 4000}),
+                ctx,
+            )
+            self.assertTrue(page_eof.ok)
+            self.assertIn("has_more=false EOF", page_eof.content)
 
         asyncio.run(_run())
 

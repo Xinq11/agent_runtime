@@ -136,7 +136,7 @@ def register_immutable_builtin_tools(
             except AccessControlError as exc:
                 return ToolResult("", "read_tool_output", f"[acl_error] {exc}", ok=False, error_code="acl_error")
         page, error = store.read_tool_output_page(
-            ctx, args["ref_id"], args.get("offset", 0), args.get("limit", 1200)
+            ctx, args["ref_id"], args.get("offset", 0), args.get("limit", 4000)
         )
         if error:
             return ToolResult("", "read_tool_output", f"[{error}]", ok=False, error_code=error)
@@ -187,7 +187,10 @@ def register_immutable_builtin_tools(
     registry.register_builtin(
         ToolSpec(
             name="read_tool_output",
-            description="按字符偏移分页读取本人有权访问的超限落盘工具结果（ref_id）。",
+            description=(
+                "按字符偏移分页读取本人有权访问的超限落盘工具结果（ref_id）；"
+                "单页默认 4000 字符、上限 8000 字符，返回头包含 chars/has_more/next_offset。"
+            ),
             required_args=("ref_id",),
             allowed_args=("ref_id", "offset", "limit"),
             risk_level=RiskLevel.READ,
@@ -198,7 +201,7 @@ def register_immutable_builtin_tools(
                 "properties": {
                     "ref_id": {"type": "string"},
                     "offset": {"type": "integer", "default": 0},
-                    "limit": {"type": "integer", "default": 1200},
+                    "limit": {"type": "integer", "default": 4000},
                 },
                 "required": ["ref_id"],
                 "additionalProperties": False,

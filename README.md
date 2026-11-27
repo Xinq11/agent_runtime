@@ -45,7 +45,7 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 
 > 核查华东区 Q3 差旅超标情况，并发起专项审批。
 
-费用示例在 `DEEPSEEK_API_KEY` 留空时使用脚本 Mock。PostgreSQL 和 MinIO 仍实际参与执行，完整流程是**查询 BI 和差旅制度 → 暂停等待人工确认 → 确认后生成示例 OA 回执**。同一次运行的 Trace 可以展开查看模型与工具耗时。示例 BI 数据、提示词和 OA 回执仅属于演示客户包，接入新客户时替换为自己的扩展包即可。
+费用示例需配置 `DEEPSEEK_API_KEY`（在 `.env` 中设置，或在页面左下角设置弹窗中热配置；后续将扩展更多模型 API）。PostgreSQL 和 MinIO 全程参与执行，完整流程是**查询 BI 和差旅制度 → 暂停等待人工确认 → 确认后生成示例 OA 回执**。同一次运行的 Trace 与上下文压缩状态可在对话右侧栏展开查看。示例 BI 数据、提示词和 OA 回执仅属于演示客户包，接入新客户时替换为自己的扩展包即可。
 
 | 想看什么 | 本地入口 |
 | --- | --- |
@@ -62,7 +62,7 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 | [backend/agent_runtime/framework](backend/agent_runtime/framework/) | 核心契约、上下文预算与裁剪、LangGraph 执行图、Run 状态机、安全 ACL 与工具网关 |
 | [backend/agent_runtime/extensions](backend/agent_runtime/extensions/) | 内置标准可选扩展（RAG 7 阶段检索、版本化 Skills），运行期按需装配或替换 |
 | [backend/agent_runtime/infra](backend/agent_runtime/infra/) | PostgreSQL + pgvector 仓储、MinIO 对象存储、OpenAI 兼容 LLM 适配、PLG 观测 |
-| [examples/enterprise_expense](examples/enterprise_expense/) | 独立客户交付包样板，包含业务工具、子 Agent、提示词、离线演示脚本、OA 表定义与独立测试 |
+| [examples/enterprise_expense](examples/enterprise_expense/) | 独立客户交付包样板，包含业务工具、子 Agent、提示词、OA 表定义与独立测试 |
 | [frontend](frontend/) | React + TypeScript 参考工作台与管理后台（仅通过 HTTP / SSE v1 对接后端） |
 | [deploy](deploy/) | PostgreSQL / pgvector 迁移脚本（`deploy/sql/`）与 Prometheus / Loki / Grafana 运维配置 |
 | [docs](docs/) | 后端架构文档、HTTP / SSE v1 接口契约与架构配图 |
@@ -71,7 +71,7 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | 模型 API Key；留空自动走 Mock 推理，页面热更新仅对当前后端进程生效 | 空（Mock） |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key（必填后方可对话；支持页面热配置，仅对当前后端进程生效） | 空（未配置） |
 | `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | OpenAI 兼容端点与模型名 | `https://api.deepseek.com/v1` / `deepseek-chat` |
 | `AGENT_EXTENSIONS` | 启动加载的扩展列表（逗号分隔 `module:Symbol`，设为 `none` 关闭扩展） | RAG + Skills |
 | `AGENT_ACCESS_CONTROLLER` | 可拔插权限控制器：`default`（本地单权限管理 + 资源角色过滤）\| `noop` \| `rbac` \| `module:Symbol` | `default` |

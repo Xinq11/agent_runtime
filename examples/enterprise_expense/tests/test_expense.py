@@ -12,10 +12,76 @@ from agent_runtime import (
 )
 from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
-from agent_runtime.framework.core.contracts import canonical_hash
+from agent_runtime.framework.core.contracts import Message, canonical_hash
 from agent_runtime.framework.core.runs import RunStateError
 from enterprise_expense import EnterpriseExpensePlugin
-from tests._pg_harness import get_test_store, reset_test_db
+from tests._pg_harness import EchoTestModel, get_test_store, reset_test_db
+
+
+def _expense_test_router(ctx, last_user, tool_msgs, tool_names):
+    """Test-only scripted LLM router for deterministic expense integration tests."""
+    if ctx.agent_name == "bi_analyst":
+        if not tool_msgs and "bi_query" in tool_names:
+            return Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id=uid("tc"), name="bi_query", args={"region": "华东", "quarter": "Q3"})],
+            )
+        summary = tool_msgs[-1].content[:360] if tool_msgs else "无数据"
+        return Message(role="assistant", content=f"【BI 子代理结论】¥82,000。摘要：{summary}")
+
+    if "LOOP_TEST" in last_user:
+        if any("loop_broken" in m.content or "连续" in m.content for m in tool_msgs):
+            return Message(role="assistant", content="工具连续无进展已触发熔断，停止重试。")
+        return Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id=uid("tc"), name="flaky_lookup", args={"id": "X-999"})],
+        )
+
+    if "超标" in last_user and "审批" in last_user:
+        called = {m.name for m in tool_msgs}
+        if not tool_msgs:
+            calls = []
+            if "call_bi_analyst" in tool_names:
+                calls.append(ToolCall(id=uid("tc"), name="call_bi_analyst", args={"goal": "统计华东区 Q3 超标"}))
+            if "search_knowledge" in tool_names:
+                calls.append(ToolCall(id=uid("tc"), name="search_knowledge", args={"query": "差旅住宿标准"}))
+            return Message(role="assistant", content="", tool_calls=calls)
+        if "submit_approval" not in called and "submit_approval" in tool_names:
+            return Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id=uid("tc"),
+                        name="submit_approval",
+                        args={"title": "华东区 Q3 差旅超标整改审批", "amount": 82000, "region": "华东"},
+                    )
+                ],
+            )
+        approval_msg = next((m.content for m in tool_msgs if m.name == "submit_approval"), "")
+        return Message(role="assistant", content=f"已完成核查与审批：{approval_msg}")
+
+    if "全量明细" in last_user:
+        if not tool_msgs and "bi_query" in tool_names:
+            return Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    ToolCall(id=uid("tc"), name="bi_query", args={"region": "华东", "quarter": "Q3", "verbose": True})
+                ],
+            )
+        if len(tool_msgs) == 1 and "ref_id=" in tool_msgs[0].content and "read_tool_output" in tool_names:
+            ref_part = tool_msgs[0].content.split("ref_id=")[1].split()[0].strip("])|,")
+            return Message(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id=uid("tc"), name="read_tool_output", args={"ref_id": ref_part, "offset": 0, "limit": 300})],
+            )
+        return Message(role="assistant", content=f"已分页读取：{tool_msgs[-1].content[:180]}")
+
+    return Message(role="assistant", content=f"已收到：{last_user}")
 
 
 def build_full_app(
@@ -26,6 +92,7 @@ def build_full_app(
 ):
     approval_writes: List[Dict[str, Any]] = []
     app = AgentRuntimeApp(
+        model=EchoTestModel(router=_expense_test_router),
         store=get_test_store(),
         extensions=[
             RagExtension(),

@@ -272,12 +272,26 @@ class ToolGateway:
             result = ToolResult(call.id, call.name, text)
         if spec.bypass_truncation or estimate_tokens(result.content) <= self.max_result_tokens:
             return result
-        hint = "\n[truncated ref_id=" + "0" * 32 + "]"
-        preview = _preview(result.content, max(0, self.max_result_tokens - estimate_tokens(hint) - 1))
+        placeholder = (
+            "\n[truncated ref_id="
+            + "0" * 36
+            + ' chars=0..9999/999999 — 剩余 999999 字符，可调用 read_tool_output(ref_id="'
+            + "0" * 36
+            + '", offset=9999, limit=4000) 继续读取]'
+        )
+        preview = _preview(result.content, max(0, self.max_result_tokens - estimate_tokens(placeholder) - 1))
         blob = self.store.save_tool_output(ctx, call.name, result.content, preview)
-        hint = f"\n[truncated ref_id={blob.ref_id}]"
+        remaining = max(0, blob.total_chars - len(preview))
+        hint = (
+            f"\n[truncated ref_id={blob.ref_id} chars=0..{len(preview)}/{blob.total_chars}"
+            f' — 剩余 {remaining} 字符，可调用 read_tool_output(ref_id="{blob.ref_id}", offset={len(preview)}, limit=4000) 继续读取]'
+        )
         if estimate_tokens(preview + hint) <= self.max_result_tokens:
             preview += hint
+        else:
+            short_hint = f"\n[truncated ref_id={blob.ref_id} chars=0..{len(preview)}/{blob.total_chars}]"
+            if estimate_tokens(preview + short_hint) <= self.max_result_tokens:
+                preview += short_hint
         return replace(result, content=preview, truncated=True, ref_id=blob.ref_id)
 
     async def execute_batch(

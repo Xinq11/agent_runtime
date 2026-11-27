@@ -16,6 +16,7 @@ from agent_runtime import (
     AuthScope,
     ExecutionContext,
     HeaderIdentityResolver,
+    Message,
     NoopAccessController,
     RAGChunk,
     RagExtension,
@@ -26,11 +27,11 @@ from agent_runtime import (
     ToolCall,
     tool,
 )
-from agent_runtime.api import approvals, ops, skills, state, system
+from agent_runtime.api import approvals, ops, skills, state, system, threads
 from agent_runtime.framework.core.config import ModelSettings, uid
-from agent_runtime.infra.llm.mock import MockScriptedLLM
+from agent_runtime.infra.llm.provider import ModelNotConfiguredError, OpenAICompatibleProvider
 from agent_runtime.infra.plg.hub import ObservabilityHub
-from tests._pg_harness import get_test_store, reset_test_db, validate_test_db_name
+from tests._pg_harness import EchoTestModel, get_test_store, reset_test_db, validate_test_db_name
 
 
 class _TestTelemetry(ObservabilityHub):
@@ -66,7 +67,7 @@ def _make_http_app(runtime: AgentRuntimeApp, *, resolver=None) -> FastAPI:
     if resolver is not None:
         app.state.identity_resolver = resolver
     v1 = APIRouter()
-    for sub in (system.router, approvals.router, state.router, skills.router, ops.router):
+    for sub in (system.router, threads.router, approvals.router, state.router, skills.router, ops.router):
         v1.include_router(sub)
     app.include_router(v1, prefix="/api/v1")
     return app
@@ -205,8 +206,8 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         store = get_test_store()
         obs = _TestTelemetry(store)
         rbac = RbacAccessController(admin_roles=("admin",))
-        model = MockScriptedLLM(obs=obs)
-        model.config = ModelSettings(api_key="", mode="mock")
+        model = EchoTestModel()
+        model.config = ModelSettings(api_key="sk-test", mode="deepseek")
         runtime = AgentRuntimeApp(
             model=model,
             store=store,
@@ -235,7 +236,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_bypass.status_code, 403)
         self.assertEqual(client.get("/api/v1/ops/overview", headers=emp_headers).status_code, 403)
         self.assertEqual(
-            client.post("/api/v1/config/model", headers=emp_headers, json={"mode": "mock"}).status_code, 403
+            client.post("/api/v1/config/model", headers=emp_headers, json={"mode": "deepseek"}).status_code, 403
         )
         self.assertEqual(
             client.patch(
@@ -267,7 +268,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
 
         # Tenant admin cannot mutate shared process model config or read process-global Loki logs
         self.assertEqual(
-            client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "mock"}).status_code,
+            client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "deepseek"}).status_code,
             403,
         )
         r_ops = client.get("/api/v1/ops/overview", headers=admin_headers)
@@ -287,9 +288,26 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_plat_ops.status_code, 200)
         self.assertEqual(len(r_plat_ops.json()["loki_logs"]), 1)
         self.assertEqual(
-            client.post("/api/v1/config/model", headers=plat_headers, json={"mode": "mock"}).status_code,
+            client.post(
+                "/api/v1/config/model", headers=plat_headers, json={"mode": "deepseek", "model": "deepseek-chat"}
+            ).status_code,
             200,
         )
+        # Mock mode is removed and must be rejected with 422
+        self.assertEqual(
+            client.post("/api/v1/config/model", headers=plat_headers, json={"mode": "mock"}).status_code,
+            422,
+        )
+        # Provider without API key fails explicitly instead of falling back to mock
+        unconfigured = OpenAICompatibleProvider(None, obs, settings=ModelSettings(api_key=""))
+        with self.assertRaises(ModelNotConfiguredError):
+            asyncio.run(
+                unconfigured.generate(
+                    messages=[Message("user", "ping")],
+                    tool_specs=[],
+                    ctx=ExecutionContext(uid("tr"), uid("th"), admin_scope, uid("req")),
+                )
+            )
 
     def test_p0_hmac_gateway_headers_cross_user_approval_and_server_approver_id(self):
         store = get_test_store()
@@ -633,6 +651,81 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             self.assertNotIn("13800138000", msgs[-1].content)
 
         asyncio.run(_run())
+
+    def test_message_feedback_persistence_upsert_isolation_and_delete(self):
+        store = get_test_store()
+        obs = _TestTelemetry(store)
+        runtime = AgentRuntimeApp(model=EchoTestModel(), store=store, obs=obs)
+        alice_scope = AuthScope("t_acme", "u_alice", ("employee",))
+        ctx = ExecutionContext(
+            trace_id=uid("tr"),
+            thread_id="th_fb_1",
+            auth_scope=alice_scope,
+            request_id=uid("req"),
+        )
+        asyncio.run(runtime.run_turn("请帮我查一下数据", ctx=ctx))
+
+        client = TestClient(_make_http_app(runtime))
+        alice_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_alice", "X-User-Roles": "employee"}
+        bob_h = {"X-Tenant-Id": "t_acme", "X-User-Id": "u_bob", "X-User-Roles": "employee"}
+
+        # 1. Submit thumbs-up first, then switch to thumbs-down -> mutually exclusive upsert in PG
+        r_up = client.post(
+            "/api/v1/threads/th_fb_1/feedback",
+            headers=alice_h,
+            json={"trace_id": ctx.trace_id, "rating": "up"},
+        )
+        self.assertEqual(r_up.status_code, 200)
+        self.assertEqual(r_up.json()["feedback"]["rating"], "up")
+
+        r1 = client.post(
+            "/api/v1/threads/th_fb_1/feedback",
+            headers=alice_h,
+            json={"trace_id": ctx.trace_id, "rating": "down"},
+        )
+        self.assertEqual(r1.status_code, 200)
+        fb1 = r1.json()["feedback"]
+        self.assertEqual(fb1["rating"], "down")
+        self.assertEqual(fb1["trace_id"], ctx.trace_id)
+        self.assertIsNotNone(fb1["msg_id"])
+        self.assertIn("已收到消息", fb1["answer_excerpt"])
+
+        # 2. Updating reason upserts the same record cleanly (no duplicate rows)
+        r2 = client.post(
+            "/api/v1/threads/th_fb_1/feedback",
+            headers=alice_h,
+            json={"trace_id": ctx.trace_id, "rating": "down", "reason": "回答不够具体"},
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["feedback"]["reason"], "回答不够具体")
+        r_list = client.get("/api/v1/threads/th_fb_1/feedback", headers=alice_h)
+        self.assertEqual(r_list.status_code, 200)
+        self.assertEqual(len(r_list.json()["feedback"]), 1)
+
+        # 3. Loading thread messages includes persisted feedback attached to assistant message
+        r_msgs = client.get("/api/v1/threads/th_fb_1/messages", headers=alice_h)
+        self.assertEqual(r_msgs.status_code, 200)
+        asst_msgs = [m for m in r_msgs.json()["messages"] if m["role"] == "assistant"]
+        self.assertEqual(len(asst_msgs), 1)
+        self.assertEqual(asst_msgs[0]["feedback"]["rating"], "down")
+        self.assertEqual(asst_msgs[0]["feedback"]["reason"], "回答不够具体")
+
+        # 4. Another user cannot read/write/delete Alice's thread feedback
+        self.assertEqual(client.get("/api/v1/threads/th_fb_1/feedback", headers=bob_h).status_code, 404)
+        self.assertEqual(
+            client.post(
+                "/api/v1/threads/th_fb_1/feedback",
+                headers=bob_h,
+                json={"trace_id": ctx.trace_id, "rating": "down"},
+            ).status_code,
+            404,
+        )
+
+        # 5. Cancel dislike deletes the row cleanly
+        r_del = client.delete(f"/api/v1/threads/th_fb_1/feedback/{ctx.trace_id}", headers=alice_h)
+        self.assertEqual(r_del.status_code, 200)
+        self.assertTrue(r_del.json()["deleted"])
+        self.assertEqual(len(client.get("/api/v1/threads/th_fb_1/feedback", headers=alice_h).json()["feedback"]), 0)
 
 
 if __name__ == "__main__":

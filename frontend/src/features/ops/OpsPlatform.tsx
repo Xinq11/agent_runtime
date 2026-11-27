@@ -1,29 +1,19 @@
 import React, { useCallback, useEffect, useState } from "react";
-import {
-  ArrowLeft,
-  BookOpen,
-  FileText,
-  MessageSquare,
-  Moon,
-  RefreshCw,
-  Sun,
-} from "lucide-react";
+import { ArrowLeft, BookOpen, FileText, Moon, RefreshCw, Sun } from "lucide-react";
 import { fetchOpsOverview } from "../../shared/api/client";
 import { OpsOverview } from "../../shared/types/runtime";
-import { ContextTab } from "./ContextTab";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { SkillsTab } from "./SkillsTab";
 
 interface OpsPlatformProps {
   dark: boolean;
   onToggleTheme: () => void;
-  onBackToChat: (jumpThreadId?: string) => void;
+  onBackToChat: () => void;
 }
 
-type OpsTab = "context" | "kb" | "skills";
+type OpsTab = "kb" | "skills";
 
 const TABS = [
-  ["context", "会话上下文与压缩透视", MessageSquare],
   ["kb", "知识库管理", BookOpen],
   ["skills", "Skills 技能库", FileText],
 ] as const;
@@ -33,17 +23,15 @@ export const OpsPlatform: React.FC<OpsPlatformProps> = ({
   onToggleTheme,
   onBackToChat,
 }) => {
-  const [tab, setTab] = useState<OpsTab>("context");
+  const [tab, setTab] = useState<OpsTab>("kb");
   const [overview, setOverview] = useState<OpsOverview | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
     try {
       const data = await fetchOpsOverview();
       setOverview(data);
-      setSelectedThreadId((cur) => cur || data.threads[0]?.thread_id || null);
     } finally {
       setLoading(false);
     }
@@ -64,7 +52,7 @@ export const OpsPlatform: React.FC<OpsPlatformProps> = ({
       >
         <div className="flex items-center gap-3 min-w-0">
           <button
-            onClick={() => onBackToChat()}
+            onClick={onBackToChat}
             className="interactive-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-[12.5px] font-medium"
             style={{ background: "var(--bg)", borderColor: "var(--border-strong)", color: "var(--ink)" }}
           >
@@ -130,14 +118,6 @@ export const OpsPlatform: React.FC<OpsPlatformProps> = ({
 
       <div className="flex-1 overflow-y-auto p-6">
         <div className="max-w-6xl mx-auto space-y-5">
-          {tab === "context" && (
-            <ContextTab
-              threads={overview?.threads || []}
-              selectedThreadId={selectedThreadId}
-              onSelectThread={setSelectedThreadId}
-              onOpenInChat={(tid) => onBackToChat(tid)}
-            />
-          )}
           {tab === "kb" && (
             <KnowledgeTab chunks={overview?.knowledge_chunks || []} onRefresh={loadOverview} />
           )}

@@ -289,7 +289,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 管理后台
               </div>
               <div className="text-[10.5px] truncate mt-0.5" style={{ color: "var(--ink-muted)" }}>
-                上下文 · 知识库 · Skills
+                知识库 · Skills
               </div>
             </div>
           </div>
@@ -309,14 +309,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <span
                 className="w-2 h-2 rounded-full shrink-0"
                 style={{
-                  background:
-                    modelConfig.mode === "deepseek" ? "var(--ok)" : "var(--warn)",
+                  background: modelConfig.has_api_key ? "var(--ok)" : "var(--warn)",
                 }}
               />
               <span className="truncate font-mono">
-                {modelConfig.mode === "deepseek"
-                  ? modelConfig.model
-                  : "mock-mode"}
+                {modelConfig.has_api_key ? modelConfig.model : "未配置 API Key"}
               </span>
             </div>
             <div

@@ -70,7 +70,7 @@
 ### 2.3 模型配置查询与热更新
 - `GET /api/v1/config/model`
 - `POST /api/v1/config/model`（当前仅对本后端进程生效，且端点受白名单约束；生产部署应限制为平台运维权限）
-  - 请求体：`{ "api_key"?: string, "base_url"?: string, "model"?: string, "mode"?: "auto" | "deepseek" | "mock" }`
+  - 请求体：`{ "api_key"?: string, "base_url"?: string, "model"?: string, "mode"?: "deepseek" }`
 
 ---
 
@@ -138,8 +138,11 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 ### 3.5 会话管理、历史消息与 Trace 状态快照
 - `GET /api/v1/threads` → 列出当前用户所有非空会话（按创建时间倒序，不含空草稿）。
 - `POST /api/v1/threads` → 显式创建会话。
-- `GET /api/v1/threads/{thread_id}/messages` → 返回该会话完整 `session_messages`。
-- `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（消息、摘要、Trace/Span、运行/审批记录、工作区文件与大输出元数据、以及 LangGraph 检查点；当前不同步清理 MinIO 实体对象）。
+- `GET /api/v1/threads/{thread_id}/messages` → 返回该会话完整 `session_messages`（附带当前用户已保存的 `feedback` 与 `feedback_by_trace`）。
+- `GET /api/v1/threads/{thread_id}/feedback` → 查询当前用户在该会话中的助手回复点赞/点踩记录。
+- `POST /api/v1/threads/{thread_id}/feedback` → 保存或更新点赞/点踩记录（入 PG `message_feedback` 表，按 `(tenant_id, thread_id, actor_id, trace_id)` 互斥幂等更新），请求体：`{ "trace_id": string, "rating": "up" | "down", "reason"?: string, "msg_id"?: number, "answer_excerpt"?: string }`。
+- `DELETE /api/v1/threads/{thread_id}/feedback/{trace_id}` → 取消指定回复的点赞/点踩记录。
+- `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（消息、摘要、反馈、Trace/Span、运行/审批记录、工作区文件与大输出元数据、以及 LangGraph 检查点；当前不同步清理 MinIO 实体对象）。
 - `GET /api/v1/state?thread_id={tid}&trace_id={tr}` → 返回单会话 Trace 瀑布图 `spans`、压缩摘要游标 `summary`、当前 `active_run`、`workspace_files`、待审批单、OSS 工件与 Loki 日志。
 
 ---
