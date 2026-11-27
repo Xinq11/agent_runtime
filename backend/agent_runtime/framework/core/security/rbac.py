@@ -49,8 +49,8 @@ class RbacAccessController:
       disabled previews, and optional per-tool / approver roles are strictly gated.
     """
 
-    _ADMIN_ACTIONS = frozenset({"ops:view", "kb:manage", "skill:manage"})
-    _PLATFORM_ADMIN_ACTIONS = frozenset({"system:update_model", "platform:view_telemetry"})
+    _ADMIN_ACTIONS = frozenset({"kb:manage", "skill:manage"})
+    _PLATFORM_ADMIN_ACTIONS = frozenset({"system:update_model"})
 
     def __init__(
         self,

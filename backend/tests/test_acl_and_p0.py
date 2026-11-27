@@ -29,7 +29,7 @@ from agent_runtime import (
     ToolCall,
     tool,
 )
-from agent_runtime.api import approvals, ops, state, system, threads
+from agent_runtime.api import approvals, state, system, threads
 from agent_runtime.framework.core.config import ModelSettings, uid
 from agent_runtime.infra.llm.provider import ModelNotConfiguredError, OpenAICompatibleProvider
 from agent_runtime.infra.plg.hub import ObservabilityHub
@@ -69,7 +69,7 @@ def _make_http_app(runtime: AgentRuntimeApp, *, resolver=None) -> FastAPI:
     if resolver is not None:
         app.state.identity_resolver = resolver
     v1 = APIRouter()
-    for sub in (system.router, threads.router, approvals.router, state.router, ops.router):
+    for sub in (system.router, threads.router, approvals.router, state.router):
         v1.include_router(sub)
     for ext_router in runtime.extension_routers():
         v1.include_router(ext_router)
@@ -227,7 +227,6 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         # Non-admin MUST NOT bypass ACL using ?include_disabled=true
         r_bypass = client.get("/api/v1/skills/secret-sop?include_disabled=true", headers=emp_headers)
         self.assertEqual(r_bypass.status_code, 403)
-        self.assertEqual(client.get("/api/v1/ops/overview", headers=emp_headers).status_code, 403)
         self.assertEqual(
             client.post("/api/v1/config/model", headers=emp_headers, json={"mode": "deepseek"}).status_code, 403
         )
@@ -251,32 +250,21 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
         self.assertEqual(r_state.status_code, 200)
         self.assertNotIn("knowledge_chunks", r_state.json())
 
-        # Admin succeeds on disabled preview, ops overview (with real acl_roles, NO process-global logs), and status toggle
-        obs.loki_events.append({"msg": "process_global_log"})
+        # Admin succeeds on disabled preview, while still unable to mutate shared process model config
         r_admin_sk = client.get("/api/v1/skills/secret-sop?include_disabled=true", headers=admin_headers)
         self.assertEqual(r_admin_sk.status_code, 200)
         self.assertIn("绝密流程", r_admin_sk.json()["content"])
 
-        # Regular admin cannot mutate shared process model config or read process-global Loki logs
         self.assertEqual(
             client.post("/api/v1/config/model", headers=admin_headers, json={"mode": "deepseek"}).status_code,
             403,
         )
-        r_ops = client.get("/api/v1/ops/overview", headers=admin_headers)
-        self.assertEqual(r_ops.status_code, 200)
-        self.assertEqual(r_ops.json()["loki_logs"], [])
-        self.assertEqual(r_ops.json()["metrics_text"], "")
-        kb_by_title = {k["doc_title"]: k for k in r_ops.json()["knowledge_chunks"]}
-        self.assertEqual(kb_by_title["高管密件"]["acl_roles"], ["exec"])
 
-        # Platform admin CAN read process telemetry and update model config
+        # Platform admin CAN update model config
         plat_headers = {
             "X-User-Id": "u_plat",
             "X-User-Roles": "platform_admin",
         }
-        r_plat_ops = client.get("/api/v1/ops/overview", headers=plat_headers)
-        self.assertEqual(r_plat_ops.status_code, 200)
-        self.assertEqual(len(r_plat_ops.json()["loki_logs"]), 1)
         self.assertEqual(
             client.post(
                 "/api/v1/config/model", headers=plat_headers, json={"mode": "deepseek", "model": "deepseek-chat"}
@@ -427,7 +415,7 @@ class TestPluggableAclAndP0Fixes(unittest.TestCase):
             self.assertEqual(tool_res.error_code, "acl_error")
 
             http_client = TestClient(_make_http_app(app_broken))
-            self.assertEqual(http_client.get("/api/v1/ops/overview").status_code, 503)
+            self.assertEqual(http_client.get("/api/v1/outputs/out_any").status_code, 503)
             self.assertEqual(http_client.get("/api/v1/meta").status_code, 503)
 
         asyncio.run(_run())

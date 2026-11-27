@@ -30,7 +30,7 @@ function uid(prefix: string) {
   return `${prefix}_${Math.random().toString(16).slice(2, 10)}`;
 }
 
-export function useChatSession(route: "chat" | "ops") {
+export function useChatSession() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>(() => uid("th"));
   const activeThreadIdRef = useRef(activeThreadId);
@@ -75,8 +75,8 @@ export function useChatSession(route: "chat" | "ops") {
   );
 
   useEffect(() => {
-    if (route === "chat") refreshAll();
-  }, [route, refreshAll]);
+    refreshAll();
+  }, [refreshAll]);
 
   const selectThread = async (threadId: string) => {
     activeThreadIdRef.current = threadId;

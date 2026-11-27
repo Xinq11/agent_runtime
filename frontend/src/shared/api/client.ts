@@ -2,9 +2,7 @@ import {
   AppMeta,
   DEFAULT_IDENTITY,
   ModelConfig,
-  OpsOverview,
   RuntimeStateSnapshot,
-  SkillSummary,
   ThreadSummary,
   WorkspaceFileSummary,
 } from "../types/runtime";
@@ -191,79 +189,6 @@ export async function fetchRuntimeState(
   return res.json();
 }
 
-export async function fetchOpsOverview(): Promise<OpsOverview> {
-  const res = await fetch(`${API_BASE}/ops/overview`, { headers: defaultHeaders() });
-  if (!res.ok) throw new Error("拉取管理后台数据失败");
-  return res.json();
-}
-
-export async function fetchSkillContent(
-  slug: string,
-  resource = "",
-  includeDisabled = true
-): Promise<{ skill: SkillSummary; resource: string; content: string }> {
-  const qs = new URLSearchParams();
-  if (resource) qs.set("resource", resource);
-  if (includeDisabled) qs.set("include_disabled", "true");
-  const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(slug)}${suffix}`, {
-    headers: defaultHeaders(),
-  });
-  if (!res.ok) throw new Error("读取 Skill 正文失败");
-  return res.json();
-}
-
-export async function updateSkillStatus(
-  slug: string,
-  status: "active" | "disabled"
-): Promise<{ ok: boolean; slug: string; status: "active" | "disabled" }> {
-  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(slug)}/status`, {
-    method: "PATCH",
-    headers: defaultHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || "更新 Skill 状态失败");
-  }
-  return res.json();
-}
-
-export async function uploadSkill(payload: {
-  slug: string;
-  description: string;
-  content?: string;
-  file?: File | null;
-}): Promise<{ ok: boolean; skill: SkillSummary }> {
-  let res: Response;
-  if (payload.file) {
-    const form = new FormData();
-    form.append("file", payload.file);
-    form.append("slug", payload.slug);
-    form.append("description", payload.description);
-    res = await fetch(`${API_BASE}/skills/upload`, {
-      method: "POST",
-      headers: identityHeaders(),
-      body: form,
-    });
-  } else {
-    res = await fetch(`${API_BASE}/skills/upload`, {
-      method: "POST",
-      headers: defaultHeaders(),
-      body: JSON.stringify({
-        slug: payload.slug,
-        description: payload.description,
-        content: payload.content || "",
-      }),
-    });
-  }
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || "发布 Skill 失败");
-  }
-  return res.json();
-}
-
 export async function abortChatRun(payload: {
   runId?: string | null;
   threadId?: string | null;
@@ -303,43 +228,6 @@ export async function resumeApproval(payload: {
   if (!res.ok) {
     const err = await res.text();
     throw new Error(err || "审批恢复失败");
-  }
-  return res.json();
-}
-
-export async function uploadKnowledgeDoc(payload: {
-  title: string;
-  section?: string;
-  file: File;
-}): Promise<{ ok: boolean; oss_key: string; chunks_indexed: number }> {
-  const form = new FormData();
-  form.append("file", payload.file);
-  form.append("title", payload.title);
-  form.append("section", payload.section || "正文");
-  const res = await fetch(`${API_BASE}/knowledge/upload`, {
-    method: "POST",
-    headers: identityHeaders(),
-    body: form,
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || "上传知识文档失败");
-  }
-  return res.json();
-}
-
-export async function updateKnowledgeStatus(
-  parentId: string,
-  status: "active" | "disabled"
-): Promise<{ ok: boolean; parent_id: string; status: "active" | "disabled" }> {
-  const res = await fetch(`${API_BASE}/knowledge/${encodeURIComponent(parentId)}/status`, {
-    method: "PATCH",
-    headers: defaultHeaders(),
-    body: JSON.stringify({ status }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(err || "更新知识文档状态失败");
   }
   return res.json();
 }

@@ -46,7 +46,7 @@ from agent_runtime import (
     ToolCall,
     tool,
 )
-from agent_runtime.api import approvals, chat_stream, ops, state, system, threads
+from agent_runtime.api import approvals, chat_stream, state, system, threads
 from agent_runtime.api.main import create_app
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.runs import RunStateError
@@ -66,7 +66,7 @@ class _QuietObs(ObservabilityHub):
         return []
 
 
-def _http_client(runtime: AgentRuntimeApp, *, include_ops: bool = False) -> TestClient:
+def _http_client(runtime: AgentRuntimeApp) -> TestClient:
     app = FastAPI()
     app.state.runtime = runtime
     app.state.store = runtime.store
@@ -78,8 +78,6 @@ def _http_client(runtime: AgentRuntimeApp, *, include_ops: bool = False) -> Test
         v1.include_router(sub)
     for r in runtime.extension_routers():
         v1.include_router(r)
-    if include_ops:
-        v1.include_router(ops.router)
     app.include_router(v1, prefix="/api/v1")
     return TestClient(app)
 
@@ -141,7 +139,7 @@ class TestArchitectureAcceptance(unittest.TestCase):
                 self.assertIsNone(core_store.rows("SELECT to_regclass(%s) AS t", (tbl,))[0]["t"])
 
             # Pure SDK FastAPI app mounts ZERO RAG/Skills/Ops routes by default
-            pure_http = create_app(extensions=[], enable_ops=False)
+            pure_http = create_app(extensions=[])
             paths = set(pure_http.openapi()["paths"].keys())
             self.assertFalse(any("/skills" in p or "/knowledge" in p or "/ops" in p for p in paths))
 
@@ -311,7 +309,7 @@ class TestArchitectureAcceptance(unittest.TestCase):
             trace_id = ctx_a.trace_id
             ref_id = store.rows("SELECT ref_id FROM tool_outputs WHERE thread_id=%s", (tid,))[0]["ref_id"]
 
-            client = _http_client(runtime, include_ops=True)
+            client = _http_client(runtime)
             bob_h = {"X-User-Id": "u_bob", "X-User-Roles": "employee"}
             alice_h = {"X-User-Id": "u_alice", "X-User-Roles": "employee"}
 
@@ -328,7 +326,8 @@ class TestArchitectureAcceptance(unittest.TestCase):
                 404,
                 mode_name,
             )
-            self.assertEqual(client.get(f"/api/v1/ops/outputs/{ref_id}", headers=bob_h).status_code, 404, mode_name)
+            self.assertEqual(client.get(f"/api/v1/outputs/{ref_id}", headers=bob_h).status_code, 404, mode_name)
+            self.assertEqual(client.get(f"/api/v1/outputs/{ref_id}", headers=alice_h).status_code, 200, mode_name)
 
             # SDK-level cross-user checks also reject Bob
             with self.assertRaises(AuthorizationError):

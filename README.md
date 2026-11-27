@@ -29,7 +29,7 @@ result = asyncio.run(app.run_turn("帮我梳理待办清单", scope=AuthScope("u
 
 按需装配官方 RAG / Skills 扩展时，在 `extensions=[RagExtension(), SkillsExtension()]` 中传入并执行 `app.bootstrap_extensions()`，扩展会自动建各自的表并挂载对应工具与管理路由。
 
-参考 HTTP 服务默认纯 SDK 模式（`AGENT_EXTENSIONS=""`、`AGENT_ENABLE_OPS=0`）；通过环境变量 `AGENT_EXTENSIONS` 加载镜像内可导入的 `module.path:Symbol` 列表，通过 `AGENT_ENABLE_OPS=1` 启用参考版 `/ops` 运维总览。详见 [后端架构](docs/ARCHITECTURE.md) 与 [HTTP / SSE 接口](docs/API.md)。
+参考 HTTP 服务默认纯 SDK 模式（`AGENT_EXTENSIONS=""`），不内置任何管理后台页面或运维总览接口（知识库、Skills 与业务管理后台由各客户按自身需求独立开发或对接自有系统）；通过环境变量 `AGENT_EXTENSIONS` 按需加载镜像内可导入的 `module.path:Symbol` 列表。详见 [后端架构](docs/ARCHITECTURE.md) 与 [HTTP / SSE 接口](docs/API.md)。
 
 运行通用版服务可执行 `docker compose up -d --build`。已有部署若显式配置了旧费用插件导入路径，请切换到下面的示例配置。
 
@@ -50,7 +50,7 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 
 | 想看什么 | 本地入口 |
 | --- | --- |
-| 对话工作台 / 管理知识库、Skills 和会话 | [对话工作台](http://localhost:8080) · [管理后台](http://localhost:8080/ops) |
+| 对话工作台（纯会话参考前端，不含管理后台） | [对话工作台](http://localhost:8080) |
 | 调用接口、核对请求与响应结构 | [OpenAPI](http://localhost:8000/docs) |
 | 查指标、日志和步骤耗时 | [Grafana](http://localhost:3000) · [Prometheus](http://localhost:9090) |
 | 查看上传文件和工具输出原文 | [MinIO 控制台](http://localhost:9001) |
@@ -59,12 +59,12 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 
 | 目录 | 职责 |
 | --- | --- |
-| [backend/agent_runtime/api](backend/agent_runtime/api/) | FastAPI 路由、SSE v1 推流、审批恢复与管理后台接口 |
-| [backend/agent_runtime/framework](backend/agent_runtime/framework/) | 核心契约、上下文预算与裁剪、LangGraph 执行图、Run 状态机、安全 ACL 与工具网关 |
-| [backend/agent_runtime/extensions](backend/agent_runtime/extensions/) | 内置标准可选扩展（RAG 7 阶段检索、版本化 Skills），运行期按需装配或替换 |
-| [backend/agent_runtime/infra](backend/agent_runtime/infra/) | PostgreSQL + pgvector 仓储、MinIO 对象存储、OpenAI 兼容 LLM 适配、PLG 观测 |
-| [examples/enterprise_expense](examples/enterprise_expense/) | 独立客户交付包样板，包含业务工具、子 Agent、提示词、OA 表定义与独立测试 |
-| [frontend](frontend/) | React + TypeScript 参考工作台与管理后台（仅通过 HTTP / SSE v1 对接后端） |
+| [backend/agent_runtime/api](backend/agent_runtime/api/) | FastAPI 核心路由、SSE v1 推流、审批恢复与大输出分页接口 |
+| [backend/agent_runtime/framework](backend/agent_runtime/framework/) | 核心契约、上下文预算与裁剪、LangGraph 执行图、Run 状态机、安全契约与工具网关 |
+| [backend/agent_runtime/extensions](backend/agent_runtime/extensions/) | 内置标准可选扩展（RAG 7 阶段检索、版本化 Skills），各自独立拥有 `schema.sql`、仓储与 API 路由 |
+| [backend/agent_runtime/infra](backend/agent_runtime/infra/) | 核心 PostgreSQL 仓储、MinIO 对象存储、OpenAI 兼容 LLM 适配、PLG 观测 |
+| [examples/enterprise_expense](examples/enterprise_expense/) | 独立客户交付包样板，包含业务工具、声明式子 Agent、提示词、OA 表定义与独立测试 |
+| [frontend](frontend/) | React + TypeScript 纯对话参考工作台（仅对接核心 HTTP / SSE v1，不含管理后台） |
 | [deploy](deploy/) | PostgreSQL / pgvector 迁移脚本（`deploy/sql/`）与 Prometheus / Loki / Grafana 运维配置 |
 | [docs](docs/) | 后端架构文档、HTTP / SSE v1 接口契约与架构配图 |
 
@@ -75,7 +75,6 @@ docker compose -f docker-compose.yml -f examples/enterprise_expense/compose.yml 
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（必填后方可对话；支持页面热配置，仅对当前后端进程生效） | 空（未配置） |
 | `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | OpenAI 兼容端点与模型名 | `https://api.deepseek.com/v1` / `deepseek-chat` |
 | `AGENT_EXTENSIONS` | 启动加载的扩展列表（逗号分隔 `module:Symbol`；纯 SDK 默认空，Compose Demo 默认 RAG + Skills） | 空（Compose 为 RAG + Skills） |
-| `AGENT_ENABLE_OPS` | 是否挂载参考版 `/ops` 运维总览路由（纯 SDK 默认关闭，Compose Demo 默认开启） | `0`（Compose 为 `1`） |
 | `AGENT_ACCESS_CONTROLLER` | 可拔插权限控制器：`default`（创建者私有会话与审批 + 资源角色过滤）\| `noop` \| `rbac` \| `module:Symbol` | `default` |
 | `AGENT_IDENTITY_RESOLVER` | 可拔插身份解析器：`header` \| `default` \| `signed_header`（配合 `AGENT_GATEWAY_HMAC_SECRET`）\| `module:Symbol` | `header` |
 | `PG_DSN` / `MINIO_*` | PostgreSQL 连接串与 MinIO 凭证/桶名（Compose 自动注入） | 见 [docker-compose.yml](docker-compose.yml) |

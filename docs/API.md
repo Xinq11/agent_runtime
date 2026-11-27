@@ -146,6 +146,7 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 - `GET /api/v1/threads/{thread_id}/files/download?path={logical_path}` → 校验会话归属与路径安全后原样下载文件（强制 `Content-Disposition: attachment` + RFC 5987 UTF-8 文件名、`nosniff` 与 `CSP sandbox` 防 Stored XSS）。
 - `DELETE /api/v1/threads/{thread_id}` → 若存在活跃 Run 先尝试中止，再级联删除该会话在 PG 中的全部记录（并同步清理工作区在 MinIO 中的实体与提取文本对象）。
 - `GET /api/v1/state?thread_id={tid}&trace_id={tr}` → 严格校验创建者归属（支持按 `thread_id` 或单独按 `trace_id` 查询，非本人记录一律返 `404`），返回单会话 Trace 瀑布图 `spans`、压缩摘要游标 `summary`、`context_budget`、当前 `active_run`、`workspace_files`、待审批单、OSS 工件与 Loki 日志（不查询 RAG 表）。
+- `GET /api/v1/outputs/{ref_id}?offset=0&limit=4000` → 校验创建者归属与 `artifact:read` 后，分页读取 MinIO OSS 落盘的大工具输出工件。
 
 ---
 
@@ -175,13 +176,11 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 
 ---
 
-## 5. 知识库与运维观测接口（按需挂载）
+## 5. 知识库与观测指标接口
 
 - `POST /api/v1/knowledge/upload`（仅启用 `RagExtension` 时挂载）→ 支持 `application/json`（`{title, content, section, acl_roles}`）或 `multipart/form-data`（`file`, `title?`, `section?`, `acl_roles?`）上传，原文落 MinIO OSS，切块向量化后入 PG `pgvector`。
 - `PATCH /api/v1/knowledge/{parent_id}/status`（仅启用 `RagExtension` 时挂载）→ 切换知识库文档生效/下架状态，请求体：`{ "status": "active" | "disabled" }`。
-- `GET /api/v1/ops/overview`（仅设置 `AGENT_ENABLE_OPS=1` 时挂载）→ 管理后台总览（健康状态、各实体计数、会话与摘要、OSS 工件、已启用扩展的知识文档与 Skills、最近 Trace、Prometheus `/metrics` 快照、Loki 最近 80 条结构化日志）。
-- `GET /api/v1/ops/outputs/{ref_id}?offset=0&limit=1200`（仅设置 `AGENT_ENABLE_OPS=1` 时挂载）→ 分页读取当前用户有权访问的 MinIO OSS 大工具输出。
-- `GET /metrics` → 标准 Prometheus Exposition Format 指标端点。
+- `GET /metrics` → 标准 Prometheus Exposition Format 指标端点（平台观测由 Prometheus / Loki / Grafana 提供，底座不内置管理后台）。
 
 ---
 

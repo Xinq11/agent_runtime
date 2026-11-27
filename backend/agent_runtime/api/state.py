@@ -8,9 +8,10 @@ import json
 
 from fastapi import APIRouter, HTTPException, Request
 
-from agent_runtime.api.deps import caller_scope_async
+from agent_runtime.api.deps import caller_scope, caller_scope_async, require_access
 from agent_runtime.framework.context.memory import ContextBudget, _msg_tokens
-from agent_runtime.framework.core.contracts import Message, estimate_tokens
+from agent_runtime.framework.core.contracts import ExecutionContext, Message, estimate_tokens
+from agent_runtime.framework.core.security import ResourceRef
 from agent_runtime.infra.llm.provider import wire_spec
 
 router = APIRouter(tags=["Conversation & Runs"])
@@ -85,3 +86,14 @@ async def runtime_state(req: Request, thread_id: str = "", trace_id: str = ""):
         "active_run": asdict(active_run) if active_run else None,
         "loki_logs": logs,
     }
+
+
+@router.get("/outputs/{ref_id}", summary="分页读取当前用户有权访问的 MinIO OSS 大工具输出工件")
+def read_output_artifact(ref_id: str, req: Request, offset: int = 0, limit: int = 4000):
+    scope = caller_scope(req)
+    require_access(req, scope, "artifact:read", ResourceRef("artifact", id=ref_id, owner_id=scope.user_id))
+    ctx = ExecutionContext(trace_id="artifact", thread_id="artifact", request_id="artifact", auth_scope=scope)
+    page, err = req.app.state.store.read_tool_output_page(ctx, ref_id, offset=offset, limit=limit)
+    if err:
+        raise HTTPException(404, err)
+    return {"ref_id": ref_id, "offset": offset, "content": page}

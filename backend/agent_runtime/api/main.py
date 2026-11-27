@@ -1,9 +1,8 @@
 """FastAPI application entrypoint mounting `/api/v1/*` (canonical) and `/api/*` (compat).
 
-Pure SDK default:
+Pure Harness SDK default:
   - `AGENT_EXTENSIONS` defaults to empty (`""`) — zero RAG or Skills tables/routes mounted.
-  - `AGENT_ENABLE_OPS` defaults to `"0"` — reference admin `/ops` console is opt-in.
-Reference demos (e.g. `docker-compose.yml`) explicitly enable extensions & ops routes.
+  - Zero built-in admin console; customers build/connect their own management systems.
 """
 
 from __future__ import annotations
@@ -37,17 +36,11 @@ def _load_configured_extensions() -> list[AgentPlugin]:
     return [load_extension(item.strip()) for item in raw.split(",") if item.strip()]
 
 
-def _ops_enabled() -> bool:
-    return os.getenv("AGENT_ENABLE_OPS", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
 def create_app(
     *,
     extensions: Optional[Sequence[AgentPlugin]] = None,
-    enable_ops: Optional[bool] = None,
 ) -> FastAPI:
     configured_extensions = list(extensions) if extensions is not None else _load_configured_extensions()
-    mount_ops = _ops_enabled() if enable_ops is None else bool(enable_ops)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -116,7 +109,7 @@ def create_app(
         t0 = time.monotonic()
         response = await call_next(req)
         path = req.url.path
-        skip = ("/api/health", "/api/v1/health", "/metrics", "/api/ops/overview", "/api/v1/ops/overview")
+        skip = ("/api/health", "/api/v1/health", "/metrics")
         if path not in skip and hasattr(app.state, "obs"):
             dur_ms = max(1, int((time.monotonic() - t0) * 1000))
             app.state.obs.log_event(
@@ -136,10 +129,6 @@ def create_app(
     for ext in configured_extensions:
         for ext_router in ext.routers():
             v1_router.include_router(ext_router)
-    if mount_ops:
-        from agent_runtime.api import ops
-
-        v1_router.include_router(ops.router)
 
     app.include_router(v1_router, prefix="/api/v1")
     app.include_router(v1_router, prefix="/api", include_in_schema=False)

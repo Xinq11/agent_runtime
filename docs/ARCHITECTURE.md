@@ -14,7 +14,7 @@
 
 | 层 | 负责什么 | 从哪里读代码 |
 | --- | --- | --- |
-| 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流；可选参考运维路由 `ops.py` 仅在 `AGENT_ENABLE_OPS=1` 挂载 | [api/main.py](../backend/agent_runtime/api/main.py) · [chat_stream.py](../backend/agent_runtime/api/chat_stream.py) |
+| 接口 (`api/`) | 接收 HTTP 请求，解析身份，启动/恢复运行，通过 SSE v1 推流（不内置管理后台，管理面由客户应用自建） | [api/main.py](../backend/agent_runtime/api/main.py) · [chat_stream.py](../backend/agent_runtime/api/chat_stream.py) |
 | 内核 (`framework/`) | 装配模型与扩展，构建执行图，管理上下文预算、Run 状态机、安全契约与工具网关（零 RAG/Skills/pgvector 依赖） | [agent/app.py](../backend/agent_runtime/framework/agent/app.py) · [core/workflow.py](../backend/agent_runtime/framework/core/workflow.py) |
 | 扩展 (`extensions/`) | 内置标准可选扩展（RAG 7 阶段检索、版本化 Skills），各自独立拥有 `schema.sql`、仓储与管理路由 | [RAG](../backend/agent_runtime/extensions/rag/) · [Skills](../backend/agent_runtime/extensions/skills/) |
 | 基础设施 (`infra/`) | 适配核心 PostgreSQL、MinIO 对象存储、OpenAI 兼容 LLM 服务与 PLG 观测 | [PG](../backend/agent_runtime/infra/pg/) · [OSS](../backend/agent_runtime/infra/oss/) · [LLM](../backend/agent_runtime/infra/llm/) · [PLG](../backend/agent_runtime/infra/plg/) |
@@ -129,7 +129,7 @@
 | RAG（可选扩展） | 检索、邻块、父文、上传与上下架 | 自持 `extensions/rag/schema.sql`、仓储与管理路由；统一通过 `AccessFilter` 下推 SQL |
 | Skills（可选扩展） | 列表、正文、附件、上传、上下架 | 自持 `extensions/skills/schema.sql`、仓储与管理路由；管理与下架预览统一走 `skill:manage` |
 | Artifact / Workspace | HTTP 与 `read_tool_output` 分页续读、文件读写 | 统一校验 `resource_owner == scope.user_id`、`artifact:read` 与 TTL |
-| Ops / 模型配置 | `/ops/overview`（`AGENT_ENABLE_OPS=1` 可选）、`/config/model` | 拆分运维总览（`ops:view`）与平台运维（`platform:view_telemetry`/`system:update_model`） |
+| 模型配置 | `/config/model` | 需 `system:update_model`（`rbac` 模式下限定 `platform_admin`） |
 
 **后续演进路线（Phase 2–3 规划）**：
 - **Phase 2（企业部门与增量同步）**：扩展部门/项目组映射表（`EXISTS` 关联大组授权）与文档级 ACL 增量同步。

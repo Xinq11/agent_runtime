@@ -2,14 +2,10 @@ import React, { useEffect, useState } from "react";
 import { ChatCanvas } from "./features/chat/ChatCanvas";
 import { Sidebar } from "./features/chat/Sidebar";
 import { useChatSession } from "./features/chat/useChatSession";
-import { OpsPlatform } from "./features/ops/OpsPlatform";
 import { SettingsModal } from "./features/settings/SettingsModal";
 import { InspectorTab, TraceDrawer } from "./features/trace/TraceDrawer";
 
 export default function App() {
-  const [route, setRoute] = useState<"chat" | "ops">(() =>
-    window.location.pathname.startsWith("/ops") ? "ops" : "chat"
-  );
   const [dark, setDark] = useState(() => {
     try {
       return window.localStorage.getItem("agent_runtime_theme") !== "light";
@@ -21,7 +17,7 @@ export default function App() {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("trace");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  const session = useChatSession(route);
+  const session = useChatSession();
 
   useEffect(() => {
     const theme = dark ? "dark" : "light";
@@ -33,36 +29,10 @@ export default function App() {
     }
   }, [dark]);
 
-  useEffect(() => {
-    const onPop = () => {
-      setRoute(window.location.pathname.startsWith("/ops") ? "ops" : "chat");
-    };
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
-  }, []);
-
-  const navigate = (next: "chat" | "ops") => {
-    const targetPath = next === "ops" ? "/ops" : "/";
-    if (window.location.pathname !== targetPath) {
-      window.history.pushState({}, "", targetPath);
-    }
-    setRoute(next);
-  };
-
   const handleOpenInspector = (tab: InspectorTab) => {
     setInspectorTab(tab);
     setInspectorOpen(true);
   };
-
-  if (route === "ops") {
-    return (
-      <OpsPlatform
-        dark={dark}
-        onToggleTheme={() => setDark((d) => !d)}
-        onBackToChat={() => navigate("chat")}
-      />
-    );
-  }
 
   return (
     <div className="h-screen w-screen flex overflow-hidden">
@@ -76,7 +46,6 @@ export default function App() {
         onDeleteThread={session.removeThread}
         modelConfig={session.modelConfig}
         onOpenSettings={() => setSettingsOpen(true)}
-        onOpenOpsPlatform={() => navigate("ops")}
         dark={dark}
         onToggleTheme={() => setDark((d) => !d)}
       />

@@ -1,7 +1,5 @@
 import React, { useMemo, useState } from "react";
 import {
-  Activity,
-  ArrowUpRight,
   Check,
   ChevronDown,
   ChevronRight,
@@ -43,7 +41,6 @@ interface SidebarProps {
   onDeleteThread: (id: string) => Promise<void>;
   modelConfig: ModelConfig;
   onOpenSettings: () => void;
-  onOpenOpsPlatform: () => void;
   dark: boolean;
   onToggleTheme: () => void;
 }
@@ -58,7 +55,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onDeleteThread,
   modelConfig,
   onOpenSettings,
-  onOpenOpsPlatform,
   dark,
   onToggleTheme,
 }) => {
@@ -272,30 +268,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
       </div>
 
-      {/* Bottom: Single Unified Ops Platform Portal + Model Settings */}
+      {/* Bottom: Model Settings */}
       <div className="p-3 border-t space-y-2" style={{ borderColor: "var(--border)" }}>
-        <button
-          onClick={onOpenOpsPlatform}
-          className="interactive-btn w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-left"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border-strong)",
-          }}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <Activity size={14} style={{ color: "var(--accent)" }} />
-            <div className="min-w-0">
-              <div className="text-[12.5px] font-semibold leading-tight">
-                管理后台
-              </div>
-              <div className="text-[10.5px] truncate mt-0.5" style={{ color: "var(--ink-muted)" }}>
-                知识库 · Skills
-              </div>
-            </div>
-          </div>
-          <ArrowUpRight size={14} style={{ color: "var(--ink-muted)" }} />
-        </button>
-
         <button
           onClick={onOpenSettings}
           className="interactive-btn w-full flex items-center justify-between px-3 py-2 rounded-lg border text-left"
