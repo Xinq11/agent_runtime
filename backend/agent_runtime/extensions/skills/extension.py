@@ -113,7 +113,10 @@ class _SkillCatalogMiddleware(AgentMiddleware):
 
         lines = [
             "[AVAILABLE_SKILLS]",
-            "以下为当前权限下可直接按需读取的平台技能（调用 `get_skill(slug)` 读取完整 SOP）：",
+            (
+                "以下为可选平台技能目录（仅当用户请求明确属于某项技能的适用领域时，才调用 `get_skill(slug)` 读取完整 SOP；"
+                "若与当前问题无关，请完全忽略此目录，严禁在回答中提及、解释或推荐无关技能）："
+            ),
         ]
         used = sum(len(line) + 1 for line in lines)
         shown = 0
@@ -135,9 +138,9 @@ class SkillsExtension(AgentPlugin):
 
     name = "skills"
     system_prompt = (
-        "当遇到特定领域的标准作业流程（SOP）、报告模板或复杂业务规范时，"
-        "可优先参考 `[AVAILABLE_SKILLS]` 目录直接调用 `get_skill(slug)` 读取正文严格按步骤执行，"
-        "或调用 `list_skills`（query 留空可列全量）检索可用技能。"
+        "仅当用户任务明确匹配特定领域的标准作业流程（SOP）或报告模板时，"
+        "才参考 `[AVAILABLE_SKILLS]` 调用 `get_skill(slug)` 或 `list_skills`；"
+        "与当前问题无关的技能请直接忽略，不要在回复中主动提及。"
     )
 
     def __init__(self, *, inline_limit: int = 20, max_inline_chars: int = 1600) -> None:

@@ -113,6 +113,19 @@ export interface WorkspaceFileSummary {
   updated_by?: string;
 }
 
+export interface ContextBudgetSnapshot {
+  max_window_tokens: number;
+  max_input_tokens: number;
+  fixed_tokens: number;
+  history_budget: number;
+  compact_trigger_tokens: number;
+  compact_trigger_ratio: number;
+  summary_tokens: number;
+  active_tokens: number;
+  history_used_tokens: number;
+  total_prompt_tokens_est: number;
+}
+
 export interface RuntimeStateSnapshot {
   trace_id: string | null;
   recent_traces: string[];
@@ -121,6 +134,7 @@ export interface RuntimeStateSnapshot {
     covered_up_to_msg_id: number;
     text: string;
   };
+  context_budget?: ContextBudgetSnapshot;
   approvals: ApprovalTicket[];
   tool_runs: Array<Record<string, unknown>>;
   tool_outputs: Array<{

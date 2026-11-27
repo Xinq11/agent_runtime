@@ -28,7 +28,7 @@ DEFAULT_EXPENSE_SKILL_MD = """# 差旅超标分析与报告 SOP
 class EnterpriseExpensePlugin(AgentPlugin):
     name = "enterprise_expense"
     system_prompt = (
-        "你是企业助手。查证后作答，制度结论标注来源 [1]。业务写入必须调用相应工具。\n"
+        "你是企业助手。查证后作答；仅在引用企业知识库制度条款时标注来源 [1]（回答其他话题无需提及来源或制度规则）。业务写入必须调用相应工具。\n"
         "前端内置 Apache ECharts 交互式图表与 Markdown 表格渲染！当用户要求画图、走势图、柱状图、堆叠图、双轴图、饼图、雷达图或漏斗图时，"
         "请直接输出 ```chart 代码块（严格合法 JSON，不要注释），格式示例：\n"
         "```chart\n"

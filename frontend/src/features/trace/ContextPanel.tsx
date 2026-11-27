@@ -10,6 +10,11 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatTokens(n: number): string {
+  if (n >= 10000) return `${(n / 1000).toFixed(1)}k`;
+  return n.toLocaleString("en-US");
+}
+
 interface ContextPanelProps {
   threadId: string;
   threadTitle: string;
@@ -131,6 +136,74 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
           </div>
         ))}
       </div>
+
+      {/* Live context token budget meter */}
+      {state?.context_budget && (() => {
+        const cb = state.context_budget;
+        const pctOfHistory = cb.history_budget > 0
+          ? Math.min(100, (cb.history_used_tokens / cb.history_budget) * 100)
+          : 0;
+        const triggerPct = Math.round((cb.compact_trigger_ratio || 0.7) * 100);
+        const barColor =
+          pctOfHistory >= triggerPct
+            ? "var(--danger)"
+            : pctOfHistory >= triggerPct * 0.75
+            ? "var(--warn)"
+            : "var(--ok)";
+        return (
+          <div
+            className="rounded-xl border p-3 space-y-2"
+            style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+          >
+            <div className="flex items-center justify-between gap-2 text-[11.5px]">
+              <span className="font-semibold" style={{ color: "var(--ink-secondary)" }}>
+                上下文 Token 预算
+              </span>
+              <span className="font-mono text-[11px]" style={{ color: barColor }}>
+                {formatTokens(cb.history_used_tokens)} / {formatTokens(cb.history_budget)}
+                <span className="ml-1" style={{ color: "var(--ink-muted)" }}>
+                  ({pctOfHistory.toFixed(1)}%)
+                </span>
+              </span>
+            </div>
+
+            <div
+              className="relative h-2 rounded-full overflow-hidden"
+              style={{ background: "var(--bg)" }}
+              title={`历史已用 ${cb.history_used_tokens} tokens；达到 ${cb.compact_trigger_tokens} tokens (${triggerPct}%) 时触发后台压缩`}
+            >
+              <div
+                className="h-full rounded-full transition-all"
+                style={{ width: `${Math.max(pctOfHistory > 0 ? 2 : 0, pctOfHistory)}%`, background: barColor }}
+              />
+              <div
+                className="absolute top-0 bottom-0 w-0.5"
+                style={{ left: `${triggerPct}%`, background: "var(--accent)" }}
+                title={`自动压缩触发线 (${triggerPct}% ≈ ${cb.compact_trigger_tokens} tokens)`}
+              />
+            </div>
+
+            <div
+              className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[10.5px]"
+              style={{ color: "var(--ink-muted)" }}
+            >
+              <div>
+                压缩触发线：<span style={{ color: "var(--ink-secondary)" }}>{formatTokens(cb.compact_trigger_tokens)}</span>
+              </div>
+              <div className="text-right">
+                总估算：<span style={{ color: "var(--ink-secondary)" }}>{formatTokens(cb.total_prompt_tokens_est)}</span> / {formatTokens(cb.max_window_tokens)}
+              </div>
+              <div>
+                活跃窗口：<span style={{ color: "var(--ink-secondary)" }}>{formatTokens(cb.active_tokens)}</span>
+                {cb.summary_tokens > 0 && ` · 摘要 ${formatTokens(cb.summary_tokens)}`}
+              </div>
+              <div className="text-right">
+                固定前缀：<span style={{ color: "var(--ink-secondary)" }}>{formatTokens(cb.fixed_tokens)}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Workspace files (uploaded attachments + agent-generated reports) */}
       {state?.workspace_files && state.workspace_files.length > 0 && (

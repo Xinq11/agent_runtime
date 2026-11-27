@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+import json
 
 from fastapi import APIRouter, HTTPException, Request
 
 from agent_runtime.api.deps import caller_scope_async, resolve_filter_async
+from agent_runtime.framework.context.memory import ContextBudget, _msg_tokens
+from agent_runtime.framework.core.contracts import Message, estimate_tokens
+from agent_runtime.infra.llm.provider import wire_spec
 
 router = APIRouter(tags=["Conversation & Runs"])
+
+
+def _compute_context_budget_snapshot(runtime, store, scope, thread_id: str, snapshot: dict) -> dict:
+    budget: ContextBudget = getattr(runtime, "budget", None) or ContextBudget()
+    system_prompt = getattr(runtime, "system_prompt", "") or ""
+    registry = getattr(runtime, "registry", None)
+    specs = registry.visible_specs(scope) if registry is not None else []
+    wire_overhead = (
+        estimate_tokens(json.dumps([wire_spec(s) for s in specs], ensure_ascii=False)) if specs else 0
+    )
+    fixed_tokens = _msg_tokens(Message("system", system_prompt.strip())) + wire_overhead
+    history_budget = budget.history_budget(fixed_tokens)
+    trigger_tokens = int(history_budget * budget.compact_trigger_ratio)
+
+    summary_text = str((snapshot.get("summary") or {}).get("text") or "")
+    cursor = int((snapshot.get("summary") or {}).get("covered_up_to_msg_id") or 0)
+    summary_tokens = estimate_tokens(summary_text) if summary_text.strip() else 0
+    active_messages = store.list_messages(thread_id, cursor) if thread_id else []
+    active_tokens = sum(_msg_tokens(m) for m in active_messages)
+    history_used_tokens = summary_tokens + active_tokens
+    return {
+        "max_window_tokens": budget.max_window_tokens,
+        "max_input_tokens": budget.max_input_tokens,
+        "fixed_tokens": fixed_tokens,
+        "history_budget": history_budget,
+        "compact_trigger_tokens": trigger_tokens,
+        "compact_trigger_ratio": budget.compact_trigger_ratio,
+        "summary_tokens": summary_tokens,
+        "active_tokens": active_tokens,
+        "history_used_tokens": history_used_tokens,
+        "total_prompt_tokens_est": fixed_tokens + history_used_tokens,
+    }
 
 
 @router.get("/state", summary="获取会话 Trace 瀑布图、摘要游标、工作区文件与事件日志快照")
@@ -36,8 +72,17 @@ async def runtime_state(req: Request, thread_id: str = "", trace_id: str = ""):
         else None
     )
     logs = await obs.trace_logs(snapshot["trace_id"]) if hasattr(obs, "trace_logs") else []
+    context_budget = await asyncio.to_thread(
+        _compute_context_budget_snapshot,
+        req.app.state.runtime,
+        store,
+        scope,
+        thread_id,
+        snapshot,
+    )
     return {
         **snapshot,
+        "context_budget": context_budget,
         "active_run": asdict(active_run) if active_run else None,
         "loki_logs": logs,
     }
