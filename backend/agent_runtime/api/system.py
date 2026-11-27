@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
@@ -15,7 +16,7 @@ from agent_runtime.api.deps import (
     require_access_async,
 )
 from agent_runtime.api.schemas import ModelConfigUpdateRequest
-from agent_runtime.framework.core.config import DEFAULT_BASE
+from agent_runtime.framework.core.config import DEFAULT_BASE, PROVIDER_DEFAULT_BASE_URLS
 from agent_runtime.framework.core.contracts import PROTOCOL_VERSION
 from agent_runtime.framework.core.security import AccessControlError, AuthorizationError, ResourceRef, enforce_check
 from agent_runtime.framework.tools.skills import _call_provider
@@ -108,21 +109,45 @@ async def update_model(req: Request, payload: ModelConfigUpdateRequest):
     await require_access_async(req, scope, "system:update_model", ResourceRef("system"))
     body = payload.model_dump(exclude_none=True)
     current = req.app.state.model.config
+    if "mode" in body and "base_url" not in body:
+        preset_url = PROVIDER_DEFAULT_BASE_URLS.get(str(body["mode"]).strip())
+        if preset_url:
+            body["base_url"] = preset_url
     cfg = replace(current, **{k: str(v).strip() for k, v in body.items()})
     base = urlsplit(cfg.base_url)
-    trusted = {urlsplit(DEFAULT_BASE).netloc, "api.deepseek.com", "api.openai.com"}
+    extra_hosts = {
+        h.strip()
+        for h in os.getenv("AGENT_TRUSTED_LLM_HOSTS", "").split(",")
+        if h.strip()
+    }
+    trusted = {
+        urlsplit(DEFAULT_BASE).netloc,
+        "api.deepseek.com",
+        "api.openai.com",
+        "dashscope.aliyuncs.com",
+        *extra_hosts,
+    }
     if (
         not base.hostname
         or base.netloc not in trusted
         or base.username
         or base.query
         or base.fragment
-        or base.scheme != "https"
-        and (base.scheme, base.netloc) != (urlsplit(DEFAULT_BASE).scheme, urlsplit(DEFAULT_BASE).netloc)
+        or (
+            base.scheme != "https"
+            and (base.scheme, base.netloc) != (urlsplit(DEFAULT_BASE).scheme, urlsplit(DEFAULT_BASE).netloc)
+            and base.netloc not in extra_hosts
+        )
     ):
-        raise HTTPException(422, "请使用受信任的模型服务端点（DeepSeek / OpenAI 或部署时配置的 DEEPSEEK_BASE_URL）")
-    if cfg.mode not in {"deepseek"} or not cfg.model:
-        raise HTTPException(422, "当前仅支持 deepseek 模式，请提供有效的 model 名称")
+        raise HTTPException(
+            422,
+            "请使用受信任的模型服务端点（DeepSeek / OpenAI / Qwen，或部署时通过 DEEPSEEK_BASE_URL / AGENT_TRUSTED_LLM_HOSTS 放行）",
+        )
+    if cfg.mode not in set(PROVIDER_DEFAULT_BASE_URLS) or not cfg.model:
+        raise HTTPException(
+            422,
+            f"不支持的 mode '{cfg.mode}'（支持 {sorted(PROVIDER_DEFAULT_BASE_URLS)}），或缺少有效的 model 名称",
+        )
     if base.netloc != urlsplit(current.base_url).netloc and "api_key" not in body:
         cfg = replace(cfg, api_key="")
     req.app.state.model.config = replace(cfg, base_url=cfg.base_url.rstrip("/"))

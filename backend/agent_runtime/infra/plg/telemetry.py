@@ -23,6 +23,37 @@ class Telemetry(ObservabilityHub):
         self.prom = CollectorRegistry()
         self.ttft = Histogram("agent_ttft_seconds", "Time to first model delta", ["mode"], registry=self.prom)
         self.tokens = Counter("agent_tokens", "Model tokens", ["kind", "mode"], registry=self.prom)
+        self.prompt_cache_hit_ratio = Histogram(
+            "agent_prompt_cache_hit_ratio",
+            "Prompt prefix cache hit ratio (0..1)",
+            ["mode"],
+            buckets=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0),
+            registry=self.prom,
+        )
+        self.compaction_duration = Histogram(
+            "agent_compaction_duration_seconds",
+            "Context compaction duration in seconds",
+            ["trigger"],
+            registry=self.prom,
+        )
+        self.compactions = Counter(
+            "agent_compactions_total",
+            "Context compaction outcomes",
+            ["trigger", "outcome"],
+            registry=self.prom,
+        )
+        self.llm_retries = Counter(
+            "agent_llm_retries_total",
+            "Transient LLM request retries",
+            ["mode", "reason"],
+            registry=self.prom,
+        )
+        self.runs_recovered = Counter(
+            "agent_runs_recovered_total",
+            "Stale zombie runs recovered",
+            ["reason"],
+            registry=self.prom,
+        )
         self.tools = Counter("agent_tool_calls", "Tool outcomes", ["tool", "status"], registry=self.prom)
         self.dropped = Counter("agent_log_drops", "Log entries dropped", registry=self.prom)
 
@@ -34,8 +65,12 @@ class Telemetry(ObservabilityHub):
             return lvl, "http.access", f"{fields.get('method', 'GET')} {fields.get('path', '/')} -> {status} ({fields.get('duration_ms', 0)}ms)"
         if event == "server_started":
             return "INFO", "backend.api", f"Backend ready (model={fields.get('model')}, mode={fields.get('mode')}, PG+MinIO connected)"
+        if event == "stale_runs_recovered":
+            return "WARN", "agent.lifecycle", f"Recovered {fields.get('count', 0)} stale running run(s) (reason={fields.get('reason', 'lease_expired')})"
         if event == "turn_start":
             return "INFO", "agent.lifecycle", f"Turn started on thread={fields.get('thread_id', '')}"
+        if event == "llm_retry":
+            return "WARN", "agent.llm", f"Retrying LLM request attempt={fields.get('attempt', 1)} reason={fields.get('reason', 'transient')}"
         if event == "llm_done":
             calls = fields.get("tool_calls") or []
             call_str = f"tool_calls={calls}" if calls else "final_text"
@@ -44,6 +79,12 @@ class Telemetry(ObservabilityHub):
             st = str(fields.get("status", "ok"))
             lvl = "WARN" if st == "approval_required" else ("ERROR" if st not in ("ok", "running") else "INFO")
             return lvl, "agent.tool", f"Tool {fields.get('tool', 'unknown')} finished with status={st}"
+        if event == "tool_reconciled":
+            return "INFO", "agent.tool", f"Tool {fields.get('tool', 'unknown')} reconciled op_key={fields.get('op_key', '')} -> {fields.get('outcome', 'done')}"
+        if event == "subagent_done":
+            return "INFO", "agent.subagent", f"Sub-agent {fields.get('role', 'unknown')} completed in {fields.get('steps', 1)} step(s)"
+        if event == "context_compacted":
+            return "INFO", "agent.context", f"Context compacted trigger={fields.get('trigger', 'soft')} outcome={fields.get('outcome', 'ok')} msgs={fields.get('folded_messages', 0)}"
         if event == "turn_done":
             return "INFO", "agent.lifecycle", f"Turn completed (compacted={fields.get('compacted', False)})"
         if event == "turn_error":

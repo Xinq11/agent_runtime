@@ -23,10 +23,13 @@ class ToolSpec:
     is_subagent: bool = False
     bypass_truncation: bool = False
     parameters_schema: Optional[dict] = None
+    reconcile_handler: Optional[Callable] = None
 
     def __post_init__(self):
         if not self.name or not callable(self.handler):
             raise ValueError("tool name and callable handler are required")
+        if self.reconcile_handler is not None and not callable(self.reconcile_handler):
+            raise ValueError("reconcile_handler must be callable when provided")
         if not self.allowed_args:
             object.__setattr__(self, "allowed_args", tuple(self.required_args))
         if not set(self.required_args).issubset(self.allowed_args):

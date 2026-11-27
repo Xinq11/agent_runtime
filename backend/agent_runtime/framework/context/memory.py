@@ -19,6 +19,39 @@ class ContextWindowExceeded(ValueError):
     """The current input cannot fit even with all older context removed."""
 
 
+MODEL_CONTEXT_WINDOWS = {
+    "deepseek-chat": 65536,
+    "deepseek-reasoner": 65536,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4.1": 128000,
+    "gpt-4.1-mini": 128000,
+    "qwen-plus": 128000,
+    "qwen-max": 32768,
+    "qwen-turbo": 128000,
+    "claude-3-5-sonnet": 200000,
+    "claude-3-7-sonnet": 200000,
+    "claude-sonnet-4": 200000,
+}
+
+
+def resolve_model_window(model_name: str, default: int = 32768) -> int:
+    """Resolve context window size by exact or prefix match, respecting `AGENT_MAX_WINDOW_TOKENS`."""
+    env_override = os.getenv("AGENT_MAX_WINDOW_TOKENS", "").strip()
+    if env_override:
+        try:
+            return max(2048, int(env_override))
+        except ValueError:
+            pass
+    key = (model_name or "").strip().lower()
+    if key in MODEL_CONTEXT_WINDOWS:
+        return MODEL_CONTEXT_WINDOWS[key]
+    for prefix, window in MODEL_CONTEXT_WINDOWS.items():
+        if key.startswith(prefix):
+            return window
+    return default
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     """Window slicing formula ensuring prompt never overflows model limit."""
@@ -29,6 +62,11 @@ class ContextBudget:
     max_extra_context_tokens: int = 1200
     compact_trigger_ratio: float = 0.7
     keep_tail_ratio: float = 0.2
+
+    @classmethod
+    def for_model(cls, model_name: str, **overrides) -> "ContextBudget":
+        window = overrides.pop("max_window_tokens", resolve_model_window(model_name))
+        return cls(max_window_tokens=window, **overrides)
 
     def history_budget(self, fixed_tokens: int) -> int:
         # The design reserves 10k for the next question in a 128k window.

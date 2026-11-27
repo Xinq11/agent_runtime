@@ -67,11 +67,11 @@
 
 | 情况 | 当前后端行为 | 客户开发 / 运维需要知道什么 |
 | --- | --- | --- |
-| 浏览器关闭或 SSE 消费过慢 | `publish_sse` 有限等待（0.5s），超时或断连后摘除推送队列，不再阻塞后台协程 | 后台运行可继续收敛并落库，不会锁死会话 409；回到页面查历史与状态，需主动停止时调用 Abort |
+| 浏览器关闭、刷新或 SSE 消费过慢 | `RunEventBroker` 按 `run_id` 保留有界事件环形缓冲（默认 512 帧 / TTL 5 分钟），慢消费者自动摘除不再阻塞后台协程 | 后台运行继续收敛并落库，不会锁死会话 409；客户端断线重连可携带 `Last-Event-ID` 调用 `GET /api/v1/runs/{run_id}/events` 断点补帧 |
 | 用户在一批工具执行中途取消 | `tools_node` 捕获 `CancelledError`（不吞 LangGraph 中断异常），同步刷盘本批已完成结果并为未完成调用补 `[cancelled]`；`agent_runs` 不可逆置为 `cancelled`，拒绝迟到的审批恢复 | 已被下游业务系统受理的副作用仍需按业务规则补偿或人工核对 |
 | 审批恢复触发节点重放 | 网关用 `op_key` 抢占；已完成写动作直接复用已存回执，避免重复扣款或重复提单 | 对接真实 OA / 工单时，务必透传 `ctx.op_key` 给下游做幂等防重 |
-| 下游已受理但超时/中途取消（状态不确定） | 网关将 `tool_runs.status` 标记为 `reconcile` | 客户连接器需约定按 `op_key` 向外部系统查单对账的恢复手段 |
-| 进程崩溃或首条消息写入前故障 | PG 保存业务运行态、LangGraph 保存节点级检查点，二者覆盖不同窗口；进程异常退出后活跃 `agent_runs` 目前需人工/超时回收 | 计划在后续版本补充 `start_run` 与首条消息的事务收敛及超时僵尸 Run 自动回收机制 |
+| 下游已受理但超时/中途取消（状态不确定） | 网关将 `tool_runs.status` 标记为 `reconcile`；若工具通过 `@tool(reconcile=...)` 注册了对账回调，重放或调用 `gateway.reconcile_tool_run()` 时自动按 `op_key` 查单收敛为 `done`/`failed`，避免重复写入 | 客户连接器按需提供 `reconcile(op_key, args, ctx) -> ReconcileResult` 查单对账回调 |
+| 进程崩溃或异常退出遗留活跃 Run | `RunService` 在任务执行期间定期刷新 `agent_runs.updated_at` 心跳租约；启动时与同会话发生并发冲突时自动回收超期僵尸 `running` Run（标记为 `failed/stale_run_recovered`，**永不误杀 `paused` 待审批 Run**） | 可通过 `AGENT_STALE_RUN_TIMEOUT_SEC`（默认 `120` 秒）调整租约回收阈值 |
 
 ---
 

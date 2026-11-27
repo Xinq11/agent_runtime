@@ -40,11 +40,22 @@ def resolve_identity(req, default_scope: Optional[AuthScope] = None) -> AuthScop
 SSE_PUT_TIMEOUT_SEC = 0.5
 
 
+PROVIDER_DEFAULT_BASE_URLS = {
+    "deepseek": DEFAULT_BASE,
+    "openai": "https://api.openai.com/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "compatible": DEFAULT_BASE,
+}
+
+
 async def publish_sse(event: SSEEvent, *, put_timeout: float = SSE_PUT_TIMEOUT_SEC) -> None:
+    meta = sse_meta.get()
+    if isinstance(meta, dict) and meta.get("stream") is not None:
+        meta["stream"].publish(event)
+        return
     queue = sse_sink.get()
     if queue is None:
         return
-    meta = sse_meta.get()
     if isinstance(meta, dict):
         if meta.get("closed"):
             return

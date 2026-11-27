@@ -87,6 +87,7 @@ def tool(
     risk_level: RiskLevel = RiskLevel.READ,
     timeout_sec: float = 10.0,
     bypass_truncation: bool = False,
+    reconcile: Optional[Callable[..., Any]] = None,
 ) -> Any:
     """Turn a regular Python function into a `ToolSpec` with automatic JSON Schema."""
 
@@ -114,6 +115,7 @@ def tool(
             timeout_sec=timeout_sec,
             bypass_truncation=bypass_truncation,
             parameters_schema=schema,
+            reconcile_handler=reconcile,
         )
 
     if fn is not None:

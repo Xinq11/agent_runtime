@@ -6,7 +6,8 @@ import asyncio
 from dataclasses import replace
 import json
 import logging
-from typing import List
+import time
+from typing import Any, List, Optional, Tuple
 
 from agent_runtime.framework.context.memory import (
     ContextBudget, ContextWindowExceeded, _msg_tokens, _truncate_to_token_budget, assemble_before_model,
@@ -33,7 +34,7 @@ _SUMMARY_PROMPT = (
 )
 
 
-async def _summarize(previous, messages, model, ctx, budget):
+async def _summarize(previous, messages, model, ctx, budget) -> Tuple[str, bool]:
     summary = _truncate_to_token_budget(previous, budget.max_summary_tokens)
     prompt = Message("system", _SUMMARY_PROMPT)
     # Reserve room for the previous digest on every incremental summarizer call.
@@ -46,8 +47,10 @@ async def _summarize(previous, messages, model, ctx, budget):
                                 parent_span_id=ctx.parent_span_id or ctx.trace_id)
 
     child.on_event = None
+    used_fallback = False
 
     async def merge(lines, old):
+        nonlocal used_fallback
         transcript = "\n".join(lines)
         if can_call and summary_cap:
             try:
@@ -58,7 +61,10 @@ async def _summarize(previous, messages, model, ctx, budget):
                 if reply.content.strip():
                     return _truncate_to_token_budget(reply.content.strip(), summary_cap)
             except Exception:
+                used_fallback = True
                 logging.getLogger(__name__).warning("Falling back to extractive history summary", exc_info=True)
+        else:
+            used_fallback = True
         snippets = "\n".join(line[:160] for line in lines[-12:])
         return _truncate_to_token_budget("\n".join(filter(None, (old, snippets))), summary_cap)
 
@@ -78,16 +84,19 @@ async def _summarize(previous, messages, model, ctx, budget):
             size = 0
         batch.append(line)
         size += cost
-    return await merge(batch, summary) if batch else summary
+    if batch:
+        summary = await merge(batch, summary)
+    return summary, used_fallback
 
 
 class SessionCompactor:
     """Share a session's in-flight summary between finish and the next model call."""
 
-    def __init__(self, store, model, budget: ContextBudget):
+    def __init__(self, store, model, budget: ContextBudget, *, obs: Optional[Any] = None):
         self.store = store
         self.model = model
         self.budget = budget
+        self.obs = obs
         self.tasks: dict[str, asyncio.Task] = {}
 
     async def load(self, thread_id):
@@ -123,10 +132,13 @@ class SessionCompactor:
             return
         cut = _split_history(messages, int(h * self.budget.keep_tail_ratio))
         if cut:
-            await self._fold(ctx, summary, cursor, messages[:cut], persist=True)
+            await self._fold(ctx, summary, cursor, messages[:cut], persist=True, trigger="soft")
 
-    async def _fold(self, ctx, summary, cursor, messages, *, persist, use_model=True):
-        merged = await _summarize(summary, messages, self.model if use_model else None, ctx, self.budget)
+    async def _fold(self, ctx, summary, cursor, messages, *, persist, use_model=True, trigger="soft"):
+        t0 = time.monotonic()
+        merged, used_fallback = await _summarize(
+            summary, messages, self.model if use_model else None, ctx, self.budget
+        )
         new_cursor = messages[-1].msg_id
         if persist and new_cursor is not None:
             guarded_save = getattr(self.store, "save_summary_if_current", None)
@@ -134,6 +146,27 @@ class SessionCompactor:
                 await asyncio.to_thread(guarded_save, ctx.thread_id, merged, new_cursor, expected_cursor=cursor)
             else:
                 await asyncio.to_thread(self.store.save_summary, ctx.thread_id, merged, new_cursor)
+        elapsed = max(0.0, time.monotonic() - t0)
+        outcome = "fallback" if used_fallback else "ok"
+        if self.obs is not None:
+            dur = getattr(self.obs, "compaction_duration", None)
+            if dur is not None:
+                dur.labels(trigger).observe(elapsed)
+            cnt = getattr(self.obs, "compactions", None)
+            if cnt is not None:
+                cnt.labels(trigger, outcome).inc()
+            log_fn = getattr(self.obs, "log_event", None)
+            if log_fn is not None:
+                log_fn(
+                    "context_compacted",
+                    ctx.trace_id,
+                    ctx.thread_id,
+                    trigger=trigger,
+                    outcome=outcome,
+                    folded_messages=len(messages),
+                    persisted=bool(persist and new_cursor is not None),
+                    duration_ms=max(1, int(elapsed * 1000)),
+                )
         return merged
 
     async def prepare(self, ctx, *, system_prompt, wire_overhead, summary, cursor, recent, extras):
@@ -187,6 +220,7 @@ class SessionCompactor:
                     summary = await self._fold(
                         ctx, summary, cursor, history[:cut], persist=persist,
                         use_model=ctx.thread_id not in self.tasks,
+                        trigger="emergency",
                     )
                     recent = recent[cut:]
                 # An oversized current tool group can be trimmed for this request only.

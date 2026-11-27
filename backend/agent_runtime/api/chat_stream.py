@@ -31,6 +31,43 @@ def get_run(run_id: str, req: Request):
     return asdict(rec)
 
 
+def _parse_last_event_id(req: Request, after_seq: int) -> int:
+    cursor = max(0, int(after_seq))
+    raw = req.headers.get("Last-Event-ID") or req.headers.get("last-event-id")
+    if raw is not None:
+        try:
+            cursor = max(cursor, int(str(raw).strip()))
+        except ValueError:
+            pass
+    return cursor
+
+
+@router.get("/runs/{run_id}/events", summary="按 Last-Event-ID 断点续接并补帧单次 Run 的 SSE 事件流")
+async def resume_run_events(run_id: str, req: Request, after_seq: int = 0):
+    scope = await caller_scope_async(req)
+    runtime = req.app.state.runtime
+    try:
+        runtime.run_service.get_run(scope, run_id)
+    except RunNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    stream = runtime.sse_broker.get(run_id)
+    if stream is None:
+        raise HTTPException(410, "该运行的 SSE 事件缓冲已过期，请直接拉取会话消息与运行状态")
+
+    cursor = _parse_last_event_id(req, after_seq)
+
+    async def replay():
+        async for ev in stream.subscribe(after_seq=cursor, is_disconnected=req.is_disconnected):
+            yield ev.to_sse_wire()
+
+    return StreamingResponse(
+        replay(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/chat/abort", status_code=202, summary="主动中止正在执行或待审批的 Run")
 async def abort_chat(req: Request, body: AbortRequest):
     scope = await caller_scope_async(req)
@@ -75,11 +112,11 @@ async def chat_sse(req: Request, body: ChatRequest):
         raise HTTPException(409, str(exc)) from exc
 
     tid, trace, request_id = ctx.thread_id, ctx.trace_id, ctx.request_id
-    queue: asyncio.Queue = asyncio.Queue(256)
-    stream_meta = {"run_id": run_rec.run_id, "seq": 0, "closed": False}
+    run_stream = runtime.sse_broker.open(run_rec.run_id)
+    stream_meta = {"run_id": run_rec.run_id, "stream": run_stream}
 
     async def worker():
-        token_sink = sse_sink.set(queue)
+        token_sink = sse_sink.set(None)
         token_meta = sse_meta.set(stream_meta)
         try:
             model_cfg = getattr(req.app.state.model, "config", None)
@@ -91,7 +128,7 @@ async def chat_sse(req: Request, body: ChatRequest):
                     SSEEvent(
                         "error",
                         {
-                            "error": "未配置 DeepSeek API Key，请先在 .env 设置 DEEPSEEK_API_KEY 或点击左下角设置填写密钥。",
+                            "error": "未配置模型 API Key，请先在 .env 设置 DEEPSEEK_API_KEY 或点击左下角设置填写密钥。",
                             "trace_id": trace,
                             "run_id": run_rec.run_id,
                         },
@@ -162,36 +199,20 @@ async def chat_sse(req: Request, body: ChatRequest):
             elif isinstance(exc, (ModelNotConfiguredError, ContextWindowExceeded)):
                 detail = str(exc)
             else:
-                detail = "执行失败，请检查 DeepSeek 模型配置和服务日志"
+                detail = "执行失败，请检查模型配置和服务日志"
             await publish_sse(SSEEvent("error", {"error": detail, "trace_id": trace, "run_id": run_rec.run_id}))
         finally:
             run_service.detach_task(run_rec.run_id)
+            runtime.sse_broker.close(run_rec.run_id)
             sse_meta.reset(token_meta)
             sse_sink.reset(token_sink)
-            if not stream_meta["closed"]:
-                with suppress(asyncio.QueueFull):
-                    queue.put_nowait(None)
 
     task = asyncio.create_task(worker())
     run_service.attach_task(run_rec.run_id, task)
 
     async def stream():
-        try:
-            while True:
-                if await req.is_disconnected():
-                    stream_meta["closed"] = True
-                    break
-                try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    continue
-                if ev is None:
-                    break
-                yield ev.to_sse_wire()
-        finally:
-            stream_meta["closed"] = True
-            with suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
+        async for ev in run_stream.subscribe(after_seq=0, is_disconnected=req.is_disconnected):
+            yield ev.to_sse_wire()
 
     return StreamingResponse(
         stream(),

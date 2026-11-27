@@ -25,6 +25,7 @@ from agent_runtime.framework.core.protocols import (
     SkillProvider,
 )
 from agent_runtime.framework.core.runs import RunNotFoundError, RunService, RunStateError
+from agent_runtime.framework.core.sse import RunEventBroker
 from agent_runtime.framework.core.security import (
     AccessController,
     RbacAccessController,
@@ -109,8 +110,13 @@ class AgentRuntimeApp:
         self.access_controller: AccessController = (
             access_controller if access_controller is not None else RbacAccessController(admin_roles=None)
         )
-        self.run_service = RunService(self.store)
-        self.budget = budget or ContextBudget()
+        self.run_service = RunService(self.store, obs=self.obs)
+        self.sse_broker = RunEventBroker()
+        if budget is not None:
+            self.budget = budget
+        else:
+            model_name = getattr(getattr(self.model, "config", None), "model", "")
+            self.budget = ContextBudget.for_model(model_name) if model_name else ContextBudget()
         self.max_steps = (
             max(1, int(max_steps))
             if max_steps is not None
@@ -208,7 +214,7 @@ class AgentRuntimeApp:
             parts = [ext.system_prompt.strip() for ext in self.extensions if ext.system_prompt.strip()]
             self.system_prompt = "\n\n".join(parts) if parts else DEFAULT_SYSTEM_PROMPT
 
-        self.compactor = SessionCompactor(self.store, self.model, self.budget)
+        self.compactor = SessionCompactor(self.store, self.model, self.budget, obs=self.obs)
         self.graph = build_agent_graph(
             store=self.store,
             obs=self.obs,
@@ -233,6 +239,7 @@ class AgentRuntimeApp:
             tool_gateway=self.gateway,
             obs=self.obs,
             tool_spec_cls=ToolSpec,
+            budget=self.budget,
         )
 
     def get_extension(self, name: str) -> Optional[AgentPlugin]:

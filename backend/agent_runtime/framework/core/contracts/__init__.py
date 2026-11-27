@@ -22,6 +22,7 @@ from agent_runtime.framework.core.contracts.messages import (
 from agent_runtime.framework.core.contracts.runtime import (
     ApprovalDecision,
     ApprovalTicket,
+    ReconcileResult,
     RunRecord,
     SpanRecord,
     ToolRunRecord,
@@ -35,6 +36,7 @@ __all__ = [
     "ExecutionContext",
     "Message",
     "ProgressCallback",
+    "ReconcileResult",
     "RiskLevel",
     "RunRecord",
     "SpanRecord",

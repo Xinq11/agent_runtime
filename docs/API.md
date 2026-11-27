@@ -69,7 +69,7 @@
 ### 2.3 模型配置查询与热更新
 - `GET /api/v1/config/model`
 - `POST /api/v1/config/model`（当前仅对本后端进程生效，且端点受白名单约束；生产部署应限制为平台运维权限）
-  - 请求体：`{ "api_key"?: string, "base_url"?: string, "model"?: string, "mode"?: "deepseek" }`
+  - 请求体：`{ "api_key"?: string, "base_url"?: string, "model"?: string, "mode"?: "deepseek" | "openai" | "qwen" | "compatible" }`（自建 OpenAI 兼容网关可通过 `AGENT_TRUSTED_LLM_HOSTS` 放行域名）
 
 ---
 
@@ -115,8 +115,9 @@ data: {"schema_version":"1.0","run_id":"run_xxx","seq":1,"type":"meta","timestam
 - 响应：`{ "ok": true, "run": { "run_id": "...", "status": "cancelled", ... } }`
 - 说明：中止活跃运行后，底层 `agent_runs` 不可逆进入 `cancelled`，旧审批票据无法再恢复该 Run。按 `run_id` 重复调用已完成/已失败/已取消的 Run 时返回其原终态；按 `thread_id` 查询不到活跃 Run 时返回 `404`。
 
-### 3.3 查询单次 Run 状态
+### 3.3 查询单次 Run 状态与 SSE 断点续接补帧
 - `GET /api/v1/runs/{run_id}` → 返回 `RunRecord`（`status`: `running | paused | completed | cancelled | failed`）。
+- `GET /api/v1/runs/{run_id}/events?after_seq={n}`（同时支持标准 `Last-Event-ID` 请求头）→ 校验创建者归属后，从内存环形缓冲中重放 `seq > cursor` 的全部遗漏帧；若 Run 仍在执行则无缝续接实时推流直至终态，缓冲已过期时返回 `410`。
 
 ### 3.4 高危审批同意/拒绝并恢复线程
 - `POST /api/v1/approvals/{review_id}/resume`

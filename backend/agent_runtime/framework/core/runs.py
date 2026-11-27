@@ -12,6 +12,8 @@ stream blocks abort requests:
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -32,14 +34,81 @@ class RunStateError(RuntimeError):
 
 
 class RunService:
-    """Manages durable `agent_runs` state transitions and live in-process cancellation."""
+    """Manages durable `agent_runs` state transitions, lease heartbeats, and live cancellation."""
 
-    def __init__(self, store: Any, *, db_poll_interval_sec: float = 0.5) -> None:
+    def __init__(
+        self,
+        store: Any,
+        *,
+        db_poll_interval_sec: float = 0.5,
+        stale_run_timeout_sec: Optional[float] = None,
+        heartbeat_interval_sec: Optional[float] = None,
+        obs: Optional[Any] = None,
+    ) -> None:
         self.store = store
+        self.obs = obs
         self._db_poll_interval_sec = max(0.0, db_poll_interval_sec)
+        self._stale_run_timeout_sec = (
+            max(1.0, float(stale_run_timeout_sec))
+            if stale_run_timeout_sec is not None
+            else max(1.0, float(os.getenv("AGENT_STALE_RUN_TIMEOUT_SEC", "120")))
+        )
+        self._heartbeat_interval_sec = (
+            max(0.2, float(heartbeat_interval_sec))
+            if heartbeat_interval_sec is not None
+            else min(15.0, max(1.0, self._stale_run_timeout_sec / 3.0))
+        )
         self._tasks: Dict[str, asyncio.Task] = {}
+        self._heartbeats: Dict[str, asyncio.Task] = {}
         self._cancel_flags: Dict[str, asyncio.Event] = {}
         self._last_db_check: Dict[str, float] = {}
+
+    def reap_stale_runs(
+        self,
+        *,
+        stale_after_sec: Optional[float] = None,
+        thread_id: Optional[str] = None,
+        reason: str = "lease_expired",
+    ) -> int:
+        """Recover crashed zombie `running` runs whose lease expired (never reaps `paused`)."""
+        reaper = getattr(self.store, "reap_stale_runs", None)
+        if reaper is None:
+            return 0
+        threshold = self._stale_run_timeout_sec if stale_after_sec is None else max(0.0, float(stale_after_sec))
+        reaped = int(reaper(stale_after_sec=threshold, thread_id=thread_id) or 0)
+        if reaped > 0 and self.obs is not None:
+            counter = getattr(self.obs, "runs_recovered", None)
+            if counter is not None:
+                counter.labels(reason).inc(reaped)
+            log_fn = getattr(self.obs, "log_event", None)
+            if log_fn is not None:
+                log_fn(
+                    "stale_runs_recovered",
+                    "system",
+                    thread_id or "system",
+                    count=reaped,
+                    reason=reason,
+                )
+        return reaped
+
+    def heartbeat_run(self, run_id: str) -> bool:
+        hb = getattr(self.store, "heartbeat_run", None)
+        if hb is None:
+            return False
+        return bool(hb(run_id))
+
+    async def _heartbeat_loop(self, run_id: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval_sec)
+                if run_id not in self._tasks:
+                    break
+                with suppress(Exception):
+                    still_running = await asyncio.to_thread(self.heartbeat_run, run_id)
+                    if not still_running:
+                        break
+        except asyncio.CancelledError:
+            return
 
     def start_run(
         self,
@@ -62,6 +131,10 @@ class RunService:
         )
         ok, err = self.store.create_run(rec)
         if not ok:
+            # Auto-recover crashed zombie `running` run on the same thread before failing with 409
+            if self.reap_stale_runs(thread_id=thread_id, reason="conflict_recovery") > 0:
+                ok, err = self.store.create_run(rec)
+        if not ok:
             raise RunConflictError(err or "当前对话已有正在执行或待审批的任务")
         self._cancel_flags[rid] = asyncio.Event()
         self._last_db_check[rid] = time.monotonic()
@@ -70,9 +143,15 @@ class RunService:
     def attach_task(self, run_id: str, task: asyncio.Task) -> None:
         self._tasks[run_id] = task
         self._cancel_flags.setdefault(run_id, asyncio.Event())
+        if hasattr(self.store, "heartbeat_run") and run_id not in self._heartbeats:
+            with suppress(RuntimeError):
+                self._heartbeats[run_id] = asyncio.create_task(self._heartbeat_loop(run_id))
 
     def detach_task(self, run_id: str) -> None:
         self._tasks.pop(run_id, None)
+        hb = self._heartbeats.pop(run_id, None)
+        if hb is not None and not hb.done():
+            hb.cancel()
         self._cancel_flags.pop(run_id, None)
         self._last_db_check.pop(run_id, None)
 

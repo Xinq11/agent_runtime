@@ -15,6 +15,7 @@ from langgraph.types import interrupt
 
 from agent_runtime.framework.core.contracts import (
     ExecutionContext,
+    ReconcileResult,
     RiskLevel,
     ToolCall,
     ToolResult,
@@ -98,6 +99,18 @@ async def _invoke(spec: ToolSpec, args: dict, ctx: ExecutionContext) -> Any:
     if inspect.iscoroutinefunction(spec.handler):
         return await spec.handler(args, ctx)
     value = await asyncio.to_thread(spec.handler, args, ctx)
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _invoke_reconcile(
+    spec: ToolSpec, op_key: str, args: dict, ctx: ExecutionContext
+) -> Any:
+    fn = spec.reconcile_handler
+    if fn is None:
+        return None
+    if inspect.iscoroutinefunction(fn):
+        return await fn(op_key, args, ctx)
+    value = await asyncio.to_thread(fn, op_key, args, ctx)
     return await value if inspect.isawaitable(value) else value
 
 
@@ -208,6 +221,8 @@ class ToolGateway:
                 ctx, op_key, call.name, digest, review_id
             )
             if not acquired:
+                if run.status == "reconcile" and spec.reconcile_handler is not None:
+                    return await self._reconcile_existing(call, spec, args, ctx, op_key)
                 if error or run.status != "done":
                     return _error(call, error or run.status)
                 return ToolResult(
@@ -261,6 +276,120 @@ class ToolGateway:
                 )
                 result.metadata["op_key"] = op_key
             return result
+
+    async def _reconcile_existing(
+        self,
+        call: ToolCall,
+        spec: ToolSpec,
+        args: dict,
+        ctx: ExecutionContext,
+        op_key: str,
+    ) -> ToolResult:
+        """Invoke a write tool's optional `reconcile(op_key, args, ctx)` callback to resolve uncertain runs."""
+        scope = (
+            self.tracer.span(
+                trace_id=ctx.trace_id,
+                operation_name=f"reconcile:{call.name}",
+                parent_span_id=ctx.parent_span_id,
+            )
+            if self.tracer
+            else nullcontext()
+        )
+        with scope as span:
+            child = replace(
+                ctx,
+                parent_span_id=span.span_id if span else ctx.parent_span_id,
+                op_key=op_key,
+            )
+            try:
+                raw = await asyncio.wait_for(
+                    _invoke_reconcile(spec, op_key, args, child),
+                    spec.timeout_sec,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if span is not None:
+                    span.status = "error"
+                    span.attributes["error_code"] = type(exc).__name__
+                return _error(call, "reconcile", f"对账查询失败: {type(exc).__name__}")
+
+            if raw is None:
+                outcome = ReconcileResult(status="pending")
+            elif isinstance(raw, ReconcileResult):
+                outcome = raw
+            elif isinstance(raw, ToolResult):
+                outcome = ReconcileResult(
+                    status="done" if raw.ok else "failed",
+                    content=raw.content,
+                    error_code=raw.error_code,
+                )
+            else:
+                text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                outcome = ReconcileResult(status="done", content=text)
+
+            if outcome.status == "done":
+                result = self._format_result(call, spec, ctx, outcome.content)
+                self.store.finish_tool_run(
+                    op_key,
+                    status="done",
+                    receipt=outcome.receipt or {"call_id": call.id, "reconciled": True},
+                    preview=result.content,
+                    result_ref=result.ref_id,
+                    error_code=None,
+                )
+                result.metadata.update({"reconciled": True, "op_key": op_key})
+                if span is not None:
+                    span.status = "ok"
+                    span.attributes["reconcile_status"] = "done"
+                if self.tracer and hasattr(self.tracer, "log_event"):
+                    self.tracer.log_event(
+                        "tool_reconciled",
+                        ctx.trace_id,
+                        ctx.thread_id,
+                        tool=call.name,
+                        op_key=op_key,
+                        outcome="done",
+                    )
+                return result
+
+            if outcome.status == "failed":
+                code = outcome.error_code or "reconcile_failed"
+                result = _error(call, code, outcome.content)
+                self.store.finish_tool_run(
+                    op_key,
+                    status="failed",
+                    receipt=outcome.receipt,
+                    preview=result.content,
+                    error_code=code,
+                )
+                result.metadata.update({"reconciled": True, "op_key": op_key})
+                if span is not None:
+                    span.status = "error"
+                    span.attributes["reconcile_status"] = "failed"
+                return result
+
+            if span is not None:
+                span.status = "error"
+                span.attributes["reconcile_status"] = "pending"
+            return _error(call, "reconcile", outcome.content or "下游状态仍不确定，需继续对账。")
+
+    async def reconcile_tool_run(
+        self,
+        op_key: str,
+        *,
+        tool_name: str,
+        args: dict,
+        ctx: ExecutionContext,
+    ) -> ToolResult:
+        """Public helper to explicitly trigger reconciliation for a `reconcile`-status `op_key`."""
+        call = ToolCall(id=f"reconcile_{op_key[:12]}", name=tool_name, args=args)
+        spec = self.registry.get(tool_name)
+        if spec is None:
+            return _error(call, "unknown_tool")
+        if spec.reconcile_handler is None:
+            return _error(call, "reconcile_unsupported", "该工具未注册 reconcile 回调")
+        return await self._reconcile_existing(call, spec, deepcopy(args), ctx, op_key)
 
     def _format_result(self, call, spec, ctx, value) -> ToolResult:
         if isinstance(value, ToolResult):

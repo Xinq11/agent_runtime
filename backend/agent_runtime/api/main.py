@@ -64,6 +64,7 @@ def create_app(
                     access_controller=access_controller,
                 )
                 await asyncio.to_thread(runtime.bootstrap_extensions)
+                await asyncio.to_thread(runtime.run_service.reap_stale_runs, reason="startup_recovery")
                 identity_resolver = load_identity_resolver(default_scope=runtime.default_identity())
 
                 app.state.runtime = runtime

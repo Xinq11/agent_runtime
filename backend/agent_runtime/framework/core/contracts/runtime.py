@@ -32,6 +32,20 @@ class ApprovalDecision:
 
 
 @dataclass
+class ReconcileResult:
+    """Outcome returned by a write tool's optional `reconcile(op_key, args, ctx)` callback."""
+
+    status: str  # done | failed | pending
+    content: str = ""
+    receipt: Optional[Dict[str, Any]] = None
+    error_code: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.status not in ("done", "failed", "pending"):
+            raise ValueError(f"Invalid ReconcileResult status: {self.status!r}")
+
+
+@dataclass
 class ToolRunRecord:
     op_key: str
     actor_id: str

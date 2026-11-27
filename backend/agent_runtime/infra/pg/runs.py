@@ -88,3 +88,52 @@ class PgRunsMixin:
             )
             row = cur.fetchone()
             return RunRecord(*row) if row else None
+
+    def heartbeat_run(self, run_id: str) -> bool:
+        """Refresh `updated_at` lease timestamp for an actively executing run."""
+        with self.transaction() as cur:
+            cur.execute(
+                """UPDATE agent_runs
+                   SET updated_at=clock_timestamp()
+                   WHERE run_id=%s AND status='running'
+                   RETURNING run_id""",
+                (run_id,),
+            )
+            return cur.fetchone() is not None
+
+    def reap_stale_runs(
+        self,
+        stale_after_sec: float = 120.0,
+        *,
+        thread_id: Optional[str] = None,
+        error_detail: str = "stale_run_recovered",
+    ) -> int:
+        """Mark zombie `running` runs whose lease expired as `failed` (never touches `paused`)."""
+        threshold = max(0.0, float(stale_after_sec))
+        with self.transaction() as cur:
+            if thread_id:
+                cur.execute(
+                    """UPDATE agent_runs
+                       SET status='failed',
+                           owner_epoch=owner_epoch+1,
+                           error_detail=COALESCE(error_detail, %s),
+                           updated_at=clock_timestamp()
+                       WHERE status='running'
+                         AND thread_id=%s
+                         AND updated_at < clock_timestamp() - (%s * interval '1 second')
+                       RETURNING run_id""",
+                    (error_detail, thread_id, threshold),
+                )
+            else:
+                cur.execute(
+                    """UPDATE agent_runs
+                       SET status='failed',
+                           owner_epoch=owner_epoch+1,
+                           error_detail=COALESCE(error_detail, %s),
+                           updated_at=clock_timestamp()
+                       WHERE status='running'
+                         AND updated_at < clock_timestamp() - (%s * interval '1 second')
+                       RETURNING run_id""",
+                    (error_detail, threshold),
+                )
+            return len(cur.fetchall())
