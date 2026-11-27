@@ -5,19 +5,17 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, replace
 import inspect
+import json
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from agent_runtime.framework.context.memory import (
-    ContextBudget,
-    assemble_before_model,
-    compact_after_agent,
-)
+from agent_runtime.framework.context.compaction import SessionCompactor
+from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import publish_sse, unpack_message
-from agent_runtime.framework.core.contracts import AuthScope, ExecutionContext, Message, SpanRecord
+from agent_runtime.framework.core.contracts import AuthScope, ExecutionContext, Message, SpanRecord, estimate_tokens
 from agent_runtime.framework.core.middleware import MiddlewareChain
 from agent_runtime.framework.core.security import (
     AuthorizationError,
@@ -25,7 +23,7 @@ from agent_runtime.framework.core.security import (
     enforce_check,
     get_policy_rev,
 )
-from agent_runtime.infra.llm.provider import strip_dsml_markup
+from agent_runtime.infra.llm.provider import strip_dsml_markup, wire_spec
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是通用智能助手。必要时先调用工具核实事实再作答，知识库结论标注来源 [1]。"
@@ -99,6 +97,7 @@ def build_agent_graph(
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     middlewares: Optional[MiddlewareChain] = None,
     budget: Optional[ContextBudget] = None,
+    compactor: Optional[SessionCompactor] = None,
     max_steps: int = 8,
     on_event: Optional[Any] = None,
     cancel_checker: Optional[Callable[[str], bool]] = None,
@@ -106,7 +105,7 @@ def build_agent_graph(
 ):
     """Build and compile the single unified LangGraph StateGraph used everywhere."""
     mw = middlewares or MiddlewareChain()
-    ctx_budget = budget or ContextBudget()
+    compactor = compactor or SessionCompactor(store, model, budget or ContextBudget())
 
     def _guard_cancel(ctx: ExecutionContext) -> None:
         if ctx.check_cancelled():
@@ -128,55 +127,6 @@ def build_agent_graph(
             operation_name="before_model",
             parent_span_id=ctx.parent_span_id,
         ) as bm_sp:
-            summary, cursor = await asyncio.to_thread(store.get_summary, ctx.thread_id)
-            history = await asyncio.to_thread(store.list_messages, ctx.thread_id, cursor)
-            recent = list(history) + list(pending)
-            latest_user_text = ""
-            last_user_idx = next(
-                (i for i in range(len(recent) - 1, -1, -1) if recent[i].role == "user"),
-                None,
-            )
-            if last_user_idx is not None:
-                raw_user = recent[last_user_idx].content or ""
-                transformed = await mw.run_transform_user_input(raw_user, ctx)
-                if transformed != raw_user:
-                    recent[last_user_idx] = replace(recent[last_user_idx], content=transformed)
-                latest_user_text = (recent[last_user_idx].content or "").strip()
-            extra_contexts = (
-                await mw.run_extra_context(latest_user_text, ctx) if latest_user_text else []
-            )
-            inputs, bm_stats = assemble_before_model(
-                system_prompt=system_prompt,
-                summary_text=summary,
-                recent_messages=recent,
-                budget=ctx_budget,
-                extra_contexts=extra_contexts,
-            )
-            await mw.run_on_before_model(inputs, ctx)
-            bm_sp.attributes.update(
-                {
-                    "input_tokens_est": bm_stats.get("input_tokens_est", 0),
-                    "kept_messages": bm_stats.get("kept_messages", 0),
-                    "dropped_messages": bm_stats.get("dropped_messages", 0),
-                    "extra_context_blocks": bm_stats.get("extra_context_blocks", 0),
-                    "extra_context_truncated": bm_stats.get("extra_context_truncated", False),
-                    "summary_cursor": cursor,
-                }
-            )
-
-        _guard_cancel(ctx)
-        step_num = state["step"] + 1
-        model_cfg = getattr(model, "config", None)
-        mode_name = getattr(model_cfg, "effective", "deepseek") if model_cfg else "deepseek"
-        model_name = getattr(model_cfg, "model", "deepseek-chat") if model_cfg else "deepseek-chat"
-
-        with obs.span(
-            trace_id=ctx.trace_id,
-            operation_name=f"model#{step_num}",
-            parent_span_id=ctx.parent_span_id,
-            attributes={"mode": mode_name, "model": model_name, "step": step_num},
-        ) as m_sp:
-            is_final_step = state["step"] >= max_steps - 1
             raw_specs = gateway.registry.visible_specs(ctx.auth_scope)
             if access_controller is not None and raw_specs:
                 specs = []
@@ -199,6 +149,56 @@ def build_agent_graph(
             else:
                 specs = raw_specs
 
+            is_final_step = state["step"] >= max_steps - 1
+            sent_specs = specs if not is_final_step or _supports_tool_choice(model) else []
+            wire_overhead = estimate_tokens(json.dumps([wire_spec(s) for s in sent_specs], ensure_ascii=False)) if sent_specs else 0
+            if is_final_step:
+                wire_overhead += estimate_tokens(_FINAL_STEP_CONVERGENCE_NOTICE) + 4
+            summary, cursor, history = await compactor.load(ctx.thread_id)
+            recent = list(history) + list(pending)
+            latest_user_text = ""
+            last_user_idx = next(
+                (i for i in range(len(recent) - 1, -1, -1) if recent[i].role == "user"),
+                None,
+            )
+            if last_user_idx is not None:
+                raw_user = recent[last_user_idx].content or ""
+                transformed = await mw.run_transform_user_input(raw_user, ctx)
+                if transformed != raw_user:
+                    recent[last_user_idx] = replace(recent[last_user_idx], content=transformed)
+                latest_user_text = (recent[last_user_idx].content or "").strip()
+            extra_contexts = (
+                await mw.run_extra_context(latest_user_text, ctx) if latest_user_text else []
+            )
+            inputs, bm_stats = await compactor.prepare(
+                ctx, system_prompt=system_prompt, wire_overhead=wire_overhead,
+                summary=summary, cursor=cursor, recent=recent, extras=extra_contexts,
+            )
+            await mw.run_on_before_model(inputs, ctx)
+            bm_sp.attributes.update(
+                {
+                    "input_tokens_est": bm_stats.get("input_tokens_est", 0),
+                    "kept_messages": bm_stats.get("kept_messages", 0),
+                    "dropped_messages": bm_stats.get("dropped_messages", 0),
+                    "extra_context_blocks": bm_stats.get("extra_context_blocks", 0),
+                    "extra_context_truncated": bm_stats.get("extra_context_truncated", False),
+                    "summary_cursor": bm_stats["summary_cursor"],
+                    "emergency": bm_stats["emergency"],
+                }
+            )
+
+        _guard_cancel(ctx)
+        step_num = state["step"] + 1
+        model_cfg = getattr(model, "config", None)
+        mode_name = getattr(model_cfg, "effective", "deepseek") if model_cfg else "deepseek"
+        model_name = getattr(model_cfg, "model", "deepseek-chat") if model_cfg else "deepseek-chat"
+
+        with obs.span(
+            trace_id=ctx.trace_id,
+            operation_name=f"model#{step_num}",
+            parent_span_id=ctx.parent_span_id,
+            attributes={"mode": mode_name, "model": model_name, "step": step_num},
+        ) as m_sp:
             if is_final_step:
                 call_inputs = _append_convergence_notice(inputs)
                 if _supports_tool_choice(model):
@@ -243,7 +243,7 @@ def build_agent_graph(
             model=model_name,
             tool_calls=[c.name for c in msg.tool_calls],
         )
-        return {**state, "step": step_num, "messages": [*state["messages"], asdict(msg)]}
+        return {**state, "step": step_num, "fixed_tokens": estimate_tokens(system_prompt) + 4 + wire_overhead, "messages": [*state["messages"], asdict(msg)]}
 
     async def tools_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ctx = run_context(
@@ -341,17 +341,11 @@ def build_agent_graph(
                     remaining_msgs,
                     step_key="finish",
                 )
-            comp = await compact_after_agent(
-                store=store,
-                ctx=ctx,
-                budget=ctx_budget,
-                model_client=model,
-            )
-            af_sp.attributes.update({k: v for k, v in comp.items() if k != "summary_text"})
+            compactor.schedule(ctx, state.get("fixed_tokens", estimate_tokens(system_prompt) + 4))
 
         final_answer = state["messages"][-1]["content"] if state["messages"] else ""
         await mw.run_after_turn(final_answer, ctx)
-        obs.log_event("turn_done", ctx.trace_id, ctx.thread_id, compacted=comp.get("compacted", False))
+        obs.log_event("turn_done", ctx.trace_id, ctx.thread_id)
         return {**state, "final_answer": final_answer, "persisted_count": len(state["messages"])}
 
     graph = StateGraph(dict)

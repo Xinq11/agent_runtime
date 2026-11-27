@@ -161,7 +161,9 @@ class TestExpensePlugin(unittest.TestCase):
             spans = app.obs.store.list_spans(ctx.trace_id)
             op_names = [s.operation_name for s in spans]
             self.assertTrue(any(n == "chat" for n in op_names))
-            self.assertTrue(any(n.startswith("subagent:bi_analyst") for n in op_names))
+            self.assertIn("subagent:bi_analyst", op_names)
+            self.assertIn("tool:call_bi_analyst", op_names)
+            self.assertIn("tool:bi_query", op_names)
             self.assertTrue(any(n == "tool:search_knowledge" for n in op_names))
 
         asyncio.run(_run())
@@ -251,7 +253,7 @@ class TestExpensePlugin(unittest.TestCase):
     def test_06_loop_breaker_and_cursor_compaction(self):
         async def _run():
             app, _writes = build_full_app(
-                budget=ContextBudget(compact_trigger_messages=4, keep_recent_messages=2),
+                budget=ContextBudget(max_window_tokens=12000, reserve_output_tokens=1000),
                 loop_limit=2,
             )
             ctx = ExecutionContext(
@@ -260,11 +262,15 @@ class TestExpensePlugin(unittest.TestCase):
                 request_id="req_loop",
                 auth_scope=AuthScope(tenant_id="t_acme", user_id="u1", roles=("employee",)),
             )
+            app.store.create_thread(ctx.auth_scope, ctx.thread_id, "历史对话")
+            app.store.append_message(ctx.thread_id, Message("user", "之前确认了哪些事项？"))
+            old_end = app.store.append_message(ctx.thread_id, Message("assistant", "记录" * 2400))
             res = await app.run_turn("LOOP_TEST", ctx=ctx)
             self.assertIn("熔断", res["final_answer"])
 
+            await app.compactor.drain()
             summary, cursor = app.store.get_summary("th_loop")
-            self.assertGreater(cursor, 0)
+            self.assertEqual(cursor, old_end)
             self.assertTrue(len(summary) > 0)
 
         asyncio.run(_run())

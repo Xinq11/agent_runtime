@@ -83,8 +83,7 @@ class EnterpriseExpensePlugin(AgentPlugin):
         register_subagent_tool(
             registry=registry,
             profile=SubAgentProfile(
-                tool_name="call_bi_analyst",
-                role="bi_analyst",
+                subagent_name="bi_analyst",
                 description="委派只读 BI 分析师",
                 system_prompt="你负责核验差旅数字并汇总结果。",
                 allowed_tools=("bi_query",),

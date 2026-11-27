@@ -41,7 +41,7 @@
 
 1. **组装上下文（`before_model`）**：读出历史摘要与摘要游标之后的消息，拼接当前轮尚未持久化的临时消息。预算超限时以**原子工具组**（`assistant(tool_calls)` + 对应全部 `tool` 结果）为单位从旧到新连续裁剪；若最新一组自身超窗则截断工具正文而非丢弃配对，避免模型看到孤立的 `tool_call`。[上下文组装](../backend/agent_runtime/framework/context/memory.py)
 2. **执行工具（`tools_node` → `ToolGateway`）**：按 `RiskLevel` 分流（只读工具受限并行，写/高危工具串行），依次执行权限收窄校验、JSON Schema 参数校验、循环熔断、高危审批拦截、幂等抢占与超时控制。返回过大时将原文落 MinIO，仅把预览与 `ref_id` 放回上下文，由 `read_tool_output` 分页续读。[工具网关](../backend/agent_runtime/framework/tools/gateway.py)
-3. **按步记录进度**：每批工具完成后，图节点以 `(thread_id, trace_id, step_key)` 幂等写入本批消息并推进 `persisted_count`。最终答复在 `finish` 节点落库后，再判断是否触发 `compact_after_agent` 推进摘要游标。[执行图](../backend/agent_runtime/framework/core/workflow.py)
+3. **按步记录进度**：每批工具完成后，图节点以 `(thread_id, trace_id, step_key)` 幂等写入本批消息并推进 `persisted_count`。最终答复在 `finish` 落库后即可返回。后台按 `H = 模型窗口 − 固定指令与工具定义 − 动态注入预留 − 提问缓冲 − 输出预留` 计算历史预算。旧摘要与未压缩消息超过 70% × H 时，按完整用户轮次切分，目标保留约 20% × H 的近期原文，仅推进摘要游标。模型调用前若估算超限，先复用在途摘要、移除动态注入、折叠旧工具预览，再按需同步压缩历史；始终保留当前提问，单次提问过长会提示分段。短生命周期的 Python 程序可在退出事件循环前 `await app.compactor.drain()` 等待回写。[执行图](../backend/agent_runtime/framework/core/workflow.py)
 4. **跨轮审批恢复**：`HIGH_RISK` 工具通过 LangGraph `interrupt()` 暂停，前端收到 `approval_required`。提交决定后，服务校验检查点挂起票据与运行状态，记录决定并以 `Command(resume=review_id)` 恢复同一检查点继续执行。[审批入口](../backend/agent_runtime/api/approvals.py) · [运行状态](../backend/agent_runtime/framework/core/runs.py)
 
 ---

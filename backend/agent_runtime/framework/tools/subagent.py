@@ -19,14 +19,19 @@ from agent_runtime.framework.core.contracts import ExecutionContext, Message, Ri
 
 @dataclass(frozen=True)
 class SubAgentProfile:
-    tool_name: str
-    role: str
+    """The parent calls `call_<subagent_name>`; events use the bare name as the role."""
+
+    subagent_name: str
     description: str
     system_prompt: str
     allowed_tools: Tuple[str, ...]
     model_name: str = "deepseek-chat"
     max_steps: int = 4
     timeout_sec: float = 12.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subagent_name, str) or not self.subagent_name.strip():
+            raise ValueError("subagent_name must be a non-empty string")
 
 
 async def run_readonly_subagent(
@@ -44,19 +49,19 @@ async def run_readonly_subagent(
 
     with obs.span(
         trace_id=parent_ctx.trace_id,
-        operation_name=f"subagent:{profile.role}",
+        operation_name=f"subagent:{profile.subagent_name}",
         parent_span_id=parent_ctx.parent_span_id,
-        attributes={"role": profile.role, "model": profile.model_name},
+        attributes={"role": profile.subagent_name, "model": profile.model_name},
     ) as sub_span:
         sub_ctx = parent_ctx.derive_subagent(
-            agent_name=profile.role,
+            agent_name=profile.subagent_name,
             allowed_tools=profile.allowed_tools,
             parent_span_id=sub_span.span_id,
             model_name=profile.model_name,
         )
         await parent_ctx.emit(
             "subagent_status",
-            {"role": profile.role, "phase": "started", "goal": goal},
+            {"role": profile.subagent_name, "phase": "started", "goal": goal},
         )
 
         # Isolated private conversation window — discarded on return
@@ -73,7 +78,7 @@ async def run_readonly_subagent(
         loop_counts: Dict[str, int] = {}
         final_answer = ""
 
-        for _step in range(profile.max_steps):
+        for step_idx in range(profile.max_steps):
             raw_specs = tool_gateway.registry.visible_specs(
                 sub_ctx.auth_scope, include_subagents=False
             )
@@ -158,7 +163,7 @@ async def run_readonly_subagent(
 
         await parent_ctx.emit(
             "subagent_status",
-            {"role": profile.role, "phase": "done", "chars": len(final_answer)},
+            {"role": profile.subagent_name, "phase": "done", "chars": len(final_answer)},
         )
         return final_answer
 
@@ -186,7 +191,7 @@ def register_subagent_tool(
 
     registry.register(
         tool_spec_cls(
-            name=profile.tool_name,
+            name=f"call_{profile.subagent_name}",
             description=profile.description,
             required_args=("goal",),
             allowed_args=("goal",),

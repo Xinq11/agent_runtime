@@ -76,6 +76,7 @@ async def lifespan(app: FastAPI):
             try:
                 yield
             finally:
+                await runtime.compactor.drain()
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(obs.queue.join(), 3)
                 worker.cancel()

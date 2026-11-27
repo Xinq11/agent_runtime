@@ -10,6 +10,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from agent_runtime.framework.context.memory import ContextWindowExceeded
 from agent_runtime.api.deps import caller_scope, caller_scope_async
 from agent_runtime.api.schemas import AbortRequest, ChatRequest
 from agent_runtime.framework.core.config import publish_sse, sse_meta, sse_sink, uid
@@ -174,7 +175,7 @@ async def chat_sse(req: Request, body: ChatRequest):
             obs.log_event("turn_error", trace, tid, run_id=run_rec.run_id, error=type(exc).__name__)
             if isinstance(exc, HTTPException):
                 detail = exc.detail
-            elif isinstance(exc, ModelNotConfiguredError):
+            elif isinstance(exc, (ModelNotConfiguredError, ContextWindowExceeded)):
                 detail = str(exc)
             else:
                 detail = "执行失败，请检查 DeepSeek 模型配置和服务日志"

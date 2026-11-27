@@ -8,10 +8,15 @@ arithmetic token-budget slicing, and cursor-based async compaction from
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 import os
-from typing import Any, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
-from agent_runtime.framework.core.contracts import ExecutionContext, Message, estimate_tokens
+from agent_runtime.framework.core.contracts import Message, estimate_tokens
+
+
+class ContextWindowExceeded(ValueError):
+    """The current input cannot fit even with all older context removed."""
 
 
 @dataclass(frozen=True)
@@ -22,8 +27,13 @@ class ContextBudget:
     reserve_output_tokens: int = int(os.getenv("AGENT_RESERVE_OUTPUT_TOKENS", "2048"))
     max_summary_tokens: int = 800
     max_extra_context_tokens: int = 1200
-    compact_trigger_messages: int = 8
-    keep_recent_messages: int = 4
+    compact_trigger_ratio: float = 0.7
+    keep_tail_ratio: float = 0.2
+
+    def history_budget(self, fixed_tokens: int) -> int:
+        # The design reserves 10k for the next question in a 128k window.
+        user_buffer = self.max_window_tokens * 10 // 128
+        return max(0, self.max_input_tokens - fixed_tokens - self.max_extra_context_tokens - user_buffer)
 
     @property
     def max_input_tokens(self) -> int:
@@ -31,18 +41,26 @@ class ContextBudget:
 
 
 def _msg_tokens(msg: Message) -> int:
-    return estimate_tokens(msg.content) + len(msg.tool_calls) * 32
+    cost = 4 + estimate_tokens(msg.content) + estimate_tokens(msg.tool_call_id or "")
+    for call in msg.tool_calls:
+        cost += 8 + estimate_tokens(call.name + call.id + json.dumps(call.args, ensure_ascii=False))
+    if msg.tool_calls:
+        cost += estimate_tokens(msg.metadata.get("reasoning_content") or "")
+    return cost
 
 
 def _truncate_to_token_budget(text: str, budget_tokens: int) -> str:
+    if budget_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= budget_tokens:
+        return text
     suffix = "\n...[truncated for context budget]"
-    if budget_tokens <= estimate_tokens(suffix) + 4:
-        return suffix.strip()
-    target = budget_tokens - estimate_tokens(suffix)
-    low, high = 0, min(len(text), 4 * target + 8)
+    if estimate_tokens(suffix) > budget_tokens:
+        suffix = ""
+    low, high = 0, len(text)
     while low < high:
         mid = (low + high + 1) // 2
-        if estimate_tokens(text[:mid]) <= target:
+        if estimate_tokens(text[:mid] + suffix) <= budget_tokens:
             low = mid
         else:
             high = mid - 1
@@ -78,21 +96,13 @@ def _group_atomic_messages(messages: List[Message]) -> List[List[Message]]:
 
 def _fit_newest_group(group: List[Message], budget_tokens: int) -> List[Message]:
     """Keep the newest atomic group valid even when oversized by truncating its `tool` payloads."""
-    tool_indices = [i for i, m in enumerate(group) if m.role == "tool"]
-    if not tool_indices:
-        return [
-            replace(group[0], content=_truncate_to_token_budget(group[0].content, max(64, budget_tokens)))
-        ]
-    fixed_cost = sum(_msg_tokens(m) for i, m in enumerate(group) if i not in tool_indices)
-    avail = max(64, budget_tokens - fixed_cost)
-    per_tool = max(32, avail // len(tool_indices))
-    fitted: List[Message] = []
-    for i, m in enumerate(group):
-        if i in tool_indices and estimate_tokens(m.content) > per_tool:
-            fitted.append(replace(m, content=_truncate_to_token_budget(m.content, per_tool)))
-        else:
-            fitted.append(m)
-    return fitted
+    tool_count = sum(m.role == "tool" for m in group)
+    base = sum(_msg_tokens(replace(m, content="")) if m.role == "tool" else _msg_tokens(m) for m in group)
+    if not tool_count or base > budget_tokens:
+        raise ContextWindowExceeded("本轮输入超过模型窗口，请分段发送或改用附件。")
+    per_tool = (budget_tokens - base) // tool_count
+    return [replace(m, content=_truncate_to_token_budget(m.content, per_tool))
+            if m.role == "tool" else m for m in group]
 
 
 def assemble_before_model(
@@ -103,6 +113,7 @@ def assemble_before_model(
     recent_messages: List[Message],
     budget: ContextBudget,
     extra_contexts: Sequence[str] = (),
+    wire_overhead: int = 0,
 ) -> Tuple[List[Message], dict]:
     """Build cache-friendly segments with strictly contiguous atomic tool-group trimming."""
     static_block = system_prompt.strip()
@@ -110,7 +121,7 @@ def assemble_before_model(
         static_block = f"{static_block}\n\n[FROZEN_TOOLS]\n{tool_schemas_text}"
 
     assembled: List[Message] = [Message(role="system", content=static_block)]
-    used_tokens = estimate_tokens(static_block)
+    used_tokens = _msg_tokens(assembled[0]) + wire_overhead
 
     if summary_text.strip():
         sum_msg = Message(
@@ -118,7 +129,7 @@ def assemble_before_model(
             content=f"[CONVERSATION_SUMMARY]\n{summary_text.strip()}",
         )
         assembled.append(sum_msg)
-        used_tokens += estimate_tokens(sum_msg.content)
+        used_tokens += _msg_tokens(sum_msg)
 
     # Merge middleware-provided reference blocks under an explicit cap so injections never blow budget
     clean_extras = [b.strip() for b in extra_contexts if isinstance(b, str) and b.strip()]
@@ -126,21 +137,28 @@ def assemble_before_model(
     if clean_extras:
         merged_extra = "\n\n".join(clean_extras)
         extra_cap = min(
-            max(64, budget.max_extra_context_tokens),
+            budget.max_extra_context_tokens,
             max(64, (budget.max_input_tokens - used_tokens) // 3),
         )
         if estimate_tokens(merged_extra) > extra_cap:
             merged_extra = _truncate_to_token_budget(merged_extra, extra_cap)
             extra_truncated = True
         extra_msg = Message(role="system", content=merged_extra)
-        assembled.append(extra_msg)
-        used_tokens += estimate_tokens(extra_msg.content)
+        used_tokens += _msg_tokens(extra_msg)
 
-    remaining = max(256, budget.max_input_tokens - used_tokens)
+    remaining = budget.max_input_tokens - used_tokens
+    latest_user = next((m for m in reversed(recent_messages) if m.role == "user"), None)
+    if latest_user is not None:
+        remaining -= _msg_tokens(latest_user)
+    if remaining < 0:
+        raise ContextWindowExceeded("本轮输入超过模型窗口，请分段发送或改用附件。")
     groups = _group_atomic_messages(recent_messages)
     kept_groups_rev: List[List[Message]] = []
 
     for grp in reversed(groups):
+        if grp[0] is latest_user:
+            kept_groups_rev.append(grp)
+            continue
         cost = sum(_msg_tokens(m) for m in grp)
         if not kept_groups_rev:
             if cost > remaining:
@@ -158,112 +176,21 @@ def assemble_before_model(
             remaining -= cost
 
     kept = [m for grp in reversed(kept_groups_rev) for m in grp]
+    if latest_user is not None and all(m is not latest_user for m in kept):
+        kept.insert(0, latest_user)
     dropped_count = max(0, len(recent_messages) - len(kept))
 
+    if clean_extras:
+        # Dynamic references follow the cacheable history, just before this turn.
+        cut = next((i for i, m in enumerate(kept) if m is latest_user), len(kept))
+        kept = [*kept[:cut], extra_msg, *kept[cut:]]
     assembled.extend(kept)
     stats = {
         "input_tokens_est": budget.max_input_tokens - remaining,
         "dropped_messages": dropped_count,
         "fallback_folded": dropped_count > 0,
-        "kept_messages": len(kept),
+        "kept_messages": len(recent_messages) - dropped_count,
         "extra_context_blocks": len(clean_extras),
         "extra_context_truncated": extra_truncated,
     }
     return assembled, stats
-
-
-async def compact_after_agent(
-    *,
-    store: Any,
-    ctx: ExecutionContext,
-    budget: ContextBudget,
-    model_client: Any = None,
-) -> dict:
-    """Cursor-based compaction: distill old messages into a structured memory summary."""
-    old_summary, covered_id = store.get_summary(ctx.thread_id)
-    uncompacted = store.list_messages(ctx.thread_id, after_msg_id=covered_id)
-
-    if len(uncompacted) < budget.compact_trigger_messages:
-        return {"compacted": False, "covered_msg_id": covered_id}
-
-    split_idx = max(1, len(uncompacted) - budget.keep_recent_messages)
-    # Never cut right in the middle of an assistant(tool_calls) -> tool pair
-    while split_idx < len(uncompacted) and uncompacted[split_idx].role == "tool":
-        split_idx += 1
-    to_fold = uncompacted[:split_idx]
-
-    if not to_fold:
-        return {"compacted": False, "covered_msg_id": covered_id}
-
-    transcript_lines: List[str] = []
-    for m in to_fold:
-        text = (m.content or "").strip()
-        if not text and m.tool_calls:
-            calls_desc = ", ".join(f"{tc.name}({tc.args})" for tc in m.tool_calls)
-            text = f"调用工具: {calls_desc}"
-        if text:
-            role_label = f"{m.role}({m.name})" if m.name else m.role
-            transcript_lines.append(f"[{role_label}] {text[:600]}")
-
-    new_summary = ""
-    used_llm = False
-    # Use LLM compaction when a live configured model_client is supplied
-    if model_client is not None:
-        cfg = getattr(model_client, "config", None)
-        can_call_llm = cfg is not None and bool(getattr(cfg, "api_key", ""))
-        if can_call_llm:
-            compact_prompt = (
-                "你是上下文记忆压缩器。请将「已有历史摘要」与「新增待折叠对话」合并压缩成一份高密度、结构化的中文记忆摘要，"
-                "供后续对话作为系统记忆使用。要求：\n"
-                "1. 严禁逐条照抄原对话，必须提炼合并去重；\n"
-                "2. 保留所有精确数字、日期、审批单号、引用出处和业务结论，丢弃寒暄与工具调用废话；\n"
-                "3. 严格按以下 3~4 个小节输出（总字数控制在 250 字以内）：\n"
-                "   - **核心目标**：用户要解决什么问题\n"
-                "   - **关键事实与数据**：查出的确切数字、制度条款与出处\n"
-                "   - **已完成动作**：已查工具/已提交或拒绝的审批结果\n"
-                "   - **待跟进事项**：尚未确认或下一步动作（无则省略）"
-            )
-            user_payload = (
-                f"【已有历史摘要】\n{old_summary.strip() or '（无）'}\n\n"
-                f"【新增待折叠对话】\n" + "\n".join(transcript_lines)
-            )
-            try:
-                compact_ctx = ctx.derive_subagent(
-                    agent_name="compactor",
-                    allowed_tools=(),
-                    parent_span_id=ctx.parent_span_id or ctx.trace_id,
-                )
-                resp = await model_client.generate(
-                    messages=[
-                        Message(role="system", content=compact_prompt),
-                        Message(role="user", content=user_payload),
-                    ],
-                    tool_specs=[],
-                    ctx=compact_ctx,
-                )
-                if resp.content and resp.content.strip():
-                    new_summary = resp.content.strip()
-                    used_llm = True
-            except Exception:
-                used_llm = False
-
-    if not new_summary:
-        # Deterministic fallback if LLM compaction fails or no API key is attached (e.g. unit tests)
-        lines: List[str] = []
-        if old_summary.strip():
-            lines.append(old_summary.strip())
-        for m in to_fold:
-            snippet = m.content.replace("\n", " ").strip()[:160]
-            if snippet:
-                lines.append(f"- [{m.role}] {snippet}")
-        new_summary = "\n".join(lines[-12:])
-
-    new_cursor = to_fold[-1].msg_id or covered_id
-    store.save_summary(ctx.thread_id, new_summary, new_cursor)
-    return {
-        "compacted": True,
-        "used_llm": used_llm,
-        "folded_count": len(to_fold),
-        "covered_msg_id": new_cursor,
-        "summary_text": new_summary,
-    }

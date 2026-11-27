@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+from agent_runtime.framework.context.compaction import SessionCompactor
 from agent_runtime.framework.context.memory import ContextBudget
 from agent_runtime.framework.core.config import uid
 from agent_runtime.framework.core.contracts import ApprovalDecision, AuthScope, ExecutionContext, Message
@@ -170,6 +171,7 @@ class AgentRuntimeApp:
             parts = [ext.system_prompt.strip() for ext in self.extensions if ext.system_prompt.strip()]
             self.system_prompt = "\n\n".join(parts) if parts else DEFAULT_SYSTEM_PROMPT
 
+        self.compactor = SessionCompactor(self.store, self.model, self.budget)
         self.graph = build_agent_graph(
             store=self.store,
             obs=self.obs,
@@ -179,6 +181,7 @@ class AgentRuntimeApp:
             system_prompt=self.system_prompt,
             middlewares=self.middlewares,
             budget=self.budget,
+            compactor=self.compactor,
             max_steps=self.max_steps,
             on_event=on_event,
             cancel_checker=self.run_service.is_cancelled,
